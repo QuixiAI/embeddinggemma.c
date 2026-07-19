@@ -1,0 +1,3 @@
+# Generated benchmark outputs are machine-specific; keep the directory, ignore runs.
+*
+!.gitignore

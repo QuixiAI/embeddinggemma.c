@@ -1,0 +1,7 @@
+build/
+*.o
+testdata/*.gguf
+__pycache__/
+*.pyc
+.reference
+model/

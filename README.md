@@ -66,6 +66,8 @@ The Makefile passes every `.metal` translation unit to one direct `xcrun metal`
 invocation, then embeds the resulting metallib in the executable's Mach-O
 `__DATA,__metallib` section. `build/embeddinggemma.metallib` remains only as an
 intermediate artifact for kernel inspection and the `metal-kernels` target.
+Darwin builds default to `MACOSX_DEPLOYMENT_TARGET=14.0`; override it only when
+intentionally raising the minimum supported macOS version.
 
 Build the portable CUDA server:
 

@@ -76,12 +76,15 @@ make release-darwin DIST=/tmp/quixiembed-dist
 ```
 
 `release-darwin` rebuilds CPU and Metal, strips and ad-hoc signs both files, and
-checks that the Metal executable contains the embedded `__DATA,__metallib`
-section. Validate the staged executables, not only the unstripped build output:
+checks that both executables retain the configured macOS 14.0 minimum and that
+the Metal executable contains the embedded `__DATA,__metallib` section.
+Validate the staged executables, not only the unstripped build output:
 
 ```sh
 codesign --verify --verbose=2 /tmp/quixiembed-dist/embeddinggemma-darwin-arm64-cpu
 codesign --verify --verbose=2 /tmp/quixiembed-dist/embeddinggemma-darwin-arm64-metal
+vtool -show-build /tmp/quixiembed-dist/embeddinggemma-darwin-arm64-cpu
+vtool -show-build /tmp/quixiembed-dist/embeddinggemma-darwin-arm64-metal
 python3 testdata/test_http_dimensions.py \
   --binary /tmp/quixiembed-dist/embeddinggemma-darwin-arm64-cpu \
   --model "$MODEL" --backend cpu

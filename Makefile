@@ -44,6 +44,11 @@ DIST    ?= dist
 MODEL   ?= model/embeddinggemma-300M-qat-Q4_0.gguf
 VERSION := $(strip $(shell cat VERSION 2>/dev/null))
 
+ifeq ($(shell uname -s),Darwin)
+MACOSX_DEPLOYMENT_TARGET ?= 14.0
+export MACOSX_DEPLOYMENT_TARGET
+endif
+
 # Prefer a full Xcode installation for Metal without requiring a global
 # xcode-select change. An environment-provided DEVELOPER_DIR still wins.
 ifeq ($(origin DEVELOPER_DIR), undefined)

@@ -48,6 +48,11 @@ if [ "$platform" = darwin ]; then
     strip -x "$temporary"
     codesign --force --sign - "$temporary"
     codesign --verify --verbose=2 "$temporary"
+    expected_minos=${MACOSX_DEPLOYMENT_TARGET:-14.0}
+    actual_minos=$(xcrun vtool -show-build "$temporary" |
+        awk '$1 == "minos" { print $2; exit }')
+    [ "$actual_minos" = "$expected_minos" ] ||
+        die "Darwin minimum is $actual_minos, expected $expected_minos"
     if [ "$variant" = metal ]; then
         otool -l "$temporary" | grep -q '__metallib' ||
             die 'Metal release binary has no embedded __metallib section'

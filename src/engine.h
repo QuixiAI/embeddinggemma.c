@@ -11,6 +11,7 @@ typedef struct {
     ei_tokenizer tokenizer;
     void *metal;
     void *cuda;
+    void *rocm;
     void *xpu;
     const char *backend_name;
     ei_thread_pool *thread_pool;

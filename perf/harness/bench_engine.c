@@ -61,9 +61,29 @@ static int parse_token_shapes(const char *value, int32_t out[MAX_TOKEN_SHAPES]) 
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s --model model.gguf [--backend auto|cpu|metal|cuda|xpu] "
+            "usage: %s --model model.gguf [--backend auto|cpu|metal|cuda|rocm|xpu] "
             "[--tokens 1,8,32,128] [--warmup n] [--iters n] "
             "[--ab-gelu-quant] [--ab-metal-fp16-kv] "
+            "[--ab-rocm-command-graph] [--ab-rocm-fp16-gemm] "
+            "[--ab-rocm-q8-latency] [--ab-rocm-direct-qkv] "
+            "[--ab-rocm-q8-two-row] [--ab-rocm-direct-context] "
+            "[--ab-rocm-tensor-attention] [--ab-rocm-mfma-attention] "
+            "[--ab-rocm-batched-attention] "
+            "[--ab-rocm-fp16-attention-scores] "
+            "[--ab-rocm-softmax-128] "
+            "[--ab-rocm-v-only] "
+            "[--ab-rocm-direct-rms] "
+            "[--ab-rocm-direct-q4-pair] "
+            "[--ab-rocm-direct-q4-quad] "
+            "[--ab-rocm-pinned-io] "
+            "[--ab-rocm-fused-embedding-rms] "
+            "[--ab-rocm-singleton-metadata] "
+            "[--ab-rocm-final-singleton-pool] "
+            "[--ab-rocm-native-q4] [--ab-rocm-native-fused] "
+            "[--ab-rocm-native-fused-activation] "
+            "[--ab-rocm-native-wide] "
+            "[--ab-rocm-native-direct-qkv] "
+            "[--ab-rocm-rms-register-cache] "
             "[--ab-xpu-fp16-attention] [--ab-xpu-swa-banded] "
             "[--ab-xpu-v-only] [--ab-xpu-cooperative-rms] "
             "[--ab-xpu-cooperative-pool] [--ab-xpu-xe2-flash] "
@@ -95,6 +115,31 @@ int main(int argc, char **argv) {
     int iters = 5;
     bool ab_gelu_quant = false;
     bool ab_metal_fp16_kv = false;
+    bool ab_rocm_command_graph = false;
+    bool ab_rocm_fp16_gemm = false;
+    bool ab_rocm_q8_latency = false;
+    bool ab_rocm_q8_two_row = false;
+    bool ab_rocm_direct_qkv = false;
+    bool ab_rocm_direct_context = false;
+    bool ab_rocm_tensor_attention = false;
+    bool ab_rocm_mfma_attention = false;
+    bool ab_rocm_batched_attention = false;
+    bool ab_rocm_fp16_attention_scores = false;
+    bool ab_rocm_softmax_128 = false;
+    bool ab_rocm_v_only = false;
+    bool ab_rocm_direct_rms = false;
+    bool ab_rocm_direct_q4_pair = false;
+    bool ab_rocm_direct_q4_quad = false;
+    bool ab_rocm_pinned_io = false;
+    bool ab_rocm_fused_embedding_rms = false;
+    bool ab_rocm_singleton_metadata = false;
+    bool ab_rocm_final_singleton_pool = false;
+    bool ab_rocm_native_q4 = false;
+    bool ab_rocm_native_fused = false;
+    bool ab_rocm_native_fused_activation = false;
+    bool ab_rocm_native_wide = false;
+    bool ab_rocm_native_direct_qkv = false;
+    bool ab_rocm_rms_register_cache = false;
     bool ab_xpu_fp16_attention = false;
     bool ab_xpu_swa_banded = false;
     bool ab_xpu_v_only = false;
@@ -125,6 +170,56 @@ int main(int argc, char **argv) {
             ab_gelu_quant = true;
         } else if (strcmp(argv[i], "--ab-metal-fp16-kv") == 0) {
             ab_metal_fp16_kv = true;
+        } else if (strcmp(argv[i], "--ab-rocm-command-graph") == 0) {
+            ab_rocm_command_graph = true;
+        } else if (strcmp(argv[i], "--ab-rocm-fp16-gemm") == 0) {
+            ab_rocm_fp16_gemm = true;
+        } else if (strcmp(argv[i], "--ab-rocm-q8-latency") == 0) {
+            ab_rocm_q8_latency = true;
+        } else if (strcmp(argv[i], "--ab-rocm-q8-two-row") == 0) {
+            ab_rocm_q8_two_row = true;
+        } else if (strcmp(argv[i], "--ab-rocm-direct-qkv") == 0) {
+            ab_rocm_direct_qkv = true;
+        } else if (strcmp(argv[i], "--ab-rocm-direct-context") == 0) {
+            ab_rocm_direct_context = true;
+        } else if (strcmp(argv[i], "--ab-rocm-tensor-attention") == 0) {
+            ab_rocm_tensor_attention = true;
+        } else if (strcmp(argv[i], "--ab-rocm-mfma-attention") == 0) {
+            ab_rocm_mfma_attention = true;
+        } else if (strcmp(argv[i], "--ab-rocm-batched-attention") == 0) {
+            ab_rocm_batched_attention = true;
+        } else if (strcmp(argv[i], "--ab-rocm-fp16-attention-scores") == 0) {
+            ab_rocm_fp16_attention_scores = true;
+        } else if (strcmp(argv[i], "--ab-rocm-softmax-128") == 0) {
+            ab_rocm_softmax_128 = true;
+        } else if (strcmp(argv[i], "--ab-rocm-v-only") == 0) {
+            ab_rocm_v_only = true;
+        } else if (strcmp(argv[i], "--ab-rocm-direct-rms") == 0) {
+            ab_rocm_direct_rms = true;
+        } else if (strcmp(argv[i], "--ab-rocm-direct-q4-pair") == 0) {
+            ab_rocm_direct_q4_pair = true;
+        } else if (strcmp(argv[i], "--ab-rocm-direct-q4-quad") == 0) {
+            ab_rocm_direct_q4_quad = true;
+        } else if (strcmp(argv[i], "--ab-rocm-pinned-io") == 0) {
+            ab_rocm_pinned_io = true;
+        } else if (strcmp(argv[i], "--ab-rocm-fused-embedding-rms") == 0) {
+            ab_rocm_fused_embedding_rms = true;
+        } else if (strcmp(argv[i], "--ab-rocm-singleton-metadata") == 0) {
+            ab_rocm_singleton_metadata = true;
+        } else if (strcmp(argv[i], "--ab-rocm-final-singleton-pool") == 0) {
+            ab_rocm_final_singleton_pool = true;
+        } else if (strcmp(argv[i], "--ab-rocm-native-q4") == 0) {
+            ab_rocm_native_q4 = true;
+        } else if (strcmp(argv[i], "--ab-rocm-native-fused") == 0) {
+            ab_rocm_native_fused = true;
+        } else if (strcmp(argv[i], "--ab-rocm-native-fused-activation") == 0) {
+            ab_rocm_native_fused_activation = true;
+        } else if (strcmp(argv[i], "--ab-rocm-native-wide") == 0) {
+            ab_rocm_native_wide = true;
+        } else if (strcmp(argv[i], "--ab-rocm-native-direct-qkv") == 0) {
+            ab_rocm_native_direct_qkv = true;
+        } else if (strcmp(argv[i], "--ab-rocm-rms-register-cache") == 0) {
+            ab_rocm_rms_register_cache = true;
         } else if (strcmp(argv[i], "--ab-xpu-fp16-attention") == 0) {
             ab_xpu_fp16_attention = true;
         } else if (strcmp(argv[i], "--ab-xpu-swa-banded") == 0) {
@@ -165,16 +260,62 @@ int main(int argc, char **argv) {
 
     int32_t shapes[MAX_TOKEN_SHAPES];
     int shape_count = parse_token_shapes(token_shapes, shapes);
-    if (ab_metal_fp16_kv || ab_xpu_fp16_attention || ab_xpu_swa_banded ||
+    const bool ab_rocm = ab_rocm_command_graph || ab_rocm_fp16_gemm ||
+        ab_rocm_q8_latency || ab_rocm_q8_two_row || ab_rocm_direct_qkv ||
+        ab_rocm_direct_context || ab_rocm_tensor_attention ||
+        ab_rocm_mfma_attention || ab_rocm_batched_attention ||
+        ab_rocm_fp16_attention_scores ||
+        ab_rocm_softmax_128 ||
+        ab_rocm_v_only ||
+        ab_rocm_direct_rms ||
+        ab_rocm_direct_q4_pair ||
+        ab_rocm_direct_q4_quad ||
+        ab_rocm_pinned_io ||
+        ab_rocm_fused_embedding_rms ||
+        ab_rocm_singleton_metadata ||
+        ab_rocm_final_singleton_pool ||
+        ab_rocm_native_q4 ||
+        ab_rocm_native_fused || ab_rocm_native_fused_activation ||
+        ab_rocm_native_wide ||
+        ab_rocm_native_direct_qkv ||
+        ab_rocm_rms_register_cache;
+    if (ab_metal_fp16_kv || ab_rocm ||
+        ab_xpu_fp16_attention || ab_xpu_swa_banded ||
         ab_xpu_v_only || ab_xpu_cooperative_rms ||
         ab_xpu_cooperative_pool || ab_xpu_xe2_flash || ab_xpu_flash_event ||
         ab_xpu_command_graph || ab_xpu_xe2_w4 ||
         ab_xpu_rms_register_cache || ab_xpu_onednn_w4 ||
         ab_xpu_onednn_f16 || ab_xpu_q4_m_tiled) {
         const char *expected_backend =
-            ab_metal_fp16_kv ? "metal" : "xpu";
+            ab_metal_fp16_kv ? "metal"
+            : ab_rocm ? "rocm" : "xpu";
         const char *environment = ab_metal_fp16_kv
             ? "EI_METAL_FP16_KV_MIN_TOKENS"
+            : ab_rocm_command_graph ? "EI_ROCM_COMMAND_GRAPH"
+            : ab_rocm_fp16_gemm ? "EI_ROCM_GEMM_MIN_TOKENS"
+            : ab_rocm_q8_latency ? "EI_ROCM_Q8_LATENCY"
+            : ab_rocm_q8_two_row ? "EI_ROCM_Q8_TWO_ROW"
+            : ab_rocm_direct_qkv ? "EI_ROCM_DIRECT_FP16_QKV"
+            : ab_rocm_direct_context ? "EI_ROCM_DIRECT_FP16_CONTEXT"
+            : ab_rocm_tensor_attention ? "EI_ROCM_TENSOR_ATTENTION_MIN_TOKENS"
+            : ab_rocm_mfma_attention ? "EI_ROCM_MFMA_ATTENTION"
+            : ab_rocm_batched_attention ? "EI_ROCM_BATCHED_TENSOR_ATTENTION"
+            : ab_rocm_fp16_attention_scores ? "EI_ROCM_FP16_ATTENTION_SCORES"
+            : ab_rocm_softmax_128 ? "EI_ROCM_TENSOR_SOFTMAX_THREADS"
+            : ab_rocm_v_only ? "EI_ROCM_SINGLE_TOKEN_V_ONLY"
+            : ab_rocm_direct_rms ? "EI_ROCM_DIRECT_RMS_FUSION"
+            : ab_rocm_direct_q4_pair ? "EI_ROCM_DIRECT_Q4_PAIR"
+            : ab_rocm_direct_q4_quad ? "EI_ROCM_DIRECT_Q4_QUAD"
+            : ab_rocm_pinned_io ? "EI_ROCM_PINNED_IO_STAGING"
+            : ab_rocm_fused_embedding_rms ? "EI_ROCM_FUSED_EMBEDDING_RMS"
+            : ab_rocm_singleton_metadata ? "EI_ROCM_SINGLETON_METADATA_ELISION"
+            : ab_rocm_final_singleton_pool ? "EI_ROCM_FINAL_SINGLETON_POOL"
+            : ab_rocm_native_q4 ? "EI_ROCM_NATIVE_Q4_GEMM"
+            : ab_rocm_native_fused ? "EI_ROCM_NATIVE_Q4_FUSED"
+            : ab_rocm_native_fused_activation ? "EI_ROCM_NATIVE_Q4_FUSED_ACTIVATION"
+            : ab_rocm_native_wide ? "EI_ROCM_NATIVE_Q4_WIDE"
+            : ab_rocm_native_direct_qkv ? "EI_ROCM_NATIVE_Q4_DIRECT_FP16_QKV"
+            : ab_rocm_rms_register_cache ? "EI_ROCM_RMS_REGISTER_CACHE"
             : ab_xpu_swa_banded ? "EI_XPU_SWA_TENSOR_TILE_TOKENS"
             : ab_xpu_v_only ? "EI_XPU_SINGLE_TOKEN_V_ONLY"
             : ab_xpu_cooperative_rms ? "EI_XPU_COOPERATIVE_RMS_MAX_ROWS"
@@ -188,10 +329,13 @@ int main(int argc, char **argv) {
             : ab_xpu_onednn_f16 ? "EI_XPU_ONEDNN_F16"
             : ab_xpu_q4_m_tiled ? "EI_XPU_Q4_M_TILED"
                                 : "EI_XPU_FP16_ATTENTION";
-        const char *baseline_value = ab_metal_fp16_kv ? "65536"
+        const char *baseline_value = ab_rocm_softmax_128 ? "256"
+            : (ab_metal_fp16_kv || ab_rocm_fp16_gemm ||
+               ab_rocm_tensor_attention) ? "65536"
             : ab_xpu_flash_event ? "1" : "0";
         const char *candidate_value = ab_metal_fp16_kv
-            ? "1" : ab_xpu_swa_banded ? xpu_swa_tile
+            ? "1" : ab_rocm_softmax_128 ? "128" : ab_rocm ? "1"
+            : ab_xpu_swa_banded ? xpu_swa_tile
             : ab_xpu_v_only ? "1"
             : ab_xpu_cooperative_rms ? "4"
             : ab_xpu_cooperative_pool ? "1"
@@ -204,6 +348,31 @@ int main(int argc, char **argv) {
             : ab_xpu_onednn_f16 ? "1"
             : ab_xpu_q4_m_tiled ? "1" : "auto";
         const char *variant = ab_metal_fp16_kv ? "fp16_kv_ab"
+            : ab_rocm_command_graph ? "command_graph_ab"
+            : ab_rocm_fp16_gemm ? "fp16_gemm_ab"
+            : ab_rocm_q8_latency ? "q8_latency_ab"
+            : ab_rocm_q8_two_row ? "q8_two_row_ab"
+            : ab_rocm_direct_qkv ? "direct_qkv_ab"
+            : ab_rocm_direct_context ? "direct_context_ab"
+            : ab_rocm_tensor_attention ? "tensor_attention_ab"
+            : ab_rocm_mfma_attention ? "mfma_attention_ab"
+            : ab_rocm_batched_attention ? "batched_attention_ab"
+            : ab_rocm_fp16_attention_scores ? "fp16_attention_scores_ab"
+            : ab_rocm_softmax_128 ? "softmax_128_ab"
+            : ab_rocm_v_only ? "v_only_ab"
+            : ab_rocm_direct_rms ? "direct_rms_ab"
+            : ab_rocm_direct_q4_pair ? "direct_q4_pair_ab"
+            : ab_rocm_direct_q4_quad ? "direct_q4_quad_ab"
+            : ab_rocm_pinned_io ? "pinned_io_ab"
+            : ab_rocm_fused_embedding_rms ? "fused_embedding_rms_ab"
+            : ab_rocm_singleton_metadata ? "singleton_metadata_ab"
+            : ab_rocm_final_singleton_pool ? "final_singleton_pool_ab"
+            : ab_rocm_native_q4 ? "native_q4_ab"
+            : ab_rocm_native_fused ? "native_fused_ab"
+            : ab_rocm_native_fused_activation ? "native_fused_activation_ab"
+            : ab_rocm_native_wide ? "native_wide_ab"
+            : ab_rocm_native_direct_qkv ? "native_direct_qkv_ab"
+            : ab_rocm_rms_register_cache ? "rms_register_cache_ab"
             : ab_xpu_swa_banded ? "swa_banded_ab"
             : ab_xpu_v_only ? "single_token_v_only_ab"
             : ab_xpu_cooperative_rms ? "cooperative_rms_ab"
@@ -218,7 +387,32 @@ int main(int argc, char **argv) {
             : ab_xpu_q4_m_tiled ? "q4_m_tiled_ab"
                             : "fp16_dense_auto_ab";
         const char *candidate_field =
-            ab_xpu_swa_banded ? "banded_ms"
+            ab_rocm_command_graph ? "graph_ms"
+            : ab_rocm_fp16_gemm ? "fp16_ms"
+            : ab_rocm_q8_latency ? "q8_ms"
+            : ab_rocm_q8_two_row ? "two_row_ms"
+            : ab_rocm_direct_qkv ? "direct_ms"
+            : ab_rocm_direct_context ? "direct_ms"
+            : ab_rocm_tensor_attention ? "tensor_ms"
+            : ab_rocm_mfma_attention ? "mfma_ms"
+            : ab_rocm_batched_attention ? "batched_ms"
+            : ab_rocm_fp16_attention_scores ? "fp16_scores_ms"
+            : ab_rocm_softmax_128 ? "softmax_128_ms"
+            : ab_rocm_v_only ? "v_only_ms"
+            : ab_rocm_direct_rms ? "fused_ms"
+            : ab_rocm_direct_q4_pair ? "pair_ms"
+            : ab_rocm_direct_q4_quad ? "quad_ms"
+            : ab_rocm_pinned_io ? "pinned_ms"
+            : ab_rocm_fused_embedding_rms ? "fused_ms"
+            : ab_rocm_singleton_metadata ? "elided_ms"
+            : ab_rocm_final_singleton_pool ? "fused_ms"
+            : ab_rocm_native_q4 ? "native_ms"
+            : ab_rocm_native_fused ? "fused_ms"
+            : ab_rocm_native_fused_activation ? "activation_ms"
+            : ab_rocm_native_wide ? "wide_ms"
+            : ab_rocm_native_direct_qkv ? "direct_ms"
+            : ab_rocm_rms_register_cache ? "register_ms"
+            : ab_xpu_swa_banded ? "banded_ms"
             : ab_xpu_v_only ? "v_only_ms"
             : ab_xpu_cooperative_rms ? "cooperative_ms"
             : ab_xpu_cooperative_pool ? "cooperative_ms"
@@ -231,7 +425,7 @@ int main(int argc, char **argv) {
             : ab_xpu_onednn_f16 ? "onednn_ms"
             : ab_xpu_q4_m_tiled ? "m_tiled_ms" : "fp16_ms";
         if (strcmp(backend, expected_backend) != 0) {
-            ei_die("FP16 A/B mode requires --backend %s", expected_backend);
+            ei_die("A/B mode requires --backend %s", expected_backend);
         }
         ei_engine baseline;
         ei_engine fp16;
@@ -240,6 +434,16 @@ int main(int argc, char **argv) {
         }
         if (ab_xpu_swa_banded) {
             setenv("EI_XPU_SWA_TENSOR_MIN_TOKENS", "1", 1);
+        }
+        if (ab_rocm_fp16_gemm) {
+            setenv("EI_ROCM_Q8_LATENCY", "0", 1);
+        }
+        if (ab_rocm_q8_two_row) {
+            setenv("EI_ROCM_GEMM_MIN_TOKENS", "65536", 1);
+            setenv("EI_ROCM_Q8_LATENCY", "1", 1);
+        }
+        if (ab_rocm_native_q4 || ab_rocm_native_wide) {
+            setenv("EI_ROCM_NATIVE_Q4_MAX_TOKENS", "65536", 1);
         }
         setenv(environment, baseline_value, 1);
         ei_engine_load_backend(&baseline, model_path, expected_backend);
@@ -251,6 +455,16 @@ int main(int argc, char **argv) {
         }
         if (ab_xpu_swa_banded) {
             unsetenv("EI_XPU_SWA_TENSOR_MIN_TOKENS");
+        }
+        if (ab_rocm_fp16_gemm) {
+            unsetenv("EI_ROCM_Q8_LATENCY");
+        }
+        if (ab_rocm_q8_two_row) {
+            unsetenv("EI_ROCM_GEMM_MIN_TOKENS");
+            unsetenv("EI_ROCM_Q8_LATENCY");
+        }
+        if (ab_rocm_native_q4 || ab_rocm_native_wide) {
+            unsetenv("EI_ROCM_NATIVE_Q4_MAX_TOKENS");
         }
 
         for (int shape = 0; shape < shape_count; shape++) {
@@ -275,7 +489,9 @@ int main(int argc, char **argv) {
                 }
             }
             double similarity = cosine(baseline_output, fp16_output);
-            if (!isfinite(similarity) || similarity < 0.998) {
+            const double minimum_cosine =
+                (ab_rocm_fp16_gemm || ab_rocm_q8_latency) ? 0.99 : 0.998;
+            if (!isfinite(similarity) || similarity < minimum_cosine) {
                 ei_die("A/B parity failed: %.9g", similarity);
             }
             qsort(baseline_samples, (size_t)iters, sizeof(*baseline_samples), compare_double);

@@ -2086,3 +2086,371 @@ Final default B60 medians were 1.04 ms at T1, 1.23 ms at T2, 2.17 ms at T32,
 Packed B32 reached about 19,850 requests/s at T1, 109,170 tokens/s at T32, and
 135,860 tokens/s at T128. These are absolute final-state measurements; the
 per-pass claims above use alternating in-process A/B.
+
+## ROCm CDNA Backend and Optimization Loop (2026-07-20)
+
+Status: retained and validated on `enc1-svr04`, one AMD Instinct MI300X
+(`gfx942`), ROCm 7.2.4. Runtime testing used one MI300X, but the production
+binary is not `gfx942`-specific: one `hipcc` link embeds `gfx908`, `gfx90a`,
+`gfx942`, and `gfx950` code objects for CDNA1 through CDNA4. `roc-obj-ls`
+confirmed all four images in `build/embeddinggemma-rocm`. `ROCM_ARCHS` and the
+legacy `ROCM_ARCH` remain developer-only size/profiling overrides.
+
+The implementation was read against llama.cpp and
+`QuixiCore/QuixiCore-ROCm`. The retained design follows QuixiCore's CDNA
+principles: wave64-aware layout, logical width-32 reductions where the model
+shape requires them, `__builtin_amdgcn_sdot4` packed dot products, native
+`__builtin_amdgcn_mfma_f32_16x16x16f16` tiles, resident weights/workspaces,
+fused epilogues, correctness-gated alternating A/B runs, and measured routing
+instead of architecture-name assumptions.
+
+### Functional Baseline
+
+The first complete backend kept the GGUF data resident, expanded projection
+weights to FP16 once for hipBLAS, and provided direct packed-Q4, Q8/SDOT4,
+native Q4/MFMA, online/Flash-style attention, tensor attention, pooling, batch,
+and HTTP paths. The ROCm binary selects ROCm by construction; `--backend rocm`
+is unnecessary outside diagnostic harnesses.
+
+Initial warmed medians were 2.234 ms at T1, 6.195 ms at T7, 6.688 ms at T32,
+10.146 ms at T128, 9.404 ms at T512, and 18.775 ms at T2048. Initial dynamic
+T32 throughput at C1/C2/C4/C8/C16/C32 was 148/150/422/612/1,677/2,495 req/s.
+
+### ROCm Pass 1: HIP Command Graphs
+
+Status: rejected by default; retained as `EI_ROCM_COMMAND_GRAPH=1`.
+
+The first A/B measured `0.963x` at T1 and neutral results at larger shapes.
+After all later kernel changes, a 101-iteration repeat measured `1.021x` at T1,
+`1.001x` at T2, `0.940x` at T4, `1.000x` at T8, and `0.978x` at T16. The gain
+was neither stable nor shape-safe.
+
+### ROCm Pass 2: Direct FP16 Context
+
+Status: retained as `EI_ROCM_DIRECT_FP16_CONTEXT=1`.
+
+Writing attention output directly to the next projection's FP16 input removed
+one context conversion and measured `1.176x` at T128, `1.186x` at T512, and
+`1.433x` at T2048.
+
+### ROCm Pass 3: Attention Routing
+
+Status: retained, then superseded by the batched-head retune below.
+
+The original tensor route lost below 256 tokens, then measured `1.039x` at T256
+and `1.184x` at T512. The initial threshold moved from the inherited 80 tokens
+to 256. The QuixiCore BQ16 MFMA attention adaptation passed tails at
+16/33/128/191 tokens but measured only `0.98x` at T16, `0.96x` at T32,
+`0.94x` at T64/T128, and `0.914x` at T255, so
+`EI_ROCM_MFMA_ATTENTION` remains off.
+
+### ROCm Pass 4: Short-Shape Q8/SDOT4
+
+Status: rejected; retained under `EI_ROCM_Q8_LATENCY` and
+`EI_ROCM_Q8_TWO_ROW`.
+
+Runtime Q8 activation quantization plus SDOT4 measured `0.821x` versus direct
+FP32 packed-Q4 at T1/T2. A two-output-row QuixiCore-style kernel was exact and
+up to `1.034x` faster than the one-row Q8 kernel, but did not recover the Q8
+route's end-to-end loss.
+
+### ROCm Pass 5: Native Packed-Q4 MFMA
+
+Status: retained for 32-368 flattened tokens.
+
+The first native Q4 MFMA projection beat expanded-FP16 hipBLAS by `1.177x` at
+T128 but was neutral by T256 before launch fusion. Combining Q/K/V into one
+launch and up/gate into one launch improved the native route by `1.215x` at
+T128, `1.182x` at T160, `1.142x` at T192, and `1.107x` at T240. The final
+lower-bound retune measured native MFMA at `1.146x` at T48, `1.261x` at T64,
+`1.368x` at T80, `1.679x` at T96, and `1.867x` at T120 versus the direct packed
+path; it still lost below 32. The final upper-bound comparison against hipBLAS
+was `1.095x` at T320, `1.067x` at T352, `1.046x` at T368, `1.027x` at T384,
+and `0.971x` at T416.
+
+A wider-N QuixiCore MFMA variant reached `1.083x` versus the one-output-tile
+native kernel at T768, but native Q4 remained slower than hipBLAS at those
+large M values. `EI_ROCM_NATIVE_Q4_WIDE` is therefore diagnostic-only.
+
+### ROCm Pass 6: Register-Cached Residual/RMS
+
+Status: retained as `EI_ROCM_RMS_REGISTER_CACHE=1`.
+
+Each logical lane keeps 24 residual values in registers across the next RMS
+reduction. Alternating A/B measured `1.074x` at T128, `1.038x` at T192,
+`1.053x` at T256, `1.048x` at T352, `1.037x` at T512, `1.034x` at T1024, and
+`1.018x` at T2048, with cosine at least `0.999997146`.
+
+### ROCm Pass 7: Native Direct QKV
+
+Status: rejected; retained as `EI_ROCM_NATIVE_Q4_DIRECT_FP16_QKV=1`.
+
+One kernel fused separate native-Q4 Q/K normalization, RoPE, V conversion, and
+FP16 output. The first sweep ranged from `0.988x` to `1.010x`. Against the final
+route it remained `0.997x-1.008x` at T96-T368, so the extra path is disabled.
+
+### ROCm Pass 8: Dense SWA at 2K
+
+Status: retained with `EI_ROCM_SWA_TENSOR_TILE_TOKENS=0`.
+
+At T1536/T2048, full-query dense tensor attention measured 9.837/11.639 ms.
+Query tiles of 128, 256, 512, and 1024 measured 33.356/42.686,
+17.259/21.997, 12.549/15.465, and 11.298/12.733 ms respectively. On MI300X,
+the extra rectangular GEMMs cost more than computing masked dense scores, so
+zero tiling provides `1.149x` at T1536 and `1.094x` at T2048 versus the prior
+1024-query default.
+
+### ROCm Pass 9: Batched GQA Heads
+
+Status: retained as `EI_ROCM_BATCHED_TENSOR_ATTENTION=1`.
+
+Because EmbeddingGemma shares one K/V head across three query heads, tensor
+attention now uses two `hipblasGemmStridedBatchedEx` calls per sequence rather
+than six per-head calls. A head-aware softmax spans separate score/probability
+matrices. Candidate/baseline cosine was exactly 1 in the A/B sweep; throughput
+improved `1.208x` at T256, `1.146x` at T512, `1.163x` at T1024, `1.170x` at
+T1536, and `1.171x` at T2048.
+
+This changed the dense crossover. Batched tensor attention measured `0.972x`
+at T64, `1.014x` at T88, `1.047x` at T96, `1.336x` at T128, `1.418x` at T160,
+and `1.500x` at T192. Final automatic thresholds are 96 for one sequence, 128
+for two through four, and 192 for larger batches.
+
+### ROCm Pass 10: Fused MFMA FFN Activation
+
+Status: retained only from 320 through the native route's 368-token ceiling.
+
+One wave reuses each input fragment for up and gate MFMA, applies GELU, and
+writes FP16 directly into an existing scratch buffer. Reduced wave count hurt
+small shapes (`0.925x` at T32 and `0.942x` at T96), but sufficient high-end
+occupancy measured `1.039x` at T320, `1.039x` at T336, `1.030x` at T352, and
+`1.030x` at T368. Runtime routing keeps both geometries.
+
+### ROCm Pass 11: FP16 Tensor-Attention Scores
+
+Status: retained through 896 sequence tokens.
+
+hipBLAS still accumulates in FP32, while its score output and the following
+softmax input use FP16; softmax reductions remain FP32. This measured `1.168x`
+at T96, `1.164x` at T128, `1.068x` at T256, `1.036x` at T512, `1.059x` at
+T640, `1.053x` at T704, and `1.031x` at T896. It fell to `0.986x` at T1024,
+so larger sequences retain FP32 scores. Minimum output cosine was `0.9999905`.
+
+### ROCm Stop Passes
+
+Three consecutive final passes produced no significant general gain:
+
+1. A 128-thread tensor softmax measured `0.994x-1.003x` versus 256 threads.
+2. Native direct-FP16 QKV retesting measured at most `1.008x`.
+3. HIP graph retesting was shape-inconsistent and regressed T4 to `0.940x`.
+
+The loop stopped with the measured defaults rather than accumulating
+architecture-specific complexity without stable throughput.
+
+### ROCm Final Validation and Throughput
+
+The portable four-code-object build passed all llama.cpp goldens at minimum
+cosine `0.999910414`, CPU/ROCm synthetic drift at `0.991444767`, native MFMA
+projection parity at `0.999983668`, online/hipBLAS attention parity at
+`0.999992847`, scalar/MFMA attention parity at `0.999997556`, direct-QKV parity
+at `0.999999762`, packed parity at `0.999875247`, and HTTP Matryoshka tests.
+
+Final warmed medians were 1.773 ms at T1, 2.307 ms at T7, 3.598 ms at T32,
+3.412 ms at T96, 3.558 ms at T128, 4.788 ms at T256, 6.051 ms at T512,
+7.177 ms at T1024, 8.590 ms at T1536, and 9.945 ms at T2048. Relative to the
+functional baseline this is approximately `1.26x`, `2.69x`, `1.86x`, `2.85x`,
+`1.55x`, and `1.89x` at T1/T7/T32/T128/T512/T2048.
+
+At T32, packed B1/B2/B4/B8/B16/B32 reached 279/545/1,032/1,624/2,649/5,161
+req/s; B32 is 165,164 input tok/s and `18.65x` serialized throughput. The real
+dynamic service measured 273/279/686/990/1,284/3,507 req/s at concurrency
+1/2/4/8/16/32, with an average executed batch size of 25.6 at C32.
+
+## ROCm Cross-Backend Continuation Loop (2026-07-20)
+
+### ROCm Pass 18: Exact Single-Token V-Only Attention
+
+Status: retained as `EI_ROCM_SINGLE_TOKEN_V_ONLY=1`.
+
+The XPU route demonstrated that an independent one-token sequence does not need
+Q, K, RoPE, softmax, or an attention kernel: its attention output is exactly
+the shared V head repeated across all three query heads. ROCm now detects an
+all-singleton batch. Below the MFMA boundary, one packed-Q4 wave kernel projects
+V and writes all three FP32 heads directly. In the native range, one MFMA kernel
+projects V and writes repeated FP16 heads directly for the attention-output
+projection. The expanded-FP16 fallback uses a V-only hipBLAS projection.
+
+Fifteen-warmup/101-iteration single-engine A/B improved T1 from 1.768 to
+1.553 ms (`1.139x`) with cosine 1. T2 was unchanged (`1.004x`), confirming the
+shape guard. Seven-warmup/31-iteration packed A/B measured `1.145x`, `1.115x`,
+`1.080x`, `1.127x`, `1.173x`, `1.089x`, and `1.089x` at B1/B2/B4/B8/B16/B32/B64,
+all with exact parity. Candidate B64 reached 22,257 req/s.
+
+### ROCm Pass 19: Direct-Path Residual/Next-RMS Fusion
+
+Status: retained as `EI_ROCM_DIRECT_RMS_FUSION=1` below the 32-token native
+MFMA boundary.
+
+Metal's short-shape fusion and ROCm's own FP16 register-cached RMS showed that
+the direct FP32 route was paying avoidable launch and global-read costs. A new
+kernel computes post-projection RMS, updates the residual, computes the next
+RMS from 24 register-held values per logical lane, and writes the next FP32
+projection input. The next layer consumes that result directly, reducing the
+direct route from roughly four norm launches per layer to two.
+
+Nine-warmup/41-iteration alternating A/B measured `1.600x`, `1.523x`, `1.506x`,
+`1.438x`, `1.383x`, `1.291x`, and `1.281x` at T1/T2/T4/T8/T16/T24/T31. T32,
+which takes native MFMA and already had the FP16 fusion, remained neutral at
+`1.008x`. Minimum candidate/baseline cosine was `0.999999318`.
+
+### ROCm Pass 20: Direct Q4 Activation Reuse
+
+Status: retained as `EI_ROCM_DIRECT_Q4_PAIR=1` for 16-31 flattened tokens.
+
+CPU/Metal adjacent-row kernels suggested explicitly reusing each FP32
+activation load across two Q4 output rows. The direct QKV, V-only,
+attention-output, and FFN-down kernels now have paired-row variants; the fused
+up/gate kernel similarly reuses each activation load across both matrices.
+The row boundaries are architecture-neutral and do not depend on a specific
+CDNA target.
+
+Five-warmup/20-iteration alternating A/B measured `1.089x`, `1.077x`, and
+`1.085x` at T16/T24/T31 with cosine 1. Pairing was neutral at T4/T8 and reduced
+T1/T2 throughput to `0.967x`/`0.982x`, so runtime routing starts at 16 tokens
+and ends naturally at the 32-token native-MFMA boundary.
+
+### ROCm Pass 21: Fused Embedding and First RMS
+
+Status: marginal; retained as `EI_ROCM_FUSED_EMBEDDING_RMS=1` below 32 tokens.
+
+A register-cached kernel now dequantizes each Q8 embedding row, writes the
+residual stream, computes the first attention RMS, and emits the normalized
+FP32 projection input without a second global read or launch. A corresponding
+FP16 output was tested for MFMA/hipBLAS shapes but was not retained there.
+
+Seven-warmup/31-iteration alternating A/B measured `1.026x` at T1, `1.010x` at
+T8, `1.029x` at T16, and `1.027x` at T31. T32/T128/T512/T2048 ranged from
+`0.998x` to `1.018x`, so the route is limited to the direct path. Minimum
+direct-path cosine was `0.999999349`. This is insignificant pass 1 of 3 because
+no measured shape reached the 3% retention threshold.
+
+### ROCm Pass 22: Singleton Metadata Elision
+
+Status: retained as `EI_ROCM_SINGLETON_METADATA_ELISION=1`.
+
+The exact V-only path never consumes positions, sequence IDs, or flash/MFMA
+attention tile metadata, but the host still allocated, populated, and submitted
+eight small metadata transfers for every all-singleton batch. The batch planner
+now recognizes this shape before allocating those vectors and transfers only
+token IDs plus pooling offsets. Mixed and multi-token batches retain the full
+metadata path.
+
+Nine-warmup/51-iteration engine A/B improved T1 by `1.034x` with cosine 1.
+Packed singleton B1/B2/B4/B8/B16/B32/B64 improved by `1.028x`, `1.028x`,
+`1.031x`, `1.028x`, `1.053x`, `1.014x`, and `1.008x`; B64 reached 22,383
+req/s. The B16 and single-request gains exceed 3%, resetting the insignificant
+pass counter.
+
+### ROCm Pass 23: Direct Singleton Final Pool
+
+Status: retained as `EI_ROCM_FINAL_SINGLETON_POOL=1` on the direct path only.
+
+For independent one-token sequences, the final FFN residual update, output
+RMS, mean pool, and L2 normalization can be computed by one register-cached
+wave per request. The fused kernel avoids writing and rereading the final
+residual. It measured `1.012x`, `1.013x`, `1.010x`, `1.017x`, and `1.037x` at
+B1/B2/B4/B8/B16 with exact direct-path parity. A native-MFMA crossover test
+failed parity at B32 (`0.770338356`), so the guard explicitly excludes every
+GEMM/MFMA shape rather than relaxing correctness. This did not reset the stop
+counter because the broad gain was below 3%.
+
+### ROCm Pass 24: Singleton-Aware Projection Crossover
+
+Status: retained with direct packed Q4 through 72 singleton requests.
+
+V-only attention removes most attention work from an all-singleton batch, so
+the general 32-token MFMA crossover no longer represents the complete route.
+An alternating packed A/B kept the direct kernels active beyond 32 tokens.
+Direct improved B32/B48/B64/B68/B72 by `1.655x`, `1.355x`, `1.130x`, `1.103x`,
+and `1.068x` with minimum cosine `0.999983609`. B76 was only `1.024x`, B80 was
+neutral, and MFMA won from B84 onward. The architecture-neutral runtime guard
+therefore uses `EI_ROCM_SINGLETON_DIRECT_MAX_TOKENS=72`. This significant
+concurrent-throughput pass resets the insignificant-pass counter.
+
+### ROCm Pass 25: Paired Q4 at Extended Singleton Shapes
+
+Status: retained through the singleton direct-route ceiling.
+
+The Pass 24 crossover exposes direct shapes beyond the original T31 pairing
+sweep. Exact alternating A/B at B16/B24/B32/B48/B64/B72 measured `1.111x`,
+`1.091x`, `1.102x`, `1.096x`, `1.101x`, and `1.111x` for paired Q4 versus
+one-row Q4. B8 remained neutral, and B76/B80 correctly remained neutral
+because they route to MFMA. This interaction confirms the existing 16-token
+pairing threshold and resets the insignificant-pass counter.
+
+### ROCm Pass 26: Four-Row Direct Q4 Reuse
+
+Status: rejected; retained only as `EI_ROCM_DIRECT_Q4_QUAD=1` for diagnostics.
+
+Four-row V-only, QKV, attention-output, and FFN-down kernels doubled activation
+reuse relative to the paired route. The extra accumulators and weight fragments
+raised VGPR pressure: single-sequence T8/T16/T24/T31 ranged from `0.981x` to
+`1.009x`. Packed B32/B48/B64/B72 measured `1.020x`, `1.021x`, `1.007x`, and
+`1.030x`, while B16 regressed to `0.965x`. Cosine was exactly 1, but there was
+no broad gain above 3%, making this insignificant pass 1 of 3.
+
+### ROCm Pass 27: Pinned Host I/O Staging
+
+Status: rejected; retained as `EI_ROCM_PINNED_IO_STAGING=1` for diagnostics.
+
+Reusable HIP-pinned buffers stage token IDs, offsets, and returned embeddings,
+avoiding pageable-memory handling inside asynchronous copies. Engine A/B ranged
+from `1.011x` at T1 to `1.037x` at T16, but fell to `0.999x` at T512 and
+`0.992x` at T2048. Packed singleton B1-B8 improved `1.008x-1.019x`; B32-B256
+were only `1.002x-1.021x`. The isolated B16 result was `1.044x`, but the sweep
+does not support enabling extra pinned allocations for that one point. This is
+insignificant pass 2 of 3.
+
+### ROCm Pass 28: Post-Fusion HIP Graph Replay
+
+Status: rejected; `EI_ROCM_COMMAND_GRAPH` remains disabled.
+
+The graph experiment was repeated after residual, embedding, metadata, and
+singleton launch reductions changed the captured workload. Nine-warmup,
+51-iteration A/B measured `0.991x`, `0.974x`, `0.990x`, `0.972x`, `0.992x`,
+and `0.994x` at T1/T4/T8/T16/T31/T32. T128/T512/T2048 were neutral at
+`1.005x`, `0.999x`, and `1.003x`, all with cosine 1. This is insignificant pass
+3 of 3, so the continuation loop stops here.
+
+### ROCm Continuation Stop
+
+The last significant result was the paired-Q4 interaction across the new
+singleton-direct range. The following three experiments produced no broad
+gain above 3%: four-row Q4 reuse, pinned host staging, and post-fusion HIP graph
+replay. Their guarded implementations remain diagnostic-only and disabled;
+the measured two-row, fusion, metadata, and batch-aware crossover routes are
+the production defaults.
+
+### ROCm Continuation Final Validation
+
+The expanded ROCm suite found and fixed two diagnostic-toggle guard bugs:
+metadata elision now requires V-only attention, and disabling direct RMS cannot
+skip intermediate FFN residuals when final singleton pooling is enabled. The
+portable build then passed all 10 llama.cpp goldens at minimum cosine
+`0.999911070`, CPU/ROCm synthetic drift at `0.991408229`, packed batch parity at
+`0.999882340`, all new route-toggle comparisons, and HTTP Matryoshka tests. The
+direct/MFMA singleton crossover comparison passed at minimum cosine
+`0.999979198`. CPU and Metal regression suites also passed.
+
+Final nine-warmup/51-iteration medians were 0.933 ms at T1, 1.576 ms at T7,
+1.903 ms at T16, 2.623 ms at T31, 3.600 ms at T32, 3.409 ms at T96, 3.556 ms
+at T128, 4.781 ms at T256, 6.044 ms at T512, 7.260 ms at T1024, 8.576 ms at
+T1536, and 9.941 ms at T2048. That is 1,072 T1 req/s and 206,011 input tok/s at
+full context.
+
+Default explicit singleton batches measured approximately 18,522 req/s at B32
+and 26,014 req/s at the B72 direct ceiling; native MFMA measured 65,358 req/s
+at B256. A 256-request dynamic-service run at T32 reached 273/279/746/1,198/
+1,645/3,952 req/s at concurrency 1/2/4/8/16/32, with average batch 28.4 at C32.
+`roc-obj-ls` confirmed `gfx908`, `gfx90a`, `gfx942`, and `gfx950` code objects in
+the final binary.

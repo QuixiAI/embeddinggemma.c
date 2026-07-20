@@ -25,7 +25,9 @@
 
 extern char **environ;
 
-#if defined(EI_ENABLE_XPU)
+#if defined(EI_ENABLE_ROCM)
+#define DEFAULT_INFERENCE_BACKEND "rocm"
+#elif defined(EI_ENABLE_XPU)
 #define DEFAULT_INFERENCE_BACKEND "xpu"
 #elif defined(EI_ENABLE_CUDA)
 #define DEFAULT_INFERENCE_BACKEND "cuda"
@@ -981,7 +983,7 @@ static void ensure_model_available(const char *model_path) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s [--bind ADDR] [--port PORT] [--backend auto|cpu|metal|cuda|xpu]\n"
+        "usage: %s [--bind ADDR] [--port PORT] [--backend auto|cpu|metal|cuda|rocm|xpu]\n"
         "          [--model PATH] [--workers N] [--max-queue N]\n"
         "          [--cache-entries N] [--max-batch-tokens N]\n"
         "          [--max-batch-requests N]\n"
@@ -1037,6 +1039,8 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
             if (strcmp(opts->backend, "auto") != 0 && strcmp(opts->backend, "cpu") != 0 &&
                 strcmp(opts->backend, "metal") != 0 &&
                 strcmp(opts->backend, "cuda") != 0 &&
+                strcmp(opts->backend, "rocm") != 0 &&
+                strcmp(opts->backend, "hip") != 0 &&
                 strcmp(opts->backend, "xpu") != 0 &&
                 strcmp(opts->backend, "sycl") != 0) return false;
         } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {

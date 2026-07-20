@@ -128,6 +128,8 @@ def main() -> int:
     rows = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
 
     out_dir = args.out_dir or default_out_dir(args.preset)
+    if not out_dir.is_absolute():
+        out_dir = REPO_ROOT / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     meta = {
         "schema": 1,

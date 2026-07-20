@@ -69,6 +69,7 @@ int main(int argc, char **argv) {
     ei_engine_free(&engine);
     float minimum_expected = 0.9999f;
     if (strcmp(backend, "cuda") == 0) minimum_expected = 0.998f;
+    if (strcmp(backend, "rocm") == 0) minimum_expected = 0.999f;
     if (strcmp(backend, "xpu") == 0) minimum_expected = 0.999f;
     if (minimum < minimum_expected) {
         fprintf(stderr, "%s packed batch parity failed: minimum cosine %.9f\n",

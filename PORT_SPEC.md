@@ -2,8 +2,8 @@
 
 A minimal inference engine for exactly one model:
 `ggml-org/embeddinggemma-300M-qat-q4_0-GGUF`. Hand-ported from the llama.cpp
-reference with no ggml dependency. CPU ARM64/x64, Metal, and CUDA are
-implemented; ROCm/HIP and XPU SYCL are target ports. The server exposes the
+reference with no ggml dependency. CPU ARM64/x64, Metal, CUDA, ROCm/HIP, and
+XPU SYCL are implemented. The server exposes the
 `/api/embed` HTTP contract that `db/03` `get_embedding()` already speaks.
 
 **Parity target**: llama.cpp CPU inference of the file below is ground truth.
@@ -126,7 +126,7 @@ llama.cpp deep-read) before implementing.
 | x86 CPU | implemented, parity tested | scalar, SSSE3, and AVX2 paths |
 | macOS Metal | implemented, parity tested | Objective-C host + standalone metallib; short-shape residual/next-norm fusion; FP16 K/V at long sequence lengths with FP32 accumulation |
 | NVIDIA CUDA | implemented, parity tested | Q4 x Q8 DP4A latency path; direct-FP16 combined-QKV epilogue; Flash, online, banded-SWA, and tensor-core attention; native packed-Q4 MMA diagnostics; CUDA graph replay |
-| ROCm/HIP | pending | planned `.hip` backend and GPU-host validation |
+| ROCm/HIP | implemented, parity tested | portable CDNA fat binary; paired packed-Q4 wave and MFMA projection kernels; exact singleton V-only attention; batched hipBLAS GQA; FP16/FP32 score routing; fused residual/RMS and pooling epilogues |
 | XPU SYCL | implemented, parity tested | resident FP16 weights; oneMKL XMX GEMM; fused norm/RoPE, online attention, and pooling; optional Xe2 Flash Attention |
 
 Core inference is C11 and links the OS C library, `libm`, and pthreads. The
@@ -140,6 +140,13 @@ FP16 GQA for short sequences and tensor-core QK/PV for long sequences, with
 rectangular symmetric-SWA bands, FP32 softmax, and FP32 accumulation. The XPU
 SYCL backend lives in `engine_xpu.cpp`, with optional Xe2 kernels adapted from
 `vllm-xpu-kernels` in `engine_xpu_flash.cpp`.
+The ROCm host and kernels live together in `engine_rocm.hip` and link HIP
+Runtime plus hipBLAS. Its default build embeds native code objects for
+`gfx908`, `gfx90a`, `gfx942`, and `gfx950`; `ROCM_ARCHS` is a developer override,
+not a release default. Native packed-Q4 MFMA serves the measured midrange and
+batched hipBLAS serves large projection and attention shapes. Independent
+one-token sequences elide Q/K/RoPE/softmax and metadata, remain on paired direct
+Q4 through 72 flattened tokens, and use a fused final residual/pool epilogue.
 
 ## Phase order
 
@@ -148,5 +155,5 @@ SYCL backend lives in `engine_xpu.cpp`, with optional Xe2 kernels adapted from
 2. HTTP server and model download - **done**
 3. NEON, AVX2/SSSE3, and persistent CPU scheduling - **done**
 4. Metal kernels, host dispatch, and parity - **done**
-5. CUDA - **done**; ROCm/HIP and XPU SYCL - **pending**
-6. External service integration and packaging - **pending**
+5. CUDA, ROCm/HIP, and XPU SYCL - **done**
+6. External service integration, installer, and release packaging - **done**

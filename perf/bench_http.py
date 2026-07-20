@@ -194,7 +194,7 @@ def summary(rows: list[dict[str, float | int | str | bool]],
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--backend", choices=("cpu", "metal", "cuda", "xpu"), required=True
+        "--backend", choices=("cpu", "metal", "cuda", "rocm", "xpu"), required=True
     )
     parser.add_argument("--keepalive", choices=("on", "off"), required=True)
     parser.add_argument("--encoding-format", choices=("float", "base64", "both"),
@@ -221,6 +221,7 @@ def main() -> int:
         "cpu": "embeddinggemma",
         "metal": "embeddinggemma-metal",
         "cuda": "embeddinggemma-cuda",
+        "rocm": "embeddinggemma-rocm",
         "xpu": "embeddinggemma-xpu",
     }[args.backend]
     binary = args.binary or REPO_ROOT / "build" / binary_name
@@ -229,6 +230,7 @@ def main() -> int:
             "cpu": "all",
             "metal": "metal",
             "cuda": "cuda",
+            "rocm": "rocm",
             "xpu": "xpu",
         }[args.backend]
         subprocess.run(
@@ -283,6 +285,8 @@ def main() -> int:
         f"{now:%H%M%S}-{args.tag}-{args.backend}-{args.keepalive}-"
         f"cache{args.response_cache_mb}"
     )
+    if not out_dir.is_absolute():
+        out_dir = REPO_ROOT / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
         "schema": 1,

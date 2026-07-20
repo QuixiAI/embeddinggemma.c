@@ -211,7 +211,7 @@ def summary(rows: list[dict[str, float | int | str]], metadata: dict[str, object
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--backend", choices=("cpu", "metal", "cuda", "xpu"), required=True
+        "--backend", choices=("cpu", "metal", "cuda", "rocm", "xpu"), required=True
     )
     parser.add_argument("--binary", type=Path)
     parser.add_argument(
@@ -236,6 +236,7 @@ def main() -> int:
         "cpu": "embeddinggemma",
         "metal": "embeddinggemma-metal",
         "cuda": "embeddinggemma-cuda",
+        "rocm": "embeddinggemma-rocm",
         "xpu": "embeddinggemma-xpu",
     }[args.backend]
     binary = args.binary or REPO_ROOT / "build" / binary_name
@@ -244,6 +245,7 @@ def main() -> int:
             "cpu": "all",
             "metal": "metal",
             "cuda": "cuda",
+            "rocm": "rocm",
             "xpu": "xpu",
         }[args.backend]
         subprocess.run(["make", target], cwd=REPO_ROOT, check=True)
@@ -286,6 +288,8 @@ def main() -> int:
     out_dir = args.out_dir or RESULTS_ROOT / now.strftime("%Y-%m-%d") / (
         f"{now:%H%M%S}-{args.backend}-dimensions"
     )
+    if not out_dir.is_absolute():
+        out_dir = REPO_ROOT / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
         "schema": 1,

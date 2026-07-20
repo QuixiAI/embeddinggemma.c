@@ -7,6 +7,7 @@ Standalone C11 inference and HTTP serving for
 - Q4_0/Q8_0 inference on scalar CPU, ARM64 NEON, and x86 SIMD paths.
 - Complete Apple Metal backend with kernels embedded in one executable.
 - CUDA backend with packed-Q4 warp kernels and FP16 tensor-core projections.
+- ROCm backend with packed-Q4 MFMA kernels and batched hipBLAS projections.
 - Model-specialized full/SWA attention, mean pooling, and L2 normalization.
 - Matryoshka outputs at 768, 512, 256, or 128 dimensions.
 - Token-budget dynamic batching with bounded lookahead, duplicate singleflight,
@@ -14,8 +15,8 @@ Standalone C11 inference and HTTP serving for
 - Bounded HTTP, tokenizer, and inference queues for concurrent serving.
 - `GET /api/tags` and `POST /api/embed` HTTP routes.
 
-The CPU, Metal, CUDA, and XPU SYCL paths are implemented and parity-tested.
-ROCm/HIP remains a planned target.
+The CPU, Metal, CUDA, ROCm, and XPU SYCL paths are implemented and
+parity-tested.
 
 ## Install
 
@@ -26,21 +27,23 @@ curl -fsSL https://raw.githubusercontent.com/QuixiAI/embeddinggemma.c/main/insta
 ```
 
 The installer selects Metal on Apple Silicon. On Linux x86_64 it selects CUDA
-when an NVIDIA device and its runtime dependencies are available, otherwise it
-selects CPU. It verifies the binary against the release's `SHA256SUMS` before
+for NVIDIA, ROCm when an AMD KFD device is present, XPU for a Level Zero GPU,
+or CPU otherwise. Missing accelerator runtime libraries trigger an automatic
+CPU fallback. It verifies the binary against the release's `SHA256SUMS` before
 replacing an existing installation.
 
 Override automatic selection or pin a release when needed:
 
 ```sh
 ./install.sh --variant cpu
-./install.sh --version v0.2.3
+./install.sh --version v0.2.4
 ./install.sh --install-dir "$HOME/bin"
 ```
 
 The equivalent environment variables are `QUIXIEMBED_VARIANT`,
 `QUIXIEMBED_VERSION`, and `QUIXIEMBED_INSTALL_DIR`. Published binaries currently
-cover Darwin ARM64 (`cpu`, `metal`) and Linux x86_64 (`cpu`, `cuda`, `xpu`).
+cover Darwin ARM64 (`cpu`, `metal`) and Linux x86_64 (`cpu`, `cuda`, `rocm`,
+`xpu`).
 
 ## Build
 
@@ -87,6 +90,19 @@ make xpu SYCL_CXX=icpx
 The output is `build/embeddinggemma-xpu` and defaults to the XPU backend.
 oneAPI DPC++, oneMKL, and a Level Zero GPU runtime are required.
 
+Build the portable AMD CDNA ROCm server:
+
+```sh
+make rocm HIPCC=/opt/rocm/bin/hipcc
+```
+
+The output is `build/embeddinggemma-rocm` and defaults to ROCm. ROCm HIP,
+hipBLAS, and an AMDGPU runtime are required. The default is one fat binary with
+native code for `gfx908`, `gfx90a`, `gfx942`, and `gfx950`, covering production
+CDNA1 through CDNA4 hardware. `ROCM_ARCHS="gfx90a gfx942"` may select a smaller
+developer build; the legacy single-target `ROCM_ARCH=gfx942` override remains
+available for local profiling only.
+
 The default model location is
 `$XDG_CACHE_HOME/embeddinggemma.c/embeddinggemma-300M-qat-Q4_0.gguf`, or
 `$HOME/.cache/embeddinggemma.c/embeddinggemma-300M-qat-Q4_0.gguf` when
@@ -116,6 +132,13 @@ The CUDA binary likewise defaults to CUDA:
 ```sh
 ./build/embeddinggemma-cuda
 ./build/embeddinggemma-cuda --backend cpu
+```
+
+The ROCm binary defaults to ROCm:
+
+```sh
+./build/embeddinggemma-rocm
+./build/embeddinggemma-rocm --backend cpu
 ```
 
 The retained CPU routes include NEON dot-product, AVX2, SSSE3, and scalar Q4_0
@@ -208,6 +231,66 @@ CUDA diagnostic controls:
   default 1536.
 - `EI_CUDA_NATIVE_Q4_GEMM=0|1`: use packed-Q4 MMA without expanded projection
   weights on compute capability 8.0 and newer; default 0.
+
+The ROCm route keeps packed Q4 weights resident and also expands them to FP16
+once for large hipBLAS GEMMs. Native Q4 MFMA handles 32-368 flattened tokens;
+shorter requests use direct packed-Q4 wave kernels and larger requests use
+hipBLAS. QKV and up/gate projections are fused, residual/next-RMS keeps the
+updated residual in registers, and the upper native range fuses paired up/gate
+MFMA with GELU and FP16 output.
+
+Independent one-token sequences use an exact V-only attention route that skips
+Q, K, RoPE, and softmax. Their host metadata, first embedding/RMS, final pool,
+and direct Q4 projections are fused or elided; paired-row direct Q4 remains
+faster through 72 packed singleton requests, after which native MFMA takes over.
+
+Attention stores FP16 Q/K/V and uses online kernels below the dense crossover.
+Dense attention broadcasts the shared GQA K/V head through one strided-batched
+hipBLAS QK call and one PV call for all three query heads. Its tuned thresholds
+are 96 tokens for one sequence, 128 for batches of two through four, and 192 for
+larger batches. Scores are FP16 through 896 tokens and FP32 above that, while
+softmax reductions and GEMM accumulation remain FP32. Dense full matrices beat
+smaller SWA query bands at the model's 2K context on the MI300X validation host.
+
+ROCm diagnostic controls:
+
+- `EI_ROCM_DEVICE=0..N`: select the HIP device; default 0.
+- `EI_ROCM_GEMM_MIN_TOKENS=1..65536`: move the packed-wave/native-MFMA
+  boundary; default 32.
+- `EI_ROCM_SINGLETON_DIRECT_MAX_TOKENS=0..65536`: keep all-singleton batches on
+  direct packed Q4 through this flattened size; default 72, and 0 disables the
+  singleton-specific override.
+- `EI_ROCM_NATIVE_Q4_GEMM=0|1` and
+  `EI_ROCM_NATIVE_Q4_MAX_TOKENS=1..65536`: control native packed-Q4 MFMA;
+  defaults are enabled and 368.
+- `EI_ROCM_NATIVE_Q4_FUSED=0|1` and
+  `EI_ROCM_NATIVE_Q4_FUSED_ACTIVATION=0|1`: control combined native
+  projections and the thresholded up/gate/GELU epilogue; both default to 1.
+- `EI_ROCM_FP16_ATTENTION_MIN_TOKENS=1..65536`: move FP16 attention storage;
+  default 5.
+- `EI_ROCM_TENSOR_ATTENTION_MIN_TOKENS=1..65536`: force one dense-attention
+  threshold instead of the batch-aware route.
+- `EI_ROCM_BATCHED_TENSOR_ATTENTION=0|1`: batch the three GQA query heads in
+  hipBLAS; default 1.
+- `EI_ROCM_FP16_ATTENTION_SCORES=0|1`: use FP16 dense scores through the tuned
+  896-token boundary; default 1.
+- `EI_ROCM_SWA_TENSOR_TILE_TOKENS=0|128|256|512|1024`: select SWA query
+  banding; default 0 after the dense route won at 1,536 and 2,048 tokens.
+- `EI_ROCM_DIRECT_FP16_CONTEXT=0|1` and `EI_ROCM_RMS_REGISTER_CACHE=0|1`:
+  control retained conversion and residual/RMS fusions; both default to 1.
+- `EI_ROCM_SINGLE_TOKEN_V_ONLY=0|1`,
+  `EI_ROCM_SINGLETON_METADATA_ELISION=0|1`, and
+  `EI_ROCM_FINAL_SINGLETON_POOL=0|1`: control exact one-token attention and its
+  metadata/final-pool fast paths; all default to 1.
+- `EI_ROCM_DIRECT_RMS_FUSION=0|1`, `EI_ROCM_DIRECT_Q4_PAIR=0|1`, and
+  `EI_ROCM_FUSED_EMBEDDING_RMS=0|1`: control retained direct-path launch and
+  activation-read reductions; all default to 1.
+- `EI_ROCM_COMMAND_GRAPH=0|1`, `EI_ROCM_MFMA_ATTENTION=0|1`,
+  `EI_ROCM_NATIVE_Q4_WIDE=0|1`, and
+  `EI_ROCM_NATIVE_Q4_DIRECT_FP16_QKV=0|1`,
+  `EI_ROCM_DIRECT_Q4_QUAD=0|1`, and `EI_ROCM_PINNED_IO_STAGING=0|1`: preserve
+  rejected kernels and staging routes for architecture-specific retesting; all
+  default to 0.
 
 The XPU route keeps model and workspace allocations resident, expands Q4_0
 projection weights to FP16 once, uses oneMKL XMX GEMM, and combines QKV and
@@ -321,6 +404,12 @@ Run CUDA golden, CPU/CUDA drift, packed-batch, and HTTP dimension tests:
 make test-cuda NVCC=/usr/local/cuda/bin/nvcc CUDA_ARCHS=86
 ```
 
+Run the equivalent ROCm suite with the portable CDNA fat binary:
+
+```sh
+make test-rocm HIPCC=/opt/rocm/bin/hipcc
+```
+
 The tests compare core GGUF metadata and all 314 tensor descriptors with the
 checked-in model manifest, plus tokenizer exact matches, quantized kernels,
 full/SWA attention, fused kernels, and all 10 embedding goldens. Each backend's
@@ -330,6 +419,10 @@ llama.cpp acceptance test. CUDA packed-route drift uses a 0.998 threshold becaus
 a one-token Q8/DP4A request can cross into FP16 tensor-core GEMM when flattened.
 CUDA tests also compare online versus tensor-core attention through 2048 tokens
 and expanded-FP16 versus native packed-Q4 MMA projections.
+ROCm tests additionally compare per-head and batched-head hipBLAS, FP32 and
+FP16 attention scores, split versus fused native FFN activation, singleton
+V-only attention, direct RMS/Q4/embedding fusions, final singleton pooling, and
+the direct/MFMA singleton crossover.
 
 ## Performance
 
@@ -343,9 +436,11 @@ make perf
 make perf-engine
 make perf-engine-metal
 make perf-engine-cuda
+make perf-engine-rocm
 make perf-engine-xpu XPU_XE2_FLASH=1
 make perf-concurrency
 make perf-concurrency-cuda
+make perf-concurrency-rocm
 make perf-concurrency-xpu XPU_XE2_FLASH=1
 make perf-batch
 make perf-tokenization
@@ -363,6 +458,9 @@ python3 perf/bench_http.py --backend metal --keepalive on --response-cache-mb 64
   --ab-metal-fp16-kv
 python3 perf/bench_engine.py --backend cuda --tokens 1,7,32,128,512,2048
 python3 perf/bench_concurrency.py --backend cuda --tokens 32 \
+  --concurrency 1,2,4,8,16,32
+python3 perf/bench_engine.py --backend rocm --tokens 1,7,32,128,512,2048
+python3 perf/bench_concurrency.py --backend rocm --tokens 32 \
   --concurrency 1,2,4,8,16,32
 python3 perf/bench_engine.py --backend xpu --tokens 1,7,32,128,512,2048
 python3 perf/bench_concurrency.py --backend xpu --tokens 32 \
@@ -382,12 +480,14 @@ comparisons; compiler, driver, power, and system load differ between hosts.
 | CPU | Apple M5 Max | 370 | 1,051 | 1,350 |
 | Metal | Apple M5 Max | 570 | 8,009 | 10,465 |
 | CUDA | NVIDIA RTX 3090 | 584 | 13,897 | 102,755 |
+| ROCm | AMD Instinct MI300X | 1,072 | 8,890 | 206,011 |
 | XPU SYCL | Intel Arc Pro B60 | 962 | 14,747 | 99,708 |
 
-The corresponding median latencies were CPU `2.70/30.46/1516.56 ms`, Metal
-`1.76/4.00/195.70 ms`, CUDA `1.71/2.30/19.93 ms`, and XPU
-`1.04/2.17/20.54 ms` for T1/T32/T2048. Full commands, warmup counts, parity
-checks, and per-pass A/B results are preserved in the optimization log.
+The corresponding median latencies for T1/T32/T2048 were CPU
+`2.70/30.46/1516.56 ms`, Metal `1.76/4.00/195.70 ms`, CUDA
+`1.71/2.30/19.93 ms`, ROCm `0.93/3.60/9.94 ms`, and XPU
+`1.04/2.17/20.54 ms`. Full commands, warmup counts, parity checks, and per-pass
+A/B results are preserved in the optimization log.
 
 The concurrency harness submits unique cache-miss requests through the actual
 inference service. One backend thread owns the mutable engine workspace and
@@ -420,6 +520,14 @@ batches of 32. A dynamic-service T32 run before the final Xe2 passes reached
 an unrelated resident workload, so the final packed measurements are reported
 instead of presenting those contended values as a regression.
 
+On the MI300X validation host, an explicit packed batch of 32 independent
+32-token requests reaches 5,161 req/s and 165,164 input tok/s. The stable
+dynamic-service run reaches 3,952 req/s at concurrency 32 with an average
+executed batch size of 28.4. Exact V-only attention reaches approximately
+18,522 req/s at singleton B32 and 26,014 req/s at the B72 direct-route ceiling;
+native MFMA reaches approximately 65,358 req/s at B256. At full context the
+single-engine route reaches 206,011 input tok/s.
+
 ## Run
 
 ```sh
@@ -436,6 +544,12 @@ CUDA:
 
 ```sh
 ./build/embeddinggemma-cuda --bind 0.0.0.0 --port 11434
+```
+
+ROCm:
+
+```sh
+./build/embeddinggemma-rocm --bind 0.0.0.0 --port 11434
 ```
 
 XPU SYCL:
@@ -465,9 +579,8 @@ Serving controls:
 - `EI_ADAPTIVE_BATCH_WAIT=0`: always apply the configured collection delay.
 - `EI_HTTP_KEEPALIVE=0`: disable persistent HTTP connections for diagnostics.
 
-The inference owner preallocates its token/output buffers, and the CPU, Metal,
-or CUDA engine reserves the configured production workspace before the listener
-starts.
+The inference owner preallocates its token/output buffers, and each accelerator
+engine reserves the configured production workspace before the listener starts.
 HTTP concurrency, client array size, and backend batch size remain separate
 controls: larger admission capacity can tokenize the next work while one batch
 runs without allowing an unbounded client request.

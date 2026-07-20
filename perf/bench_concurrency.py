@@ -29,6 +29,15 @@ def command_output(cmd: list[str]) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else "unknown"
 
 
+def rocm_device() -> str:
+    output = command_output(["rocm-smi", "--showproductname", "--device", "0"])
+    series = next((line.split("Card Series:", 1)[1].strip()
+                   for line in output.splitlines() if "Card Series:" in line), "")
+    gfx = next((line.split("GFX Version:", 1)[1].strip()
+                for line in output.splitlines() if "GFX Version:" in line), "")
+    return f"{series} ({gfx})" if series and gfx else series or gfx or output
+
+
 def git_label() -> str:
     revision = command_output(["git", "rev-parse", "--short", "HEAD"])
     if not revision or revision == "unknown":
@@ -65,7 +74,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="model/embeddinggemma-300M-qat-Q4_0.gguf")
     parser.add_argument(
-        "--backend", choices=("cpu", "metal", "cuda", "xpu", "both"),
+        "--backend", choices=("cpu", "metal", "cuda", "rocm", "xpu", "both"),
         default="both",
     )
     parser.add_argument(
@@ -89,6 +98,8 @@ def main() -> int:
             targets.append("build/perf_concurrency_metal")
         if "cuda" in backends:
             targets.append("build/perf_concurrency_cuda")
+        if "rocm" in backends:
+            targets.append("build/perf_concurrency_rocm")
         if "xpu" in backends:
             targets.append("build/perf_concurrency_xpu")
         run(["make", *targets])
@@ -100,6 +111,7 @@ def main() -> int:
             "cpu": "./build/perf_concurrency",
             "metal": "./build/perf_concurrency_metal",
             "cuda": "./build/perf_concurrency_cuda",
+            "rocm": "./build/perf_concurrency_rocm",
             "xpu": "./build/perf_concurrency_xpu",
         }[backend]
         cmd = [
@@ -120,6 +132,8 @@ def main() -> int:
 
     now = dt.datetime.now()
     out_dir = args.out_dir or RESULTS_ROOT / now.strftime("%Y-%m-%d") / f"{now:%H%M%S}-{args.tag}"
+    if not out_dir.is_absolute():
+        out_dir = REPO_ROOT / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     meta = {
         "schema": 1,
@@ -138,7 +152,8 @@ def main() -> int:
         "commands": commands,
         "platform": platform.platform(),
         "python": platform.python_version(),
-        "device": command_output([
+        "device": rocm_device()
+        if "rocm" in backends else command_output([
             "nvidia-smi", "--query-gpu=name", "--format=csv,noheader", "-i", "0"
         ]) if "cuda" in backends else (
             command_output(["sycl-ls"]) if "xpu" in backends

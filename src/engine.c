@@ -6,6 +6,9 @@
 #if defined(EI_ENABLE_CUDA)
 #include "engine_cuda.h"
 #endif
+#if defined(EI_ENABLE_ROCM)
+#include "engine_rocm.h"
+#endif
 #if defined(EI_ENABLE_XPU)
 #include "engine_xpu.h"
 #endif
@@ -54,13 +57,33 @@ void ei_engine_load_backend(ei_engine *e, const char *model_path, const char *ba
     const char *requested = backend && *backend ? backend : "auto";
     if (strcmp(requested, "auto") != 0 && strcmp(requested, "cpu") != 0 &&
         strcmp(requested, "metal") != 0 && strcmp(requested, "cuda") != 0 &&
+        strcmp(requested, "rocm") != 0 && strcmp(requested, "hip") != 0 &&
         strcmp(requested, "xpu") != 0 && strcmp(requested, "sycl") != 0) {
-        ei_die("unknown inference backend '%s' (expected auto, cpu, metal, cuda, or xpu)",
+        ei_die("unknown inference backend '%s' (expected auto, cpu, metal, cuda, rocm, or xpu)",
                requested);
     }
+#if defined(EI_ENABLE_ROCM)
+    if (strcmp(requested, "auto") == 0 || strcmp(requested, "rocm") == 0 ||
+        strcmp(requested, "hip") == 0) {
+        char rocm_err[512];
+        e->rocm = ei_rocm_engine_create(&e->model, rocm_err, sizeof rocm_err);
+        if (e->rocm) {
+            e->backend_name = "rocm";
+        } else if (strcmp(requested, "rocm") == 0 ||
+                   strcmp(requested, "hip") == 0) {
+            ei_die("ROCm backend initialization failed: %s", rocm_err);
+        } else {
+            fprintf(stderr, "ROCm unavailable, using CPU: %s\n", rocm_err);
+        }
+    }
+#else
+    if (strcmp(requested, "rocm") == 0 || strcmp(requested, "hip") == 0) {
+        ei_die("this binary was built without ROCm/HIP support");
+    }
+#endif
 #if defined(EI_ENABLE_XPU)
-    if (strcmp(requested, "auto") == 0 || strcmp(requested, "xpu") == 0 ||
-        strcmp(requested, "sycl") == 0) {
+    if (!e->rocm && (strcmp(requested, "auto") == 0 ||
+        strcmp(requested, "xpu") == 0 || strcmp(requested, "sycl") == 0)) {
         char xpu_err[512];
         e->xpu = ei_xpu_engine_create(&e->model, xpu_err, sizeof xpu_err);
         if (e->xpu) {
@@ -77,7 +100,7 @@ void ei_engine_load_backend(ei_engine *e, const char *model_path, const char *ba
     }
 #endif
 #if defined(EI_ENABLE_METAL)
-    if (!e->xpu && (strcmp(requested, "auto") == 0 ||
+    if (!e->rocm && !e->xpu && (strcmp(requested, "auto") == 0 ||
                     strcmp(requested, "metal") == 0)) {
         char metal_err[512];
         e->metal = ei_metal_engine_create(&e->model, NULL, metal_err, sizeof metal_err);
@@ -95,7 +118,7 @@ void ei_engine_load_backend(ei_engine *e, const char *model_path, const char *ba
     }
 #endif
 #if defined(EI_ENABLE_CUDA)
-    if (!e->xpu && !e->metal && strcmp(requested, "cpu") != 0 &&
+    if (!e->rocm && !e->xpu && !e->metal && strcmp(requested, "cpu") != 0 &&
         strcmp(requested, "metal") != 0) {
         char cuda_err[512];
         e->cuda = ei_cuda_engine_create(&e->model, cuda_err, sizeof cuda_err);
@@ -112,7 +135,9 @@ void ei_engine_load_backend(ei_engine *e, const char *model_path, const char *ba
         ei_die("this binary was built without CUDA support");
     }
 #endif
-    if (!e->xpu && !e->metal && !e->cuda) e->thread_pool = ei_thread_pool_create(0);
+    if (!e->rocm && !e->xpu && !e->metal && !e->cuda) {
+        e->thread_pool = ei_thread_pool_create(0);
+    }
 }
 
 void ei_engine_load(ei_engine *e, const char *model_path) {
@@ -126,6 +151,9 @@ void ei_engine_free(ei_engine *e) {
 #endif
 #if defined(EI_ENABLE_CUDA)
     ei_cuda_engine_free(e->cuda);
+#endif
+#if defined(EI_ENABLE_ROCM)
+    ei_rocm_engine_free(e->rocm);
 #endif
 #if defined(EI_ENABLE_XPU)
     ei_xpu_engine_free(e->xpu);
@@ -811,6 +839,12 @@ bool ei_engine_reserve(ei_engine *e, size_t total_tokens, size_t batch_size,
                                       err, err_len);
     }
 #endif
+#if defined(EI_ENABLE_ROCM)
+    if (e->rocm) {
+        return ei_rocm_engine_reserve(e->rocm, total_tokens, batch_size,
+                                      err, err_len);
+    }
+#endif
     ensure_workspace(e, total_tokens);
     if (err && err_len) err[0] = '\0';
     return true;
@@ -834,6 +868,12 @@ bool ei_engine_embed_tokens(ei_engine *e, const int32_t *ids, size_t n_tokens,
 #if defined(EI_ENABLE_CUDA)
     if (e->cuda) {
         return ei_cuda_engine_embed_tokens(e->cuda, ids, n_tokens, out,
+                                           err, err_len);
+    }
+#endif
+#if defined(EI_ENABLE_ROCM)
+    if (e->rocm) {
+        return ei_rocm_engine_embed_tokens(e->rocm, ids, n_tokens, out,
                                            err, err_len);
     }
 #endif
@@ -907,6 +947,12 @@ bool ei_engine_embed_tokens_batch(ei_engine *e, const int32_t *ids,
     if (e->cuda) {
         return ei_cuda_engine_embed_tokens_batch(
             e->cuda, ids, offsets, batch_size, out, err, err_len);
+    }
+#endif
+#if defined(EI_ENABLE_ROCM)
+    if (e->rocm) {
+        return ei_rocm_engine_embed_tokens_batch(
+            e->rocm, ids, offsets, batch_size, out, err, err_len);
     }
 #endif
 

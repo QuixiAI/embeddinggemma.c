@@ -9,7 +9,7 @@ install_dir=${QUIXIEMBED_INSTALL_DIR:-}
 
 usage() {
     cat <<'EOF'
-Usage: install.sh [--version VERSION] [--variant auto|cpu|metal|cuda|xpu]
+Usage: install.sh [--version VERSION] [--variant auto|cpu|metal|cuda|rocm|xpu]
                   [--install-dir DIRECTORY]
 
 Downloads a quixiembed release binary and installs it as
@@ -17,7 +17,7 @@ Downloads a quixiembed release binary and installs it as
 
 Environment overrides:
   QUIXIEMBED_VERSION       Release tag, or latest (default: latest)
-  QUIXIEMBED_VARIANT       auto, cpu, metal, cuda, or xpu (default: auto)
+  QUIXIEMBED_VARIANT       auto, cpu, metal, cuda, rocm, or xpu (default: auto)
   QUIXIEMBED_INSTALL_DIR   Installation directory (default: ~/.local/bin)
 EOF
 }
@@ -63,7 +63,7 @@ case "$version" in
 esac
 
 case "$variant" in
-    auto|cpu|metal|cuda|xpu) ;;
+    auto|cpu|metal|cuda|rocm|xpu) ;;
     *) die "invalid variant: $variant" ;;
 esac
 
@@ -98,6 +98,8 @@ if [ "$variant" = auto ]; then
     elif command -v nvidia-smi >/dev/null 2>&1 &&
          nvidia-smi -L >/dev/null 2>&1; then
         variant=cuda
+    elif [ -e /dev/kfd ]; then
+        variant=rocm
     elif command -v sycl-ls >/dev/null 2>&1 &&
          sycl-ls 2>/dev/null | grep -Eq '\[level_zero:gpu\]'; then
         variant=xpu
@@ -107,7 +109,7 @@ if [ "$variant" = auto ]; then
 fi
 
 case "$platform-$variant" in
-    darwin-cpu|darwin-metal|linux-cpu|linux-cuda|linux-xpu) ;;
+    darwin-cpu|darwin-metal|linux-cpu|linux-cuda|linux-rocm|linux-xpu) ;;
     *) die "the $variant variant is not available for $platform-$architecture" ;;
 esac
 

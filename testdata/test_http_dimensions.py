@@ -204,7 +204,7 @@ def main():
     parser.add_argument("--binary", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument(
-        "--backend", choices=("cpu", "metal", "cuda", "xpu"), required=True
+        "--backend", choices=("cpu", "metal", "cuda", "rocm", "xpu"), required=True
     )
     args = parser.parse_args()
 

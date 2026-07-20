@@ -29,6 +29,23 @@ python3 perf/bench_http.py --backend metal --keepalive on --response-cache-mb 64
 python3 perf/bench_engine.py --backend cuda --tokens 1,7,32,128,512,2048
 python3 perf/bench_concurrency.py --backend cuda --tokens 32 \
   --concurrency 1,2,4,8,16,32
+python3 perf/bench_engine.py --backend rocm --tokens 1,7,32,128,512,2048
+python3 perf/bench_concurrency.py --backend rocm --tokens 32 \
+  --concurrency 1,2,4,8,16,32
+./build/perf_batch_rocm --model model/embeddinggemma-300M-qat-Q4_0.gguf \
+  --backend rocm --tokens 32 --batch-sizes 1,2,4,8,16,32
+./build/perf_engine_rocm --model model/embeddinggemma-300M-qat-Q4_0.gguf \
+  --backend rocm --tokens 96,128,256,512,1024,2048 --warmup 7 --iters 31 \
+  --ab-rocm-batched-attention
+./build/perf_engine_rocm --model model/embeddinggemma-300M-qat-Q4_0.gguf \
+  --backend rocm --tokens 1,8,16,24,31,32 --warmup 7 --iters 31 \
+  --ab-rocm-direct-q4-pair
+./build/perf_batch_rocm --model model/embeddinggemma-300M-qat-Q4_0.gguf \
+  --backend rocm --tokens 1 --batch-sizes 16,32,48,64,72,80,96 \
+  --warmup 7 --iters 31 --ab-rocm-singleton-direct
+./build/perf_batch_rocm --model model/embeddinggemma-300M-qat-Q4_0.gguf \
+  --backend rocm --tokens 1 --batch-sizes 1,2,4,8,16,32,64 \
+  --warmup 7 --iters 31 --ab-rocm-singleton-metadata
 ./build/perf_batch_cuda --model model/embeddinggemma-300M-qat-Q4_0.gguf \
   --backend cuda --tokens 32 --batch-sizes 1,2,4,8,16,32
 EI_CUDA_TENSOR_ATTENTION_MIN_TOKENS=65536 ./build/perf_engine_cuda \

@@ -237,7 +237,7 @@ static bool execute_engine_batch(void *opaque, const int32_t *ids,
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s --model model.gguf [--backend cpu|metal|cuda|xpu] "
+            "usage: %s --model model.gguf [--backend cpu|metal|cuda|rocm|xpu] "
             "[--tokens n[,n...]] [--concurrency 1,2,4] [--warmup n] "
             "[--min-requests n] [--max-batch-tokens n] "
             "[--max-batch-requests n] [--max-batch-sequence-tokens n] "
@@ -286,6 +286,7 @@ int main(int argc, char **argv) {
     }
     if (!model_path || (strcmp(backend, "cpu") != 0 &&
         strcmp(backend, "metal") != 0 && strcmp(backend, "cuda") != 0 &&
+        strcmp(backend, "rocm") != 0 &&
         strcmp(backend, "xpu") != 0) ||
         warmup < 0 || min_requests < 1) {
         usage(argv[0]);

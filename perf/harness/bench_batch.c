@@ -130,6 +130,8 @@ static void bench_level(ei_engine *engine, int32_t tokens, int32_t batch_size,
     float minimum_expected = 0.9999f;
     if (strcmp(ei_engine_backend(engine), "cuda") == 0) {
         minimum_expected = 0.998f;
+    } else if (strcmp(ei_engine_backend(engine), "rocm") == 0) {
+        minimum_expected = 0.999f;
     } else if (strcmp(ei_engine_backend(engine), "xpu") == 0) {
         minimum_expected = 0.9998f;
     }
@@ -241,6 +243,13 @@ int main(int argc, char **argv) {
     int32_t warmup = 2;
     int32_t iterations = 7;
     bool ab_metal_fp16_kv = false;
+    bool ab_rocm_v_only = false;
+    bool ab_rocm_singleton_metadata = false;
+    bool ab_rocm_final_singleton_pool = false;
+    bool ab_rocm_singleton_direct = false;
+    bool ab_rocm_direct_q4_pair = false;
+    bool ab_rocm_direct_q4_quad = false;
+    bool ab_rocm_pinned_io = false;
     bool ab_xpu_fp16_attention = false;
     bool ab_xpu_attention_routing = false;
     bool ab_xpu_v_only = false;
@@ -257,6 +266,13 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) warmup = atoi(argv[++i]);
         else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) iterations = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ab-metal-fp16-kv") == 0) ab_metal_fp16_kv = true;
+        else if (strcmp(argv[i], "--ab-rocm-v-only") == 0) ab_rocm_v_only = true;
+        else if (strcmp(argv[i], "--ab-rocm-singleton-metadata") == 0) ab_rocm_singleton_metadata = true;
+        else if (strcmp(argv[i], "--ab-rocm-final-singleton-pool") == 0) ab_rocm_final_singleton_pool = true;
+        else if (strcmp(argv[i], "--ab-rocm-singleton-direct") == 0) ab_rocm_singleton_direct = true;
+        else if (strcmp(argv[i], "--ab-rocm-direct-q4-pair") == 0) ab_rocm_direct_q4_pair = true;
+        else if (strcmp(argv[i], "--ab-rocm-direct-q4-quad") == 0) ab_rocm_direct_q4_quad = true;
+        else if (strcmp(argv[i], "--ab-rocm-pinned-io") == 0) ab_rocm_pinned_io = true;
         else if (strcmp(argv[i], "--ab-xpu-fp16-attention") == 0) ab_xpu_fp16_attention = true;
         else if (strcmp(argv[i], "--ab-xpu-attention-routing") == 0) ab_xpu_attention_routing = true;
         else if (strcmp(argv[i], "--ab-xpu-v-only") == 0) ab_xpu_v_only = true;
@@ -264,13 +280,173 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--ab-xpu-command-graph") == 0) ab_xpu_command_graph = true;
         else if (strcmp(argv[i], "--ab-xpu-xe2-w4") == 0) ab_xpu_xe2_w4 = true;
         else if (strcmp(argv[i], "--ab-xpu-rms-register-cache") == 0) ab_xpu_rms_register_cache = true;
-        else ei_die("usage: %s --model model.gguf [--backend cpu|metal|cuda|xpu] [--tokens N] "
+        else ei_die("usage: %s --model model.gguf [--backend cpu|metal|cuda|rocm|xpu] [--tokens N] "
                     "[--batch-sizes 1,2,4] [--max-total-tokens N]", argv[0]);
     }
     if (!model || tokens < 1 || tokens > EI_N_CTX || max_total_tokens < tokens ||
         warmup < 0 || iterations < 1) ei_die("invalid batch benchmark arguments");
     int32_t levels[MAX_BATCH_LEVELS];
     int32_t n_levels = parse_levels(batch_value, levels);
+    if (ab_rocm_pinned_io) {
+        if (strcmp(backend, "rocm") != 0) {
+            ei_die("--ab-rocm-pinned-io requires --backend rocm");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        setenv("EI_ROCM_PINNED_IO_STAGING", "0", 1);
+        ei_engine_load_backend(&baseline, model, "rocm");
+        setenv("EI_ROCM_PINNED_IO_STAGING", "1", 1);
+        ei_engine_load_backend(&candidate, model, "rocm");
+        unsetenv("EI_ROCM_PINNED_IO_STAGING");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "rocm",
+                                    "pinned_io_ab", "pinned_ms", 0.9999f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
+    if (ab_rocm_direct_q4_quad) {
+        if (strcmp(backend, "rocm") != 0) {
+            ei_die("--ab-rocm-direct-q4-quad requires --backend rocm");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        setenv("EI_ROCM_DIRECT_Q4_QUAD", "0", 1);
+        ei_engine_load_backend(&baseline, model, "rocm");
+        setenv("EI_ROCM_DIRECT_Q4_QUAD", "1", 1);
+        ei_engine_load_backend(&candidate, model, "rocm");
+        unsetenv("EI_ROCM_DIRECT_Q4_QUAD");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "rocm",
+                                    "direct_q4_quad_ab", "quad_ms",
+                                    0.9999f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
+    if (ab_rocm_direct_q4_pair) {
+        if (strcmp(backend, "rocm") != 0) {
+            ei_die("--ab-rocm-direct-q4-pair requires --backend rocm");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        setenv("EI_ROCM_DIRECT_Q4_PAIR", "0", 1);
+        ei_engine_load_backend(&baseline, model, "rocm");
+        setenv("EI_ROCM_DIRECT_Q4_PAIR", "1", 1);
+        ei_engine_load_backend(&candidate, model, "rocm");
+        unsetenv("EI_ROCM_DIRECT_Q4_PAIR");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "rocm",
+                                    "direct_q4_pair_ab", "pair_ms",
+                                    0.9999f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
+    if (ab_rocm_singleton_direct) {
+        if (strcmp(backend, "rocm") != 0) {
+            ei_die("--ab-rocm-singleton-direct requires --backend rocm");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        unsetenv("EI_ROCM_GEMM_MIN_TOKENS");
+        ei_engine_load_backend(&baseline, model, "rocm");
+        setenv("EI_ROCM_GEMM_MIN_TOKENS", "65536", 1);
+        ei_engine_load_backend(&candidate, model, "rocm");
+        unsetenv("EI_ROCM_GEMM_MIN_TOKENS");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "rocm",
+                                    "singleton_direct_ab", "direct_ms",
+                                    0.9999f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
+    if (ab_rocm_final_singleton_pool) {
+        if (strcmp(backend, "rocm") != 0) {
+            ei_die("--ab-rocm-final-singleton-pool requires --backend rocm");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        setenv("EI_ROCM_FINAL_SINGLETON_POOL", "0", 1);
+        ei_engine_load_backend(&baseline, model, "rocm");
+        setenv("EI_ROCM_FINAL_SINGLETON_POOL", "1", 1);
+        ei_engine_load_backend(&candidate, model, "rocm");
+        unsetenv("EI_ROCM_FINAL_SINGLETON_POOL");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "rocm",
+                                    "final_singleton_pool_ab", "fused_ms",
+                                    0.9999f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
+    if (ab_rocm_singleton_metadata) {
+        if (strcmp(backend, "rocm") != 0) {
+            ei_die("--ab-rocm-singleton-metadata requires --backend rocm");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        setenv("EI_ROCM_SINGLETON_METADATA_ELISION", "0", 1);
+        ei_engine_load_backend(&baseline, model, "rocm");
+        setenv("EI_ROCM_SINGLETON_METADATA_ELISION", "1", 1);
+        ei_engine_load_backend(&candidate, model, "rocm");
+        unsetenv("EI_ROCM_SINGLETON_METADATA_ELISION");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "rocm",
+                                    "singleton_metadata_ab", "elided_ms",
+                                    0.9999f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
+    if (ab_rocm_v_only) {
+        if (strcmp(backend, "rocm") != 0) {
+            ei_die("--ab-rocm-v-only requires --backend rocm");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        setenv("EI_ROCM_SINGLE_TOKEN_V_ONLY", "0", 1);
+        ei_engine_load_backend(&baseline, model, "rocm");
+        setenv("EI_ROCM_SINGLE_TOKEN_V_ONLY", "1", 1);
+        ei_engine_load_backend(&candidate, model, "rocm");
+        unsetenv("EI_ROCM_SINGLE_TOKEN_V_ONLY");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "rocm",
+                                    "single_token_v_only_ab", "v_only_ms",
+                                    0.9999f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
     if (ab_xpu_rms_register_cache) {
         if (strcmp(backend, "xpu") != 0) {
             ei_die("--ab-xpu-rms-register-cache requires --backend xpu");

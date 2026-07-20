@@ -1,4 +1,4 @@
-# embeddinggemma.c CPU, Metal, CUDA, and XPU SYCL build
+# embeddinggemma.c CPU, Metal, CUDA, ROCm, and XPU SYCL build
 CC      ?= cc
 CXX     ?= c++
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Werror -g
@@ -17,6 +17,19 @@ CUDA_PTX_ARCH ?= $(lastword $(CUDA_ARCHS))
 CUDA_GENCODE := $(foreach arch,$(CUDA_ARCHS),-gencode arch=compute_$(arch),code=sm_$(arch)) \
 	-gencode arch=compute_$(CUDA_PTX_ARCH),code=compute_$(CUDA_PTX_ARCH)
 CUDA_LDLIBS := -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcublas -lcudart
+HIPCC ?= hipcc
+ROCM_HOME ?= /opt/rocm
+HIPFLAGS ?= -std=c++17 -O3 -ffast-math
+# Build one portable Instinct binary by default. These are the production LLVM
+# targets for CDNA1 through CDNA4; ROCM_ARCH remains a developer-only override.
+ROCM_CDNA_ARCHS ?= gfx908 gfx90a gfx942 gfx950
+ifdef ROCM_ARCH
+ROCM_ARCHS ?= $(ROCM_ARCH)
+else
+ROCM_ARCHS ?= $(ROCM_CDNA_ARCHS)
+endif
+ROCM_GENCODE := $(foreach arch,$(ROCM_ARCHS),--offload-arch=$(arch))
+ROCM_LDLIBS := -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lhipblas -lamdhip64
 SYCL_CXX ?= icpx
 SYCLFLAGS ?= -std=c++17 -O3 -fsycl -ffast-math
 SYCL_TARGETS ?=
@@ -68,6 +81,10 @@ CUDA_CORE_OBJS := $(patsubst src/%.c,$(BUILD)/cuda/%.o,$(SRCS_ENGINE))
 CUDA_SERVICE_OBJS := $(patsubst src/%.c,$(BUILD)/cuda/%.o,$(SRCS_SERVICE))
 CUDA_SERVER_OBJS := $(patsubst src/%.c,$(BUILD)/cuda/%.o,$(SRCS_SERVER))
 CUDA_ENGINE_OBJ := $(BUILD)/cuda/engine_cuda.o
+ROCM_CORE_OBJS := $(patsubst src/%.c,$(BUILD)/rocm/%.o,$(SRCS_ENGINE))
+ROCM_SERVICE_OBJS := $(patsubst src/%.c,$(BUILD)/rocm/%.o,$(SRCS_SERVICE))
+ROCM_SERVER_OBJS := $(patsubst src/%.c,$(BUILD)/rocm/%.o,$(SRCS_SERVER))
+ROCM_ENGINE_OBJ := $(BUILD)/rocm/engine_rocm.o
 XPU_CORE_OBJS := $(patsubst src/%.c,$(BUILD)/xpu/%.o,$(SRCS_ENGINE))
 XPU_SERVICE_OBJS := $(patsubst src/%.c,$(BUILD)/xpu/%.o,$(SRCS_SERVICE))
 XPU_SERVER_OBJS := $(patsubst src/%.c,$(BUILD)/xpu/%.o,$(SRCS_SERVER))
@@ -199,6 +216,51 @@ $(BUILD)/perf_batch_cuda: $(BUILD)/cuda/perf_batch.o $(CUDA_CORE_OBJS) $(CUDA_EN
 $(BUILD)/perf_concurrency_cuda: $(BUILD)/cuda/perf_concurrency.o $(CUDA_CORE_OBJS) $(CUDA_SERVICE_OBJS) $(CUDA_ENGINE_OBJ) | $(BUILD)
 	$(CXX) -o $@ $^ $(LDLIBS) $(CUDA_LDLIBS)
 
+$(BUILD)/rocm/%.o: src/%.c src/*.h | $(BUILD)/rocm
+	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
+
+$(ROCM_ENGINE_OBJ): src/engine_rocm.hip src/engine_rocm.h src/model.h src/gguf.h | $(BUILD)/rocm
+	$(HIPCC) $(HIPFLAGS) $(ROCM_GENCODE) -Isrc -c -o $@ $<
+
+$(BUILD)/rocm/test_embed.o: src/test_embed.c src/*.h | $(BUILD)/rocm
+	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
+
+$(BUILD)/rocm/test_batch.o: src/test_batch.c src/*.h | $(BUILD)/rocm
+	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
+
+$(BUILD)/rocm/test_rocm.o: src/test_rocm.c src/*.h | $(BUILD)/rocm
+	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
+
+$(BUILD)/rocm/perf_engine.o: perf/harness/bench_engine.c src/*.h | $(BUILD)/rocm
+	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
+
+$(BUILD)/rocm/perf_batch.o: perf/harness/bench_batch.c src/*.h | $(BUILD)/rocm
+	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
+
+$(BUILD)/rocm/perf_concurrency.o: perf/harness/bench_concurrency.c src/*.h | $(BUILD)/rocm
+	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
+
+$(BUILD)/embeddinggemma-rocm: $(ROCM_SERVER_OBJS) $(ROCM_CORE_OBJS) $(ROCM_SERVICE_OBJS) $(ROCM_ENGINE_OBJ) | $(BUILD)
+	$(HIPCC) -o $@ $^ $(LDLIBS) $(ROCM_LDLIBS)
+
+$(BUILD)/test_embed_rocm: $(BUILD)/rocm/test_embed.o $(ROCM_CORE_OBJS) $(ROCM_ENGINE_OBJ) | $(BUILD)
+	$(HIPCC) -o $@ $^ $(LDLIBS) $(ROCM_LDLIBS)
+
+$(BUILD)/test_batch_rocm: $(BUILD)/rocm/test_batch.o $(ROCM_CORE_OBJS) $(ROCM_ENGINE_OBJ) | $(BUILD)
+	$(HIPCC) -o $@ $^ $(LDLIBS) $(ROCM_LDLIBS)
+
+$(BUILD)/test_rocm: $(BUILD)/rocm/test_rocm.o $(ROCM_CORE_OBJS) $(ROCM_ENGINE_OBJ) | $(BUILD)
+	$(HIPCC) -o $@ $^ $(LDLIBS) $(ROCM_LDLIBS)
+
+$(BUILD)/perf_engine_rocm: $(BUILD)/rocm/perf_engine.o $(ROCM_CORE_OBJS) $(ROCM_ENGINE_OBJ) | $(BUILD)
+	$(HIPCC) -o $@ $^ $(LDLIBS) $(ROCM_LDLIBS)
+
+$(BUILD)/perf_batch_rocm: $(BUILD)/rocm/perf_batch.o $(ROCM_CORE_OBJS) $(ROCM_ENGINE_OBJ) | $(BUILD)
+	$(HIPCC) -o $@ $^ $(LDLIBS) $(ROCM_LDLIBS)
+
+$(BUILD)/perf_concurrency_rocm: $(BUILD)/rocm/perf_concurrency.o $(ROCM_CORE_OBJS) $(ROCM_SERVICE_OBJS) $(ROCM_ENGINE_OBJ) | $(BUILD)
+	$(HIPCC) -o $@ $^ $(LDLIBS) $(ROCM_LDLIBS)
+
 $(BUILD)/xpu/%.o: src/%.c src/*.h | $(BUILD)/xpu
 	$(CC) $(CFLAGS) -DEI_ENABLE_XPU -Isrc -c -o $@ $<
 
@@ -325,10 +387,13 @@ $(BUILD):
 $(BUILD)/cuda:
 	mkdir -p $(BUILD)/cuda
 
+$(BUILD)/rocm:
+	mkdir -p $(BUILD)/rocm
+
 $(BUILD)/xpu:
 	mkdir -p $(BUILD)/xpu
 
-.PHONY: test test-http test-http-metal test-http-cuda test-http-xpu test-metal test-cuda test-xpu perf perf-engine perf-engine-metal perf-engine-cuda perf-engine-xpu perf-concurrency perf-concurrency-cuda perf-concurrency-xpu perf-dimensions perf-batch perf-tokenization metal metal-kernels cuda xpu clean
+.PHONY: test test-http test-http-metal test-http-cuda test-http-rocm test-http-xpu test-metal test-cuda test-rocm test-xpu perf perf-engine perf-engine-metal perf-engine-cuda perf-engine-rocm perf-engine-xpu perf-concurrency perf-concurrency-cuda perf-concurrency-rocm perf-concurrency-xpu perf-dimensions perf-batch perf-tokenization metal metal-kernels cuda rocm xpu clean
 test: $(BUILD)/embeddinggemma $(BUILD)/test_gguf $(BUILD)/test_tokenizer $(BUILD)/test_kernels $(BUILD)/test_embed $(BUILD)/test_batch $(BUILD)/test_inference_service $(BUILD)/test_response_cache
 	python3 testdata/test_model_manifest.py --binary ./$(BUILD)/test_gguf \
 		--model $(MODEL) --manifest testdata/model-manifest.json
@@ -353,6 +418,10 @@ test-http-cuda: $(BUILD)/embeddinggemma-cuda
 	python3 testdata/test_http_dimensions.py --binary ./$(BUILD)/embeddinggemma-cuda \
 		--model $(MODEL) --backend cuda
 
+test-http-rocm: $(BUILD)/embeddinggemma-rocm
+	python3 testdata/test_http_dimensions.py --binary ./$(BUILD)/embeddinggemma-rocm \
+		--model $(MODEL) --backend rocm
+
 test-http-xpu: $(BUILD)/embeddinggemma-xpu
 	python3 testdata/test_http_dimensions.py --binary ./$(BUILD)/embeddinggemma-xpu \
 		--model $(MODEL) --backend xpu
@@ -369,6 +438,9 @@ perf-engine-metal: $(BUILD)/perf_engine_metal
 perf-engine-cuda: $(BUILD)/perf_engine_cuda
 	python3 perf/bench_engine.py --no-build --model $(MODEL) --backend cuda
 
+perf-engine-rocm: $(BUILD)/perf_engine_rocm
+	python3 perf/bench_engine.py --no-build --model $(MODEL) --backend rocm
+
 perf-engine-xpu: $(BUILD)/perf_engine_xpu
 	python3 perf/bench_engine.py --no-build --model $(MODEL) --backend xpu
 
@@ -377,6 +449,9 @@ perf-concurrency: $(BUILD)/perf_concurrency $(BUILD)/perf_concurrency_metal
 
 perf-concurrency-cuda: $(BUILD)/perf_concurrency_cuda
 	python3 perf/bench_concurrency.py --no-build --model $(MODEL) --backend cuda
+
+perf-concurrency-rocm: $(BUILD)/perf_concurrency_rocm
+	python3 perf/bench_concurrency.py --no-build --model $(MODEL) --backend rocm
 
 perf-concurrency-xpu: $(BUILD)/perf_concurrency_xpu
 	python3 perf/bench_concurrency.py --no-build --model $(MODEL) --backend xpu
@@ -398,6 +473,8 @@ metal: $(BUILD)/embeddinggemma-metal
 
 cuda: $(BUILD)/embeddinggemma-cuda
 
+rocm: $(BUILD)/embeddinggemma-rocm
+
 xpu: $(BUILD)/embeddinggemma-xpu
 
 test-metal: $(METALLIB) $(BUILD)/test_metal $(BUILD)/test_embed_metal $(BUILD)/test_backend_parity_metal $(BUILD)/test_batch_metal
@@ -412,6 +489,13 @@ test-cuda: $(BUILD)/test_embed_cuda $(BUILD)/test_cuda $(BUILD)/test_batch_cuda 
 	./$(BUILD)/test_batch_cuda $(MODEL) cuda
 	python3 testdata/test_http_dimensions.py --binary ./$(BUILD)/embeddinggemma-cuda \
 		--model $(MODEL) --backend cuda
+
+test-rocm: $(BUILD)/test_embed_rocm $(BUILD)/test_rocm $(BUILD)/test_batch_rocm $(BUILD)/embeddinggemma-rocm
+	EI_BACKEND=rocm ./$(BUILD)/test_embed_rocm $(MODEL) testdata/goldens-llamacpp.json
+	./$(BUILD)/test_rocm $(MODEL)
+	./$(BUILD)/test_batch_rocm $(MODEL) rocm
+	python3 testdata/test_http_dimensions.py --binary ./$(BUILD)/embeddinggemma-rocm \
+		--model $(MODEL) --backend rocm
 
 test-xpu: $(BUILD)/test_embed_xpu $(BUILD)/test_xpu $(BUILD)/test_batch_xpu $(BUILD)/embeddinggemma-xpu
 	EI_BACKEND=xpu ./$(BUILD)/test_embed_xpu $(MODEL) testdata/goldens-llamacpp.json

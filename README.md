@@ -485,6 +485,17 @@ comparisons; compiler, driver, power, and system load differ between hosts.
 | ROCm | AMD Instinct MI300X | 1,072 | 8,890 | 206,011 |
 | XPU SYCL | Intel Arc Pro B60 | 962 | 14,747 | 99,708 |
 
+```mermaid
+xychart-beta
+    title "Single-engine throughput at 2,048 input tokens"
+    x-axis ["CPU", "Metal", "CUDA", "ROCm", "XPU SYCL"]
+    y-axis "Input tokens per second" 0 --> 220000
+    bar [1350, 10465, 102755, 206011, 99708]
+```
+
+The chart uses the T2048 column above. It compares measured end-to-end engine
+throughput on the listed hardware; it is not a same-device backend comparison.
+
 The corresponding median latencies for T1/T32/T2048 were CPU
 `2.70/30.46/1516.56 ms`, Metal `1.76/4.00/195.70 ms`, CUDA
 `1.71/2.30/19.93 ms`, ROCm `0.93/3.60/9.94 ms`, and XPU

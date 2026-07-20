@@ -203,7 +203,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--backend", choices=("cpu", "metal"), required=True)
+    parser.add_argument("--backend", choices=("cpu", "metal", "cuda"), required=True)
     args = parser.parse_args()
 
     port = reserve_port()

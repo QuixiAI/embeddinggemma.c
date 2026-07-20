@@ -124,7 +124,11 @@ static void bench_level(ei_engine *engine, int32_t tokens, int32_t batch_size,
                                   serial + (size_t)sequence * EI_N_EMBD);
         if (similarity < minimum) minimum = similarity;
     }
-    if (minimum < 0.9999f) ei_die("packed/serial parity failed: %.9f", minimum);
+    const float minimum_expected = strcmp(ei_engine_backend(engine), "cuda") == 0
+        ? 0.998f : 0.9999f;
+    if (minimum < minimum_expected) {
+        ei_die("packed/serial parity failed: %.9f", minimum);
+    }
 
     qsort(packed_ms, (size_t)iterations, sizeof(*packed_ms), compare_double);
     qsort(serial_ms, (size_t)iterations, sizeof(*serial_ms), compare_double);
@@ -230,7 +234,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) warmup = atoi(argv[++i]);
         else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) iterations = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ab-metal-fp16-kv") == 0) ab_metal_fp16_kv = true;
-        else ei_die("usage: %s --model model.gguf [--backend cpu|metal] [--tokens N] "
+        else ei_die("usage: %s --model model.gguf [--backend cpu|metal|cuda] [--tokens N] "
                     "[--batch-sizes 1,2,4] [--max-total-tokens N]", argv[0]);
     }
     if (!model || tokens < 1 || tokens > EI_N_CTX || max_total_tokens < tokens ||

@@ -18,7 +18,7 @@ static float cosine(const float *a, const float *b) {
 
 int main(int argc, char **argv) {
     if (argc < 2 || argc > 3) {
-        ei_die("usage: %s <model.gguf> [cpu|metal]", argv[0]);
+        ei_die("usage: %s <model.gguf> [cpu|metal|cuda]", argv[0]);
     }
     const char *backend = argc == 3 ? argv[2] : "cpu";
     const size_t lengths[] = { 1, 7, 32, 129 };
@@ -64,7 +64,8 @@ int main(int argc, char **argv) {
     free(reference);
     free(ids);
     ei_engine_free(&engine);
-    if (minimum < 0.9999f) {
+    const float minimum_expected = strcmp(backend, "cuda") == 0 ? 0.998f : 0.9999f;
+    if (minimum < minimum_expected) {
         fprintf(stderr, "%s packed batch parity failed: minimum cosine %.9f\n",
                 backend, minimum);
         return 1;

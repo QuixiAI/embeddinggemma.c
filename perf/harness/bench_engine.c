@@ -61,7 +61,7 @@ static int parse_token_shapes(const char *value, int32_t out[MAX_TOKEN_SHAPES]) 
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s --model model.gguf [--backend auto|cpu|metal] "
+            "usage: %s --model model.gguf [--backend auto|cpu|metal|cuda] "
             "[--tokens 1,8,32,128] [--warmup n] [--iters n] "
             "[--ab-gelu-quant] [--ab-metal-fp16-kv]\n",
             argv0);

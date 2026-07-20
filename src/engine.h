@@ -10,6 +10,7 @@ typedef struct {
     ei_model model;
     ei_tokenizer tokenizer;
     void *metal;
+    void *cuda;
     const char *backend_name;
     ei_thread_pool *thread_pool;
     int32_t short_projection_threads;

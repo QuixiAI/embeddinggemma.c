@@ -20,6 +20,14 @@
 #define MAX_BODY_BYTES (16u * 1024u * 1024u)
 #define MAX_HEADER_BYTES (64u * 1024u)
 
+#if defined(EI_ENABLE_CUDA)
+#define DEFAULT_INFERENCE_BACKEND "cuda"
+#elif defined(EI_ENABLE_METAL)
+#define DEFAULT_INFERENCE_BACKEND "metal"
+#else
+#define DEFAULT_INFERENCE_BACKEND "cpu"
+#endif
+
 typedef struct {
     char  *s;
     size_t len;
@@ -964,7 +972,7 @@ static void ensure_model_available(const char *model_path) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s [--bind ADDR] [--port PORT] [--backend auto|cpu|metal]\n"
+        "usage: %s [--bind ADDR] [--port PORT] [--backend auto|cpu|metal|cuda]\n"
         "          [--model PATH] [--workers N] [--max-queue N]\n"
         "          [--cache-entries N] [--max-batch-tokens N]\n"
         "          [--max-batch-requests N]\n"
@@ -994,7 +1002,7 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
     bool keepalive_connections_set = false;
     opts->bind_host = "0.0.0.0";
     opts->port = 11434;
-    opts->backend = "auto";
+    opts->backend = DEFAULT_INFERENCE_BACKEND;
     opts->model_path = NULL;
     opts->workers = 64;
     opts->max_queue = 256;
@@ -1018,7 +1026,8 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
         } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
             opts->backend = argv[++i];
             if (strcmp(opts->backend, "auto") != 0 && strcmp(opts->backend, "cpu") != 0 &&
-                strcmp(opts->backend, "metal") != 0) return false;
+                strcmp(opts->backend, "metal") != 0 &&
+                strcmp(opts->backend, "cuda") != 0) return false;
         } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             opts->model_path = argv[++i];
         } else if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {

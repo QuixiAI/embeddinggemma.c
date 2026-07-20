@@ -42,6 +42,7 @@ int main(int argc, const char *argv[]) {
             @"ei_quantize_q8_0_f32",
             @"ei_rms_norm_f32",
             @"ei_rms_norm_residual_f32",
+            @"ei_rms_norm_residual_next_f32",
             @"ei_qk_norm_rope_f32",
             @"ei_qk_norm_rope_qk_f32",
             @"ei_attention_f32",

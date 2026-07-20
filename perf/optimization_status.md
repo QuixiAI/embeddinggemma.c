@@ -48,7 +48,7 @@ Baseline: not recorded yet.
 Decision: mirror QuixiCore's result layout and notebook discipline, but keep the
 first harness native C because this repository currently exposes C kernels.
 
-Open questions: add accelerator-backed cases once Metal/CUDA/ROCm/SYCL launch
+Open questions: add accelerator-backed cases once ROCm/SYCL launch
 APIs are wired into the repo.
 
 Raw results: none.
@@ -1376,16 +1376,14 @@ Raw results:
   path already served by an exact token-ID memory cache and duplicate
   singleflight. It may be reconsidered only for restart-heavy deployments.
 - Multiple replicas improve multi-device deployments. Infinity itself treats
-  CPU replication as a debugging option; one CPU or Metal device should keep a
+  CPU replication as a debugging option; one CPU, Metal, or CUDA device should keep a
   single workspace owner.
 - Production-shape warmup was already tested and rejected because real startup
   inference did not improve first HTTP latency. Allocation reservation remains.
 - Quantized/binary response formats change retrieval quality and require a
   calibration and recall evaluation, so they are not transport optimizations.
-- CUDA graph capture is a strong candidate for the future CUDA and ROCm ports.
-  Revisit Infinity's TensorRT setting and llama.cpp's graph capture/update path
-  in `ggml/src/ggml-cuda/ggml-cuda.cu` when those backends exist. There is no
-  equivalent Metal graph mechanism in the inspected references.
+- CUDA graph capture is now retained in the CUDA backend below. Revisit an
+  equivalent graph/update mechanism for ROCm; Metal has no direct equivalent.
 
 ## 2026-07-19: Persistent HTTP And Adaptive Collection
 
@@ -1496,3 +1494,159 @@ Raw whole-run Metal results include:
 
 The final engine and packed-batch comparisons used the alternating native A/B
 harnesses; their JSON output is summarized above.
+
+## 2026-07-19 to 2026-07-20: CUDA SM86 Backend
+
+Status: retained and validated on `quixi-3090-02`, one RTX 3090 (SM86), CUDA
+12.9, driver 580.65.06.
+
+References inspected:
+
+- `llama.cpp/ggml/src/ggml-cuda/dequantize.cuh`, `vecdotq.cuh`, and
+  `fattn-wmma-f16.cu`: exact Q4_0 packing, integer dot products, and FP16
+  attention tiling.
+- `QuixiCore-CUDA/kernels/quant/qgemv.cu`, `qgemm.cu`, and `tm_qmm.cuh`:
+  warp scheduling, zero-shuffle Q4 fragment loading, and
+  `mma.sync.m16n8k16` accumulator layout.
+- `QuixiCore-CUDA/perf/perf.md`: correctness-first alternating A/B runs,
+  realistic whole-model shapes, and a 3% retention threshold.
+- Metal and CPU routes in this repository: packed block-diagonal attention,
+  fused Q/K norm plus RoPE, multirow activation reuse, and final pooling.
+- `.reference/vllm`: repeated-shape CUDA graph replay and token-budget batching.
+
+### Optimization Passes
+
+1. The initial complete backend used direct packed-Q4 FP32 warp projections and
+   online FP32 attention. It established the functional baseline shown below.
+2. The T=1..4 path fused RMS norm with per-32-value Q8 quantization and used
+   Q4 x Q8 `dp4a` projections. At T=4 this reduced 2.882 ms to 1.997 ms,
+   1.443x throughput; T=1 remained neutral. `EI_CUDA_Q8_LATENCY=0` retains the
+   FP32 path for A/B.
+3. The tensor route combined Q/K/V into one 1280-row GEMM and up/gate into one
+   2304-row GEMM. Residual addition, next RMS norm, and FP16 conversion were
+   fused. T=7 reached 1.92 ms and T=32 2.73 ms before attention tuning.
+4. FP16 online attention, an eight-query shared-tile Flash-style kernel, and
+   dense tensor-core QK/PV plus custom FP32 softmax were implemented. Initial
+   single-sequence sweeps put their noisy crossover between 40 and 80 tokens.
+   Tensor attention reduced 512 from
+   10.96 to 4.96 ms, 1024 from 21.05 to 9.64 ms, and 2048 from 51.56 to
+   22.99 ms, all about 2.2x throughput. Online/tensor output cosine is at least
+   `0.999997914` through 2048 tokens.
+5. Native packed-Q4 MMA dequantizes GGML blocks directly into
+   `mma.sync.m16n8k16` fragments for every model projection. It matches the
+   expanded-FP16 route at minimum cosine `0.999983191`, but direct global
+   fragment dequantization is 3.2x-4.3x slower on RTX 3090. It remains available
+   with `EI_CUDA_NATIVE_Q4_GEMM=1` as a low-memory diagnostic.
+6. Packed attention exposed a batch-dependent crossover because dense QK/PV
+   launches per sequence. Production now classifies each sequence separately:
+   tensor thresholds are 80 tokens at batch 1, 128 at batches 2..4, and 192 for
+   larger batches; shorter sequences use Flash in the same forward pass. This
+   retained the single-sequence tensor gains while improving representative
+   packed shapes to 2,030 req/s at T64/B32, 878 at T96/B4, and 819 at T128/B16.
+   T192/B32 remains tensor-routed and reaches 632 req/s. Setting
+   `EI_CUDA_TENSOR_ATTENTION_MIN_TOKENS` disables this heuristic for exact A/B.
+
+Production implementation:
+
+- One CUDA copy of the GGUF data section, plus one load-time FP16 expansion of
+  the 168 projection matrices for the retained cuBLAS path.
+- Model-specialized RMS norm, residual/next norm, Q/K norm plus NEOX RoPE,
+  full and symmetric-SWA GQA masks, and final norm/mean/L2 pooling.
+- Q8/DP4A projections below five flattened tokens; combined FP16 tensor-core
+  projection GEMMs with FP32 accumulation from five tokens upward. The combined
+  QKV epilogue writes normalized and RoPE-transformed Q/K plus V directly to
+  FP16 attention buffers.
+- FP16 Q/K/V attention with FP32 softmax and output: per-sequence shared-tile
+  Flash or dense tensor-core QK/PV selected by the batch-tuned thresholds.
+- A 16-shape CUDA graph cache keyed by flattened token count, batch size, and
+  packed offset hash. Workspace growth invalidates pointer-bearing graphs.
+
+End-to-end improvement on the same GPU:
+
+| tokens | initial direct-Q4 ms | retained ms | x throughput | retained tok/s |
+|---:|---:|---:|---:|---:|
+| 1 | 2.027 | 1.712 | 1.184x | 584 |
+| 7 | 4.595 | 1.888 | 2.434x | 3,707 |
+| 32 | 15.086 | 2.303 | 6.551x | 13,897 |
+| 128 | 48.007 | 2.491 | 19.274x | 51,389 |
+| 512 | 189.083 | 4.788 | 39.490x | 106,932 |
+| 2048 | 762.588 | 19.931 | 38.261x | 102,755 |
+
+For unique 32-token requests, the final dynamic service scales from 417 req/s
+at concurrency 1 to 3,279 req/s at concurrency 32. Direct packed execution
+reaches 4,740 req/s at batch 32 with minimum packed/serialized cosine
+`0.999785721`. Full-context requests remain singleton batches; the final engine
+rate is 50.2 req/s. The 512-token packing cutoff is retained to avoid
+multiplying latency for full-context requests.
+
+Correctness and safety:
+
+- All 10 llama.cpp goldens pass; retained minimum cosine is `0.999910414`.
+- CPU/CUDA synthetic drift passes at 1/7/32/128 tokens; minimum is
+  `0.991125166` on arbitrary token IDs.
+- Packed-vs-single route drift passes at minimum cosine `0.998983860`; this is
+  the one-token Q8/DP4A route crossing to FP16 GEMM in a packed batch.
+- Q8/DP4A versus FP32 latency-route cosine is at least `0.996344924`.
+- Online/tensor attention and expanded/native-Q4 MMA have permanent parity
+  coverage. Direct-FP16 QKV split/epilogue parity is exactly `1.000000000` at
+  7, 128, and 2048 tokens. HTTP Matryoshka dimensions pass on CUDA.
+- Compute Sanitizer memcheck reports zero errors on Q8, Flash, tensor-attention,
+  direct-FP16 QKV, banded SWA, and native packed-Q4 MMA shapes.
+- The specialized server was launched without `--backend cuda` and reported the
+  CUDA backend, confirming binary-specific default selection.
+
+Raw remote results:
+
+- `/tmp/embeddinggemma.c-cuda-dev/perf/results/2026-07-19/234250-cuda-initial/`
+- `/tmp/embeddinggemma.c-cuda-dev/perf/results/2026-07-19/234821-cuda-graphs/`
+- `/tmp/embeddinggemma.c-cuda-dev/perf/results/2026-07-20/004704-cuda-kernels-final/`
+- `/tmp/embeddinggemma.c-cuda-dev/perf/results/2026-07-20/004705-cuda-kernels-final-t32/`
+- `/tmp/embeddinggemma.c-cuda-dev/perf/results/2026-07-20/004711-cuda-kernels-final-t2048/`
+
+### Cross-Backend Passes
+
+7. CUDA symmetric-SWA tensor attention now submits rectangular QK/PV GEMMs
+   over 1024-query bands instead of materializing the full 2048 x 2048 score
+   matrix. It retained output cosine `0.999999762` and reduced T=2048 from
+   about 22.93 ms to 21.08-21.15 ms (`1.084x-1.088x` throughput). Banded T=1024
+   regressed about 4.3%, so production starts the route at 1536 tokens.
+8. Metal residual addition and the following RMS norm were fused into one
+   dispatch, carrying normalized activations directly to the next projection.
+   Alternating A/B runs measured `1.09x-1.12x` at T=1, about `1.09x` at T=7,
+   `1.04x-1.05x` at T=32, and `1.02x-1.045x` at T=128. Longer shapes were
+   neutral, so production limits this fusion to 128 tokens.
+9. CUDA combined QKV projection now normalizes Q/K, applies RoPE, and writes
+   Q/K/V directly to FP16 attention buffers without intermediate split and
+   conversion kernels. Checksums remained identical. Reversed-order runs
+   measured `1.07x-1.14x` at T=7..128, `1.03x` at T=512, and about `1.05x` at
+   T=2048, so the route is retained. A second experiment wrote attention
+   context directly to the FP16 projection input; it was only `1.006x` at
+   short shapes and `1.013x-1.018x` at T=512..2048. It remains available with
+   `EI_CUDA_DIRECT_FP16_CONTEXT=1` but is disabled by default because it did
+   not meet the 3% retention threshold.
+10. A CPU 3:1-GQA attention experiment computed all three query heads together
+    and shared each K/V load. It passed kernel, golden, and packed-batch parity,
+    but extra live accumulators and output streams increased pressure on the M5
+    Max cores. The first paired run regressed T=7..2048 by roughly 8%-15%; the
+    reversed thermal order still favored the existing head-at-a-time kernel.
+    The experiment was removed.
+11. A Metal multi-simdgroup attention experiment adapted QuixiCore-Metal's
+    four-simdgroup K/V staging geometry to this model's D=256 head. Four query
+    simdgroups shared 8-token FP16 K/V tiles with FP32 online softmax. Outputs
+    had identical benchmark checksums, but the extra barriers, threadgroup
+    traffic, and occupancy cost reduced throughput to about `0.91x` at T=1024
+    and `0.86x` at T=2048 in the first pair; reversed order remained slower.
+    The experiment was removed, confirming the existing cache-fed one-simdgroup
+    kernel is better on M5 Max.
+12. A CUDA T=2..4 DP4A experiment assigned one warp to each output row and
+    accumulated four activation rows while reusing packed Q4 blocks. It covered
+    QKV, attention output, up/gate, and down projections and passed the CUDA
+    suite with identical benchmark checksums. After normalizing each run to the
+    unchanged T=1 control, however, it was about 1%-2% slower at T=2..4. The
+    apparent first-run T=2 gain tracked GPU clock state and disappeared in
+    reversed order. The kernels were removed.
+
+The last three independent optimization passes produced no significant gain,
+so this loop stops here per the handbook criterion. The retained results from
+this loop are CUDA banded SWA tensor attention, Metal short-shape residual/next
+norm fusion, and CUDA direct-FP16 QKV epilogues.

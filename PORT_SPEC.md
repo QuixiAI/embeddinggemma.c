@@ -2,8 +2,8 @@
 
 A minimal inference engine for exactly one model:
 `ggml-org/embeddinggemma-300M-qat-q4_0-GGUF`. Hand-ported from the llama.cpp
-reference with no ggml dependency. CPU ARM64/x64 and Metal are implemented;
-CUDA, ROCm/HIP, and XPU SYCL are target ports. The server exposes the
+reference with no ggml dependency. CPU ARM64/x64, Metal, and CUDA are
+implemented; ROCm/HIP and XPU SYCL are target ports. The server exposes the
 `/api/embed` HTTP contract that `db/03` `get_embedding()` already speaks.
 
 **Parity target**: llama.cpp CPU inference of the file below is ground truth.
@@ -123,16 +123,20 @@ llama.cpp deep-read) before implementing.
 | target | status | implementation/build |
 |---|---|---|
 | macOS ARM64 CPU | implemented, parity tested | C11 + NEON dot-product path |
-| x86 CPU | implemented, syntax tested | scalar, SSSE3, and AVX2 paths |
-| macOS Metal | implemented, parity tested | Objective-C host + standalone metallib; FP16 K/V at long sequence lengths with FP32 accumulation |
-| CUDA | pending | planned `.cu` backend and GPU-host validation |
+| x86 CPU | implemented, parity tested | scalar, SSSE3, and AVX2 paths |
+| macOS Metal | implemented, parity tested | Objective-C host + standalone metallib; short-shape residual/next-norm fusion; FP16 K/V at long sequence lengths with FP32 accumulation |
+| CUDA SM86 | implemented, parity tested | Q4 x Q8 DP4A latency path; direct-FP16 combined-QKV epilogue; Flash, online, banded-SWA, and tensor-core attention; native packed-Q4 MMA diagnostics; CUDA graph replay |
 | ROCm/HIP | pending | planned `.hip` backend and GPU-host validation |
 | XPU SYCL | pending | planned SYCL backend and Intel GPU validation |
 
 Core inference is C11 and links the OS C library, `libm`, and pthreads. The
 server additionally links `libcurl` for model download. CPU SIMD lives in
 `quants.c` and `kernels.c`; the Metal host is `engine_metal.m`; Metal source is
-split by family under `src/metal/kernels/` and compiled into one metallib.
+split by family under `src/metal/kernels/` and compiled into one metallib. The
+CUDA host and kernels live in `engine_cuda.cu` and link CUDA Runtime plus
+cuBLAS. Production CUDA attention uses shared-tile FP16 GQA for short sequences
+and tensor-core QK/PV for long sequences, with rectangular symmetric-SWA bands,
+FP32 softmax, and FP32 accumulation.
 
 ## Phase order
 
@@ -141,5 +145,5 @@ split by family under `src/metal/kernels/` and compiled into one metallib.
 2. HTTP server and model download - **done**
 3. NEON, AVX2/SSSE3, and persistent CPU scheduling - **done**
 4. Metal kernels, host dispatch, and parity - **done**
-5. CUDA, ROCm/HIP, and XPU SYCL - **pending**
+5. CUDA - **done**; ROCm/HIP and XPU SYCL - **pending**
 6. External service integration and packaging - **pending**

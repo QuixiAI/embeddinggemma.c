@@ -26,6 +26,26 @@ python3 perf/bench_http.py --backend metal --keepalive on --response-cache-mb 64
 ./build/perf_batch_metal --model model/embeddinggemma-300M-qat-Q4_0.gguf \
   --backend metal --tokens 2048 --batch-sizes 1,2,4 \
   --max-total-tokens 8192 --ab-metal-fp16-kv
+python3 perf/bench_engine.py --backend cuda --tokens 1,7,32,128,512,2048
+python3 perf/bench_concurrency.py --backend cuda --tokens 32 \
+  --concurrency 1,2,4,8,16,32
+./build/perf_batch_cuda --model model/embeddinggemma-300M-qat-Q4_0.gguf \
+  --backend cuda --tokens 32 --batch-sizes 1,2,4,8,16,32
+EI_CUDA_TENSOR_ATTENTION_MIN_TOKENS=65536 ./build/perf_engine_cuda \
+  --model model/embeddinggemma-300M-qat-Q4_0.gguf --backend cuda \
+  --tokens 256,512,1024,2048 --warmup 4 --iters 20
+EI_CUDA_TENSOR_ATTENTION_MIN_TOKENS=1 ./build/perf_engine_cuda \
+  --model model/embeddinggemma-300M-qat-Q4_0.gguf --backend cuda \
+  --tokens 256,512,1024,2048 --warmup 4 --iters 20
+EI_CUDA_NATIVE_Q4_GEMM=1 ./build/perf_engine_cuda \
+  --model model/embeddinggemma-300M-qat-Q4_0.gguf --backend cuda \
+  --tokens 7,32,128,512
+EI_CUDA_DIRECT_FP16_QKV=0 ./build/perf_engine_cuda \
+  --model model/embeddinggemma-300M-qat-Q4_0.gguf --backend cuda \
+  --tokens 7,32,128,512,2048 --warmup 5 --iters 20
+EI_CUDA_SWA_TENSOR_TILE_TOKENS=0 ./build/perf_engine_cuda \
+  --model model/embeddinggemma-300M-qat-Q4_0.gguf --backend cuda \
+  --tokens 2048 --warmup 5 --iters 20
 make perf-batch
 ```
 

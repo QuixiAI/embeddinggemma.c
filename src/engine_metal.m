@@ -83,6 +83,8 @@ static id<MTLBuffer> new_rope_table(id<MTLDevice> device, float base) {
     bool _fp16_kv_active;
     bool _fused_qk_rope;
     bool _fused_up_gate_gelu;
+    bool _fused_residual_next_norm;
+    uint32_t _fused_residual_next_max_tokens;
     uint32_t _fused_up_gate_rows;
     bool _triple_qkv_gemv;
 }
@@ -424,6 +426,31 @@ static void encode_rms_residual(EIMetalEngine *engine,
     metal_dispatch_groups(encoder, rows, 1, 1, 32, 1, 1);
 }
 
+static void encode_rms_residual_next(EIMetalEngine *engine,
+                                     id<MTLComputeCommandEncoder> encoder,
+                                     id<MTLBuffer> input,
+                                     const float *post_weight,
+                                     id<MTLBuffer> residual,
+                                     const float *next_weight,
+                                     id<MTLBuffer> next_output,
+                                     uint32_t rows, uint32_t cols, float eps) {
+    const uint8_t *model_base = engine->_model->gguf.map +
+                                engine->_model->gguf.data_off;
+    NSUInteger post_offset = (const uint8_t *)post_weight - model_base;
+    NSUInteger next_offset = (const uint8_t *)next_weight - model_base;
+    [encoder setComputePipelineState:metal_pipeline(
+        engine, @"ei_rms_norm_residual_next_f32")];
+    [encoder setBuffer:input offset:0 atIndex:0];
+    [encoder setBuffer:engine->_model_buffer offset:post_offset atIndex:1];
+    [encoder setBuffer:residual offset:0 atIndex:2];
+    [encoder setBuffer:engine->_model_buffer offset:next_offset atIndex:3];
+    [encoder setBuffer:next_output offset:0 atIndex:4];
+    [encoder setBytes:&rows length:sizeof rows atIndex:5];
+    [encoder setBytes:&cols length:sizeof cols atIndex:6];
+    [encoder setBytes:&eps length:sizeof eps atIndex:7];
+    metal_dispatch_groups(encoder, rows, 1, 1, 32, 1, 1);
+}
+
 static void encode_pool(EIMetalEngine *engine, id<MTLComputeCommandEncoder> encoder,
                         uint32_t tokens, float eps) {
     NSUInteger weight_offset = (const uint8_t *)engine->_model->output_norm
@@ -464,6 +491,25 @@ static void encode_pool_batch(EIMetalEngine *engine,
     _gemm_tile_tokens = 16;
     _gemv_r4_min_tokens = 7;
     _fp16_kv_min_tokens = 1024;
+    _fused_residual_next_max_tokens = 128;
+    const char *fused_residual_next = getenv(
+        "EI_METAL_FUSED_RESIDUAL_NEXT_NORM");
+    _fused_residual_next_norm = !fused_residual_next ||
+        strcmp(fused_residual_next, "0") != 0;
+    const char *fused_residual_max = getenv(
+        "EI_METAL_FUSED_RESIDUAL_NEXT_MAX_TOKENS");
+    if (fused_residual_max && *fused_residual_max) {
+        char *end = NULL;
+        long parsed = strtol(fused_residual_max, &end, 10);
+        if (*end != '\0' || parsed < 1 || parsed > 65536) {
+            if (errorMessage) {
+                *errorMessage =
+                    @"EI_METAL_FUSED_RESIDUAL_NEXT_MAX_TOKENS must be 1..65536";
+            }
+            return nil;
+        }
+        _fused_residual_next_max_tokens = (uint32_t)parsed;
+    }
     const char *fused_qk_rope = getenv("EI_METAL_FUSED_QK_ROPE");
     _fused_qk_rope = !fused_qk_rope || strcmp(fused_qk_rope, "0") != 0;
     const char *fused_up_gate_gelu = getenv("EI_METAL_FUSED_UP_GATE_GELU");
@@ -567,7 +613,8 @@ static void encode_pool_batch(EIMetalEngine *engine,
         @"ei_q4_0_f32_up_gate_gemm",
         @"ei_q4_0_f32_up_gate_gemm_16x16",
         @"ei_q4_0_q8_0_gemv", @"ei_quantize_q8_0_f32", @"ei_rms_norm_f32",
-        @"ei_rms_norm_residual_f32", @"ei_qk_norm_rope_f32", @"ei_attention_f32",
+        @"ei_rms_norm_residual_f32", @"ei_rms_norm_residual_next_f32",
+        @"ei_qk_norm_rope_f32", @"ei_attention_f32",
         @"ei_attention_f16_kv",
         @"ei_qk_norm_rope_qk_f32",
         @"ei_qk_norm_rope_q_f32_k_f16",
@@ -730,14 +777,18 @@ static void encode_pool_batch(EIMetalEngine *engine,
 
     uint32_t tokens = (uint32_t)count;
     const float eps = _model->rms_eps;
+    const bool fused_residual_next = _fused_residual_next_norm &&
+        tokens <= _fused_residual_next_max_tokens;
     encode_embedding(self, encoder, count);
     for (int layer_index = 0; layer_index < EI_N_LAYER; layer_index++) {
         const ei_layer *layer = &_model->layers[layer_index];
         const bool swa = ei_layer_is_swa(_model, layer_index);
         id<MTLBuffer> rope_table = swa ? _rope_swa : _rope_full;
 
-        encode_rms(self, encoder, _x, layer->attn_norm, _norm,
-                   tokens, EI_N_EMBD, eps);
+        if (layer_index == 0 || !fused_residual_next) {
+            encode_rms(self, encoder, _x, layer->attn_norm, _norm,
+                       tokens, EI_N_EMBD, eps);
+        }
         encode_qkv_projection(self, encoder, layer, tokens);
         if (batchSize > 1 && _fused_qk_rope) {
             encode_qk_norm_rope_fused_batch(self, encoder, layer, tokens, eps, rope_table);
@@ -763,16 +814,28 @@ static void encode_pool_batch(EIMetalEngine *engine,
             encode_attention(self, encoder, tokens, swa ? _model->swa_window : 0);
         }
         encode_q4_projection(self, encoder, layer->attn_output, _ctx, _tmp, tokens);
-        encode_rms_residual(self, encoder, _tmp, layer->post_attention_norm,
-                            _x, tokens, EI_N_EMBD, eps);
-
-        encode_rms(self, encoder, _x, layer->ffn_norm, _norm,
-                   tokens, EI_N_EMBD, eps);
+        if (fused_residual_next) {
+            encode_rms_residual_next(self, encoder, _tmp,
+                layer->post_attention_norm, _x, layer->ffn_norm, _norm,
+                tokens, EI_N_EMBD, eps);
+        } else {
+            encode_rms_residual(self, encoder, _tmp,
+                layer->post_attention_norm, _x, tokens, EI_N_EMBD, eps);
+            encode_rms(self, encoder, _x, layer->ffn_norm, _norm,
+                       tokens, EI_N_EMBD, eps);
+        }
         bool fused_up_gate = encode_up_gate_projection(self, encoder, layer, tokens);
         if (!fused_up_gate) encode_gelu_mul(self, encoder, tokens * EI_N_FF);
         encode_q4_projection(self, encoder, layer->ffn_down, _gate, _tmp, tokens);
-        encode_rms_residual(self, encoder, _tmp, layer->post_ffw_norm,
-                            _x, tokens, EI_N_EMBD, eps);
+        if (fused_residual_next && layer_index + 1 < EI_N_LAYER) {
+            encode_rms_residual_next(self, encoder, _tmp,
+                layer->post_ffw_norm, _x,
+                _model->layers[layer_index + 1].attn_norm, _norm,
+                tokens, EI_N_EMBD, eps);
+        } else {
+            encode_rms_residual(self, encoder, _tmp, layer->post_ffw_norm,
+                                _x, tokens, EI_N_EMBD, eps);
+        }
     }
     if (batchSize > 1) encode_pool_batch(self, encoder, (uint32_t)batchSize, eps);
     else encode_pool(self, encoder, tokens, eps);

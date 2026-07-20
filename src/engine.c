@@ -3,6 +3,9 @@
 #if defined(EI_ENABLE_METAL)
 #include "engine_metal.h"
 #endif
+#if defined(EI_ENABLE_CUDA)
+#include "engine_cuda.h"
+#endif
 
 #include <math.h>
 
@@ -47,11 +50,12 @@ void ei_engine_load_backend(ei_engine *e, const char *model_path, const char *ba
 
     const char *requested = backend && *backend ? backend : "auto";
     if (strcmp(requested, "auto") != 0 && strcmp(requested, "cpu") != 0 &&
-        strcmp(requested, "metal") != 0) {
-        ei_die("unknown inference backend '%s' (expected auto, cpu, or metal)", requested);
+        strcmp(requested, "metal") != 0 && strcmp(requested, "cuda") != 0) {
+        ei_die("unknown inference backend '%s' (expected auto, cpu, metal, or cuda)",
+               requested);
     }
 #if defined(EI_ENABLE_METAL)
-    if (strcmp(requested, "cpu") != 0) {
+    if (strcmp(requested, "auto") == 0 || strcmp(requested, "metal") == 0) {
         char metal_err[512];
         e->metal = ei_metal_engine_create(&e->model, NULL, metal_err, sizeof metal_err);
         if (e->metal) {
@@ -67,7 +71,25 @@ void ei_engine_load_backend(ei_engine *e, const char *model_path, const char *ba
         ei_die("this binary was built without Metal support");
     }
 #endif
-    if (!e->metal) e->thread_pool = ei_thread_pool_create(0);
+#if defined(EI_ENABLE_CUDA)
+    if (!e->metal && strcmp(requested, "cpu") != 0 &&
+        strcmp(requested, "metal") != 0) {
+        char cuda_err[512];
+        e->cuda = ei_cuda_engine_create(&e->model, cuda_err, sizeof cuda_err);
+        if (e->cuda) {
+            e->backend_name = "cuda";
+        } else if (strcmp(requested, "cuda") == 0) {
+            ei_die("CUDA backend initialization failed: %s", cuda_err);
+        } else {
+            fprintf(stderr, "CUDA unavailable, using CPU: %s\n", cuda_err);
+        }
+    }
+#else
+    if (strcmp(requested, "cuda") == 0) {
+        ei_die("this binary was built without CUDA support");
+    }
+#endif
+    if (!e->metal && !e->cuda) e->thread_pool = ei_thread_pool_create(0);
 }
 
 void ei_engine_load(ei_engine *e, const char *model_path) {
@@ -78,6 +100,9 @@ void ei_engine_load(ei_engine *e, const char *model_path) {
 void ei_engine_free(ei_engine *e) {
 #if defined(EI_ENABLE_METAL)
     ei_metal_engine_free(e->metal);
+#endif
+#if defined(EI_ENABLE_CUDA)
+    ei_cuda_engine_free(e->cuda);
 #endif
     ei_thread_pool_destroy(e->thread_pool);
     free(e->workspace_positions);
@@ -748,6 +773,12 @@ bool ei_engine_reserve(ei_engine *e, size_t total_tokens, size_t batch_size,
                                        err, err_len);
     }
 #endif
+#if defined(EI_ENABLE_CUDA)
+    if (e->cuda) {
+        return ei_cuda_engine_reserve(e->cuda, total_tokens, batch_size,
+                                      err, err_len);
+    }
+#endif
     ensure_workspace(e, total_tokens);
     if (err && err_len) err[0] = '\0';
     return true;
@@ -760,6 +791,12 @@ bool ei_engine_embed_tokens(ei_engine *e, const int32_t *ids, size_t n_tokens,
 #if defined(EI_ENABLE_METAL)
     if (e->metal) {
         return ei_metal_engine_embed_tokens(e->metal, ids, n_tokens, out, err, err_len);
+    }
+#endif
+#if defined(EI_ENABLE_CUDA)
+    if (e->cuda) {
+        return ei_cuda_engine_embed_tokens(e->cuda, ids, n_tokens, out,
+                                           err, err_len);
     }
 #endif
 
@@ -820,6 +857,12 @@ bool ei_engine_embed_tokens_batch(ei_engine *e, const int32_t *ids,
     if (e->metal) {
         return ei_metal_engine_embed_tokens_batch(
             e->metal, ids, offsets, batch_size, out, err, err_len);
+    }
+#endif
+#if defined(EI_ENABLE_CUDA)
+    if (e->cuda) {
+        return ei_cuda_engine_embed_tokens_batch(
+            e->cuda, ids, offsets, batch_size, out, err, err_len);
     }
 #endif
 

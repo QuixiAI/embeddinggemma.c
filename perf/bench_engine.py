@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Warmed end-to-end CPU/Metal inference benchmark and result recorder."""
+"""Warmed end-to-end CPU/Metal/CUDA inference benchmark and result recorder."""
 
 from __future__ import annotations
 
@@ -27,7 +27,10 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None) -> subprocess.Comp
 
 
 def command_output(cmd: list[str]) -> str:
-    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    except OSError:
+        return "unknown"
     return proc.stdout.strip() if proc.returncode == 0 else "unknown"
 
 
@@ -60,7 +63,7 @@ def write_summary(rows: list[dict[str, object]], meta: dict[str, object], out_di
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="model/embeddinggemma-300M-qat-Q4_0.gguf")
-    parser.add_argument("--backend", choices=("cpu", "metal", "both"), default="both")
+    parser.add_argument("--backend", choices=("cpu", "metal", "cuda", "both"), default="both")
     parser.add_argument("--tokens", default="1,4,8,32,128,512,2048")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
@@ -75,12 +78,18 @@ def main() -> int:
         targets = ["build/perf_engine"]
         if "metal" in backends:
             targets.append("build/perf_engine_metal")
+        if "cuda" in backends:
+            targets.append("build/perf_engine_cuda")
         run(["make", *targets])
 
     rows: list[dict[str, object]] = []
     commands: list[str] = []
     for backend in backends:
-        binary = "./build/perf_engine_metal" if backend == "metal" else "./build/perf_engine"
+        binary = {
+            "cpu": "./build/perf_engine",
+            "metal": "./build/perf_engine_metal",
+            "cuda": "./build/perf_engine_cuda",
+        }[backend]
         cmd = [
             binary,
             "--model", args.model,
@@ -111,8 +120,10 @@ def main() -> int:
         "commands": commands,
         "platform": platform.platform(),
         "python": platform.python_version(),
-        "device": command_output(["sysctl", "-n", "hw.model"]),
-        "os": command_output(["sw_vers", "-productVersion"]),
+        "device": command_output([
+            "nvidia-smi", "--query-gpu=name", "--format=csv,noheader", "-i", "0"
+        ]) if "cuda" in backends else command_output(["sysctl", "-n", "hw.model"]),
+        "os": platform.platform(),
         "xcode": command_output(["xcodebuild", "-version"]).replace("\n", " "),
     }
     (out_dir / "run.json").write_text(json.dumps(meta, indent=2) + "\n")

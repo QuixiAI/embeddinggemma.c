@@ -22,7 +22,10 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None) -> subprocess.Comp
 
 
 def command_output(cmd: list[str]) -> str:
-    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    except OSError:
+        return "unknown"
     return proc.stdout.strip() if proc.returncode == 0 else "unknown"
 
 
@@ -61,7 +64,7 @@ def write_summary(rows: list[dict[str, object]], meta: dict[str, object], out_di
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="model/embeddinggemma-300M-qat-Q4_0.gguf")
-    parser.add_argument("--backend", choices=("cpu", "metal", "both"), default="both")
+    parser.add_argument("--backend", choices=("cpu", "metal", "cuda", "both"), default="both")
     parser.add_argument(
         "--tokens",
         default="2048",
@@ -81,16 +84,18 @@ def main() -> int:
         targets = ["build/perf_concurrency"]
         if "metal" in backends:
             targets.append("build/perf_concurrency_metal")
+        if "cuda" in backends:
+            targets.append("build/perf_concurrency_cuda")
         run(["make", *targets])
 
     rows: list[dict[str, object]] = []
     commands: list[str] = []
     for backend in backends:
-        binary = (
-            "./build/perf_concurrency_metal"
-            if backend == "metal"
-            else "./build/perf_concurrency"
-        )
+        binary = {
+            "cpu": "./build/perf_concurrency",
+            "metal": "./build/perf_concurrency_metal",
+            "cuda": "./build/perf_concurrency_cuda",
+        }[backend]
         cmd = [
             binary,
             "--model", args.model,
@@ -127,7 +132,9 @@ def main() -> int:
         "commands": commands,
         "platform": platform.platform(),
         "python": platform.python_version(),
-        "device": command_output(["sysctl", "-n", "hw.model"]),
+        "device": command_output([
+            "nvidia-smi", "--query-gpu=name", "--format=csv,noheader", "-i", "0"
+        ]) if "cuda" in backends else command_output(["sysctl", "-n", "hw.model"]),
         "os": command_output(["sw_vers", "-productVersion"]),
         "xcode": command_output(["xcodebuild", "-version"]).replace("\n", " "),
     }

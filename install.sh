@@ -3,27 +3,27 @@
 set -eu
 
 repo="QuixiAI/embeddinggemma.c"
-version=${QUIXIEMBED_VERSION:-latest}
-variant=${QUIXIEMBED_VARIANT:-auto}
-install_dir=${QUIXIEMBED_INSTALL_DIR:-}
+version=${EMBEDDINGGEMMA_VERSION:-latest}
+variant=${EMBEDDINGGEMMA_VARIANT:-auto}
+install_dir=${EMBEDDINGGEMMA_INSTALL_DIR:-}
 
 usage() {
     cat <<'EOF'
 Usage: install.sh [--version VERSION] [--variant auto|cpu|metal|cuda|rocm|xpu]
                   [--install-dir DIRECTORY]
 
-Downloads a quixiembed release binary and installs it as
-~/.local/bin/quixiembed by default.
+Downloads an embeddinggemma release binary and installs it as
+~/.local/bin/embeddinggemma by default.
 
 Environment overrides:
-  QUIXIEMBED_VERSION       Release tag, or latest (default: latest)
-  QUIXIEMBED_VARIANT       auto, cpu, metal, cuda, rocm, or xpu (default: auto)
-  QUIXIEMBED_INSTALL_DIR   Installation directory (default: ~/.local/bin)
+  EMBEDDINGGEMMA_VERSION       Release tag, or latest (default: latest)
+  EMBEDDINGGEMMA_VARIANT       auto, cpu, metal, cuda, rocm, or xpu (default: auto)
+  EMBEDDINGGEMMA_INSTALL_DIR   Installation directory (default: ~/.local/bin)
 EOF
 }
 
 die() {
-    printf 'quixiembed installer: %s\n' "$*" >&2
+    printf 'embeddinggemma installer: %s\n' "$*" >&2
     exit 1
 }
 
@@ -145,7 +145,7 @@ sha256_file() {
     fi
 }
 
-tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/quixiembed.XXXXXX") ||
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/embeddinggemma.XXXXXX") ||
     die 'could not create a temporary directory'
 staged=
 cleanup() {
@@ -195,15 +195,15 @@ if [ "$platform" = linux ] && command -v ldd >/dev/null 2>&1; then
 fi
 
 mkdir -p "$install_dir"
-staged=$(mktemp "$install_dir/.quixiembed.XXXXXX") ||
+staged=$(mktemp "$install_dir/.embeddinggemma.XXXXXX") ||
     die "could not create a temporary file in $install_dir"
 cp "$tmpdir/$asset" "$staged"
 chmod 0755 "$staged"
-mv -f "$staged" "$install_dir/quixiembed"
+mv -f "$staged" "$install_dir/embeddinggemma"
 staged=
 
-printf 'Installed %s as %s/quixiembed\n' "$asset" "$install_dir"
+printf 'Installed %s as %s/embeddinggemma\n' "$asset" "$install_dir"
 case ":${PATH:-}:" in
     *":$install_dir:"*) ;;
-    *) printf 'Add %s to PATH to run quixiembed directly.\n' "$install_dir" ;;
+    *) printf 'Add %s to PATH to run embeddinggemma directly.\n' "$install_dir" ;;
 esac

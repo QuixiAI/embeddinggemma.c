@@ -2,7 +2,7 @@
 #define EI_HTTP_DOCS_H
 
 static const char EI_ROOT_JSON[] =
-    "{\"name\":\"quixiembed\",\"status\":\"ok\","
+    "{\"name\":\"embeddinggemma\",\"status\":\"ok\","
     "\"docs\":\"/docs\",\"openapi\":\"/openapi.json\","
     "\"health\":\"/healthz\",\"routes\":["
     "\"GET /api/tags\",\"POST /api/embed\"]}\n";
@@ -15,7 +15,7 @@ static const char EI_DOCS_HTML[] =
     "<head>\n"
     "<meta charset=\"utf-8\">\n"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
-    "<title>quixiembed API</title>\n"
+    "<title>embeddinggemma API</title>\n"
     "<style>\n"
     ":root{color-scheme:light dark;--bg:#f7f7f5;--surface:#fff;--text:#18181b;"
     "--muted:#5f6368;--line:#d9d9d4;--link:#075985;--get:#166534;--post:#9a3412;"
@@ -45,7 +45,7 @@ static const char EI_DOCS_HTML[] =
     "</head>\n"
     "<body>\n"
     "<header><div class=\"wrap\"><p class=\"eyebrow\">LOCAL EMBEDDING INFERENCE</p>"
-    "<h1>quixiembed API</h1><p>HTTP interface for EmbeddingGemma with 768, 512, "
+    "<h1>embeddinggemma API</h1><p>HTTP interface for EmbeddingGemma with 768, 512, "
     "256, and 128-dimensional Matryoshka outputs.</p><nav>"
     "<a href=\"/openapi.json\">OpenAPI JSON</a><a href=\"/healthz\">Health</a>"
     "</nav></div></header>\n"
@@ -77,7 +77,7 @@ static const char EI_DOCS_HTML[] =
 static const char EI_OPENAPI_JSON[] =
     "{"
     "\"openapi\":\"3.1.0\","
-    "\"info\":{\"title\":\"quixiembed API\",\"version\":\"1.0.0\","
+    "\"info\":{\"title\":\"embeddinggemma API\",\"version\":\"1.0.0\","
     "\"description\":\"Local EmbeddingGemma inference API.\"},"
     "\"servers\":[{\"url\":\"http://127.0.0.1:42666\"}],"
     "\"paths\":{"

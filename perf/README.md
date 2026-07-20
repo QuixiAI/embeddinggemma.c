@@ -21,7 +21,7 @@ EI_BATCH_LOOKAHEAD=0 python3 perf/bench_concurrency.py --backend metal \
 python3 perf/bench_dimensions.py --backend metal --encoding-format both
 python3 perf/bench_http.py --backend metal --keepalive on --response-cache-mb 64
 python3 perf/bench_servers.py --url http://127.0.0.1:42666 \
-  --api quixi --model embeddinggemma-300m
+  --api embeddinggemma --model embeddinggemma-300m
 ./build/perf_engine_metal --model model/embeddinggemma-300M-qat-Q4_0.gguf \
   --backend metal --tokens 512,1024,2048 --warmup 4 --iters 14 \
   --ab-metal-fp16-kv
@@ -70,13 +70,13 @@ make perf-batch
 
 ## Server Comparisons
 
-`bench_servers.py` applies one HTTP workload to quixiembed, Ollama, vLLM, and
+`bench_servers.py` applies one HTTP workload to embeddinggemma, Ollama, vLLM, and
 text-embeddings-inference. Start each server separately on the same otherwise
 idle device, then run the matching adapter:
 
 ```sh
 python3 perf/bench_servers.py --url http://127.0.0.1:42666 \
-  --api quixi --model embeddinggemma-300m --label quixiembed
+  --api embeddinggemma --model embeddinggemma-300m --label embeddinggemma
 python3 perf/bench_servers.py --url http://127.0.0.1:11434 \
   --api ollama --model embeddinggemma --label ollama
 python3 perf/bench_servers.py --url http://127.0.0.1:8000 \

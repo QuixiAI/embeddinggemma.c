@@ -1,8 +1,8 @@
-# quixiembed
+# embeddinggemma
 
 **The fastest way to serve EmbeddingGemma. Anywhere.**
 
-`quixiembed` is a tiny, model-specialized embeddings server for
+`embeddinggemma` is a tiny, model-specialized embeddings server for
 EmbeddingGemma 300M. It runs on CPU, Apple Metal, NVIDIA CUDA, AMD ROCm, and
 Intel XPU SYCL from a single native executable per platform. No Python
 environment, framework, container, or sidecar kernel library is required.
@@ -24,7 +24,7 @@ Start the server. The correct backend is built into each platform binary and
 selected automatically:
 
 ```sh
-quixiembed
+embeddinggemma
 ```
 
 The model is downloaded on first run to
@@ -60,7 +60,7 @@ API reference. `GET /healthz` reports readiness, and `--bind`, `--port`, and
 
 ## Install
 
-Install the latest release as `~/.local/bin/quixiembed`:
+Install the latest release as `~/.local/bin/embeddinggemma`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/QuixiAI/embeddinggemma.c/main/install.sh | sh

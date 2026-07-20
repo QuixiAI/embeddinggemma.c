@@ -92,7 +92,7 @@ class Endpoint:
         self.port = parsed.port
         self.https = parsed.scheme == "https"
         default_path = {
-            "quixi": "/api/embed",
+            "embeddinggemma": "/api/embed",
             "ollama": "/api/embed",
             "openai": "/v1/embeddings",
         }[api]
@@ -232,7 +232,9 @@ def render_summary(metadata: dict[str, object], rows: list[dict[str, object]]) -
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
-    parser.add_argument("--api", choices=("quixi", "openai", "ollama"), required=True)
+    parser.add_argument(
+        "--api", choices=("embeddinggemma", "openai", "ollama"), required=True
+    )
     parser.add_argument("--path")
     parser.add_argument("--model", default="embeddinggemma-300m")
     parser.add_argument("--label")

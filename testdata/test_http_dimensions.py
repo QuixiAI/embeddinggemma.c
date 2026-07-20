@@ -117,7 +117,7 @@ def check_discovery(base_url):
         raise AssertionError(f"root returned {content_type!r}")
     root = json.loads(body)
     expected = {
-        "name": "quixiembed",
+        "name": "embeddinggemma",
         "status": "ok",
         "docs": "/docs",
         "openapi": "/openapi.json",
@@ -136,7 +136,7 @@ def check_discovery(base_url):
     if content_type != "text/html":
         raise AssertionError(f"docs returned {content_type!r}")
     html = body.decode("utf-8")
-    for marker in ("quixiembed API", "/healthz", "/api/tags", "/api/embed"):
+    for marker in ("embeddinggemma API", "/healthz", "/api/tags", "/api/embed"):
         if marker not in html:
             raise AssertionError(f"docs are missing {marker!r}")
 

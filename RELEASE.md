@@ -72,7 +72,7 @@ xcodebuild -version
 xcrun --find metal
 make test
 make test-metal
-make release-darwin DIST=/tmp/quixiembed-dist
+make release-darwin DIST=/tmp/embeddinggemma-dist
 ```
 
 `release-darwin` rebuilds CPU and Metal, strips and ad-hoc signs both files, and
@@ -81,15 +81,15 @@ the Metal executable contains the embedded `__DATA,__metallib` section.
 Validate the staged executables, not only the unstripped build output:
 
 ```sh
-codesign --verify --verbose=2 /tmp/quixiembed-dist/embeddinggemma-darwin-arm64-cpu
-codesign --verify --verbose=2 /tmp/quixiembed-dist/embeddinggemma-darwin-arm64-metal
-vtool -show-build /tmp/quixiembed-dist/embeddinggemma-darwin-arm64-cpu
-vtool -show-build /tmp/quixiembed-dist/embeddinggemma-darwin-arm64-metal
+codesign --verify --verbose=2 /tmp/embeddinggemma-dist/embeddinggemma-darwin-arm64-cpu
+codesign --verify --verbose=2 /tmp/embeddinggemma-dist/embeddinggemma-darwin-arm64-metal
+vtool -show-build /tmp/embeddinggemma-dist/embeddinggemma-darwin-arm64-cpu
+vtool -show-build /tmp/embeddinggemma-dist/embeddinggemma-darwin-arm64-metal
 python3 testdata/test_http_dimensions.py \
-  --binary /tmp/quixiembed-dist/embeddinggemma-darwin-arm64-cpu \
+  --binary /tmp/embeddinggemma-dist/embeddinggemma-darwin-arm64-cpu \
   --model "$MODEL" --backend cpu
 python3 testdata/test_http_dimensions.py \
-  --binary /tmp/quixiembed-dist/embeddinggemma-darwin-arm64-metal \
+  --binary /tmp/embeddinggemma-dist/embeddinggemma-darwin-arm64-metal \
   --model "$MODEL" --backend metal
 ```
 
@@ -104,11 +104,11 @@ flags such as `-march=native`.
 ```sh
 cd "$worktree"
 make test
-make release-linux-cpu DIST=/tmp/quixiembed-dist
+make release-linux-cpu DIST=/tmp/embeddinggemma-dist
 python3 testdata/test_http_dimensions.py \
-  --binary /tmp/quixiembed-dist/embeddinggemma-linux-x86_64-cpu \
+  --binary /tmp/embeddinggemma-dist/embeddinggemma-linux-x86_64-cpu \
   --model "$MODEL" --backend cpu
-ldd /tmp/quixiembed-dist/embeddinggemma-linux-x86_64-cpu
+ldd /tmp/embeddinggemma-dist/embeddinggemma-linux-x86_64-cpu
 ```
 
 Review `ldd` output for unexpected non-system dependencies.
@@ -122,14 +122,14 @@ architecture supported by the installed compiler and PTX for the newest one.
 ```sh
 cd "$worktree"
 make test-cuda NVCC=/usr/local/cuda/bin/nvcc CUDA_ARCHS=86
-make release-linux-cuda DIST=/tmp/quixiembed-dist \
+make release-linux-cuda DIST=/tmp/embeddinggemma-dist \
   NVCC=/usr/local/cuda/bin/nvcc CUDA_HOME=/usr/local/cuda
 python3 testdata/test_http_dimensions.py \
-  --binary /tmp/quixiembed-dist/embeddinggemma-linux-x86_64-cuda \
+  --binary /tmp/embeddinggemma-dist/embeddinggemma-linux-x86_64-cuda \
   --model "$MODEL" --backend cuda
-cuobjdump --list-elf /tmp/quixiembed-dist/embeddinggemma-linux-x86_64-cuda
-cuobjdump --list-ptx /tmp/quixiembed-dist/embeddinggemma-linux-x86_64-cuda
-ldd /tmp/quixiembed-dist/embeddinggemma-linux-x86_64-cuda
+cuobjdump --list-elf /tmp/embeddinggemma-dist/embeddinggemma-linux-x86_64-cuda
+cuobjdump --list-ptx /tmp/embeddinggemma-dist/embeddinggemma-linux-x86_64-cuda
+ldd /tmp/embeddinggemma-dist/embeddinggemma-linux-x86_64-cuda
 ```
 
 The focused test may use the host architecture for speed. The release command
@@ -143,14 +143,14 @@ the release; the default includes `gfx908`, `gfx90a`, `gfx942`, and `gfx950`.
 ```sh
 cd "$worktree"
 make test-rocm HIPCC=/opt/rocm/bin/hipcc ROCM_ARCHS=gfx942
-make release-linux-rocm DIST=/tmp/quixiembed-dist \
+make release-linux-rocm DIST=/tmp/embeddinggemma-dist \
   HIPCC=/opt/rocm/bin/hipcc ROCM_HOME=/opt/rocm
 python3 testdata/test_http_dimensions.py \
-  --binary /tmp/quixiembed-dist/embeddinggemma-linux-x86_64-rocm \
+  --binary /tmp/embeddinggemma-dist/embeddinggemma-linux-x86_64-rocm \
   --model "$MODEL" --backend rocm
 /opt/rocm/bin/roc-obj-ls \
-  /tmp/quixiembed-dist/embeddinggemma-linux-x86_64-rocm
-ldd /tmp/quixiembed-dist/embeddinggemma-linux-x86_64-rocm
+  /tmp/embeddinggemma-dist/embeddinggemma-linux-x86_64-rocm
+ldd /tmp/embeddinggemma-dist/embeddinggemma-linux-x86_64-rocm
 ```
 
 The staged file must list all four CDNA code objects and no missing runtime
@@ -167,11 +167,11 @@ cd "$worktree"
 source /opt/intel/oneapi/setvars.sh
 make xpu-deps
 make test-xpu XPU_XE2_FLASH=1 SYCL_CXX=icpx
-make release-linux-xpu DIST=/tmp/quixiembed-dist SYCL_CXX=icpx
+make release-linux-xpu DIST=/tmp/embeddinggemma-dist SYCL_CXX=icpx
 python3 testdata/test_http_dimensions.py \
-  --binary /tmp/quixiembed-dist/embeddinggemma-linux-x86_64-xpu \
+  --binary /tmp/embeddinggemma-dist/embeddinggemma-linux-x86_64-xpu \
   --model "$MODEL" --backend xpu
-ldd /tmp/quixiembed-dist/embeddinggemma-linux-x86_64-xpu
+ldd /tmp/embeddinggemma-dist/embeddinggemma-linux-x86_64-xpu
 ```
 
 Run on a Level Zero GPU and confirm the specialized route is active in the
@@ -185,9 +185,9 @@ workstation. Preserve the names exactly, then generate and verify checksums:
 
 ```sh
 cd "$worktree"
-make release-checksums DIST=/tmp/quixiembed-dist
-make release-verify DIST=/tmp/quixiembed-dist
-make release-ready DIST=/tmp/quixiembed-dist
+make release-checksums DIST=/tmp/embeddinggemma-dist
+make release-verify DIST=/tmp/embeddinggemma-dist
+make release-ready DIST=/tmp/embeddinggemma-dist
 ```
 
 `release-ready` rejects a dirty worktree, a malformed `VERSION`, a README that
@@ -207,7 +207,7 @@ runtime requirements, correctness validation, and architecture coverage. Then
 publish the raw files:
 
 ```sh
-gh release create "$version" /tmp/quixiembed-dist/* \
+gh release create "$version" /tmp/embeddinggemma-dist/* \
   --title "embeddinggemma.c $version" \
   --notes-file /tmp/release-notes.md
 ```
@@ -226,8 +226,8 @@ so the developer's active binary is not replaced:
 
 ```sh
 ./install.sh --version "$(cat VERSION)" --variant cpu \
-  --install-dir /tmp/quixiembed-install
-/tmp/quixiembed-install/quixiembed --help
+  --install-dir /tmp/embeddinggemma-install
+/tmp/embeddinggemma-install/embeddinggemma --help
 ```
 
 On each accelerator platform, repeat with its explicit variant. Also test

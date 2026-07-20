@@ -44,7 +44,7 @@ DIST    ?= dist
 MODEL   ?= model/embeddinggemma-300M-qat-Q4_0.gguf
 VERSION := $(strip $(shell cat VERSION 2>/dev/null))
 PERF_SERVER_URL ?= http://127.0.0.1:42666
-PERF_SERVER_API ?= quixi
+PERF_SERVER_API ?= embeddinggemma
 PERF_SERVER_MODEL ?= embeddinggemma-300m
 
 ifeq ($(shell uname -s),Darwin)

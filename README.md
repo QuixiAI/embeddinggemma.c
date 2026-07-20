@@ -4,8 +4,7 @@
 
 `embeddinggemma` is a tiny, model-specialized embeddings server for
 EmbeddingGemma 300M. It runs on CPU, Apple Metal, NVIDIA CUDA, AMD ROCm, and
-Intel XPU SYCL from a single native executable per platform. No Python
-environment, framework, container, or sidecar kernel library is required.
+Intel XPU SYCL from a single native executable per platform.
 
 It is fast as fuck, and the CPU binary is about 100 KiB.
 
@@ -14,9 +13,6 @@ It is fast as fuck, and the CPU binary is about 100 KiB.
   caching for concurrent serving.
 - Matryoshka embeddings at 768, 512, 256, and 128 dimensions.
 - Automatic model download and a built-in HTTP server on port `42666`.
-- One Q4_0 model, one executable, and no generic runtime overhead.
-
-Gaudi is the only major accelerator backend not supported yet.
 
 ## Basic Usage
 

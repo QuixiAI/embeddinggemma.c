@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    name: Portable checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run model-free checks
+        run: make check
+      - name: Build CPU server
+        run: make

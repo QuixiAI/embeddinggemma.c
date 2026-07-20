@@ -1,4 +1,5 @@
 build/
+dist/
 *.o
 testdata/*.gguf
 __pycache__/

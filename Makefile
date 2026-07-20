@@ -40,7 +40,9 @@ SYCL_LINK_TARGET_FLAGS += -fsycl-targets=$(SYCL_TARGETS)
 endif
 SYCL_LDLIBS ?= -fsycl -qmkl
 BUILD   := build
+DIST    ?= dist
 MODEL   ?= model/embeddinggemma-300M-qat-Q4_0.gguf
+VERSION := $(strip $(shell cat VERSION 2>/dev/null))
 
 # Prefer a full Xcode installation for Metal without requiring a global
 # xcode-select change. An environment-provided DEVELOPER_DIR still wins.
@@ -393,7 +395,7 @@ $(BUILD)/rocm:
 $(BUILD)/xpu:
 	mkdir -p $(BUILD)/xpu
 
-.PHONY: test test-http test-http-metal test-http-cuda test-http-rocm test-http-xpu test-metal test-cuda test-rocm test-xpu perf perf-engine perf-engine-metal perf-engine-cuda perf-engine-rocm perf-engine-xpu perf-concurrency perf-concurrency-cuda perf-concurrency-rocm perf-concurrency-xpu perf-dimensions perf-batch perf-tokenization metal metal-kernels cuda rocm xpu clean
+.PHONY: test test-unit check test-http test-http-metal test-http-cuda test-http-rocm test-http-xpu test-metal test-cuda test-rocm test-xpu perf perf-engine perf-engine-metal perf-engine-cuda perf-engine-rocm perf-engine-xpu perf-concurrency perf-concurrency-cuda perf-concurrency-rocm perf-concurrency-xpu perf-dimensions perf-batch perf-tokenization metal metal-kernels cuda rocm xpu check-scripts clean clean-cpu clean-metal clean-cuda clean-rocm clean-xpu release-darwin release-linux-cpu release-linux-cuda release-linux-rocm release-linux-xpu release-checksums release-verify release-ready release-info help
 test: $(BUILD)/embeddinggemma $(BUILD)/test_gguf $(BUILD)/test_tokenizer $(BUILD)/test_kernels $(BUILD)/test_embed $(BUILD)/test_batch $(BUILD)/test_inference_service $(BUILD)/test_response_cache
 	python3 testdata/test_model_manifest.py --binary ./$(BUILD)/test_gguf \
 		--model $(MODEL) --manifest testdata/model-manifest.json
@@ -405,6 +407,13 @@ test: $(BUILD)/embeddinggemma $(BUILD)/test_gguf $(BUILD)/test_tokenizer $(BUILD
 	./$(BUILD)/test_response_cache
 	python3 testdata/test_http_dimensions.py --binary ./$(BUILD)/embeddinggemma \
 		--model $(MODEL) --backend cpu
+
+test-unit: $(BUILD)/test_kernels $(BUILD)/test_inference_service $(BUILD)/test_response_cache
+	./$(BUILD)/test_kernels
+	./$(BUILD)/test_inference_service
+	./$(BUILD)/test_response_cache
+
+check: check-scripts test-unit
 
 test-http: $(BUILD)/embeddinggemma
 	python3 testdata/test_http_dimensions.py --binary ./$(BUILD)/embeddinggemma \
@@ -507,5 +516,96 @@ test-xpu: $(BUILD)/test_embed_xpu $(BUILD)/test_xpu $(BUILD)/test_batch_xpu $(BU
 print-cc-version:
 	@$(CC) --version 2>/dev/null | sed -n '1p'
 
+check-scripts:
+	sh -n install.sh scripts/fetch-xpu-deps.sh scripts/stage-release.sh scripts/release-assets.sh
+
+clean-cpu:
+	rm -f $(BUILD)/embeddinggemma
+
+clean-metal:
+	rm -f $(METALLIB) $(BUILD)/engine_metal.o $(BUILD)/*metal $(BUILD)/*metal.o
+
+clean-cuda:
+	rm -rf $(BUILD)/cuda
+	rm -f $(BUILD)/*cuda
+
+clean-rocm:
+	rm -rf $(BUILD)/rocm
+	rm -f $(BUILD)/*rocm
+
+clean-xpu:
+	rm -rf $(BUILD)/xpu
+	rm -f $(BUILD)/*xpu $(BUILD)/test_xpu_w4
+
+release-darwin:
+	$(MAKE) clean-cpu clean-metal
+	$(MAKE) all
+	$(MAKE) metal
+	./scripts/stage-release.sh cpu $(BUILD)/embeddinggemma $(DIST)
+	./scripts/stage-release.sh metal $(BUILD)/embeddinggemma-metal $(DIST)
+
+release-linux-cpu:
+	$(MAKE) clean-cpu
+	$(MAKE) all
+	./scripts/stage-release.sh cpu $(BUILD)/embeddinggemma $(DIST)
+
+release-linux-cuda:
+	@test "$(origin CUDA_ARCH)" = undefined && \
+		test "$(origin CUDA_ARCHS)" = file && \
+		test "$(origin CUDA_PTX_ARCH)" = file || { \
+		echo 'error: CUDA architecture overrides are forbidden for release builds' >&2; exit 1; }
+	$(MAKE) clean-cuda
+	$(MAKE) cuda
+	./scripts/stage-release.sh cuda $(BUILD)/embeddinggemma-cuda $(DIST)
+
+release-linux-rocm:
+	@test "$(origin ROCM_ARCH)" = undefined && \
+		test "$(origin ROCM_ARCHS)" = file || { \
+		echo 'error: ROCm architecture overrides are forbidden for release builds' >&2; exit 1; }
+	$(MAKE) clean-rocm
+	$(MAKE) rocm
+	./scripts/stage-release.sh rocm $(BUILD)/embeddinggemma-rocm $(DIST)
+
+release-linux-xpu:
+	$(MAKE) clean-xpu
+	$(MAKE) xpu XPU_XE2_FLASH=1
+	./scripts/stage-release.sh xpu $(BUILD)/embeddinggemma-xpu $(DIST)
+
+release-checksums:
+	./scripts/release-assets.sh checksums $(DIST)
+
+release-verify:
+	./scripts/release-assets.sh verify $(DIST)
+
+release-ready: check-scripts release-verify
+	@test -n "$(VERSION)" || { echo 'error: VERSION is empty' >&2; exit 1; }
+	@printf '%s\n' "$(VERSION)" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$' || { \
+		echo 'error: VERSION must use vMAJOR.MINOR.PATCH' >&2; exit 1; }
+	@test -z "$$(git status --porcelain)" || { \
+		echo 'error: release worktree is dirty' >&2; git status --short >&2; exit 1; }
+	@git grep -q -- "--version $(VERSION)" README.md || { \
+		echo 'error: README pinned installer example does not match VERSION' >&2; exit 1; }
+	@if git rev-parse -q --verify "refs/tags/$(VERSION)" >/dev/null; then \
+		test "$$(git rev-list -n 1 "$(VERSION)")" = "$$(git rev-parse HEAD)" || { \
+			echo 'error: existing VERSION tag does not point to HEAD' >&2; exit 1; }; \
+	fi
+	@printf 'Release %s is ready at commit %s\n' "$(VERSION)" "$$(git rev-parse --short=12 HEAD)"
+
+release-info:
+	@printf 'version=%s\ncommit=%s\ndist=%s\n' "$(VERSION)" \
+		"$$(git rev-parse HEAD 2>/dev/null || printf unknown)" "$(DIST)"
+
+help:
+	@printf '%s\n' \
+		'make | metal | cuda | rocm | xpu  Build a server backend' \
+		'make check                         Run model-free unit and script checks' \
+		'make test | test-BACKEND          Run correctness and HTTP tests' \
+		'make perf-*                       Run kernel, engine, batch, or concurrency benchmarks' \
+		'make clean-BACKEND                Remove backend objects before changing build flags' \
+		'make release-darwin               Stage Darwin ARM64 CPU and Metal executables' \
+		'make release-linux-BACKEND        Stage a Linux x86_64 executable' \
+		'make release-checksums            Write checksums for all six executables' \
+		'make release-ready                Verify scripts, assets, checksums, version, and git state'
+
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD) $(DIST)

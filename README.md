@@ -627,8 +627,13 @@ dimensions it reduced payload size by 61%, made cached batch-32 responses about
 10x faster to format, and improved cached concurrency-32 throughput by
 1.12x-1.14x. It does not shorten cache-miss model inference.
 
-## Design Documents
+## Project Documentation
 
 Keep both design documents. `EXTRACTION.md` records exact llama.cpp algorithm
 and constant provenance needed to audit parity. `PORT_SPEC.md` defines the
 fixed model graph, serving contract, backend scope, and remaining port work.
+
+Development setup, testing expectations, kernel experiment rules, and pull
+request guidance are in `CONTRIBUTING.md`. The complete per-platform artifact,
+validation, signing, checksum, tagging, and publication procedure is in
+`RELEASE.md`.

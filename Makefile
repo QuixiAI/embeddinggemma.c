@@ -24,7 +24,7 @@ endif
 endif
 
 # QuixiCore-Metal-style build: compile every Metal translation unit into one
-# colocated metallib. Keep the source list explicit and track included headers.
+# metallib, then embed it into each Metal executable as a Mach-O section.
 METAL_FLAGS ?= -std=metal3.1 -O2 -Wall -Wextra -fno-fast-math
 METAL_INCLUDE_DIR := src/metal/include
 METAL_SOURCES := \
@@ -37,6 +37,7 @@ METAL_SOURCES := \
 	src/metal/kernels/pool.metal
 METAL_HEADERS := $(wildcard $(METAL_INCLUDE_DIR)/*.metal)
 METALLIB := $(BUILD)/embeddinggemma.metallib
+METALLIB_LDFLAGS := -Wl,-sectcreate,__DATA,__metallib,$(abspath $(METALLIB))
 OBJC ?= clang
 OBJCFLAGS ?= -O2 -Wall -Wextra -Werror -fobjc-arc
 METAL_FRAMEWORKS := -framework Foundation -framework Metal
@@ -131,19 +132,20 @@ $(BUILD)/engine_metal.o: src/engine_metal.m src/engine_metal.h src/model.h src/g
 
 $(BUILD)/embeddinggemma-metal: $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL $(CURL_CFLAGS) -o $@ $(SRCS_SERVER) $(SRCS_ENGINE) \
-		$(SRCS_SERVICE) $(BUILD)/engine_metal.o $(LDLIBS) $(CURL_LIBS) $(METAL_FRAMEWORKS)
+		$(SRCS_SERVICE) $(BUILD)/engine_metal.o $(LDLIBS) $(CURL_LIBS) \
+		$(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
 $(BUILD)/test_embed_metal: src/test_embed.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/test_embed.c $(SRCS_ENGINE) \
-		$(BUILD)/engine_metal.o $(LDLIBS) $(METAL_FRAMEWORKS)
+		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
 $(BUILD)/test_backend_parity_metal: src/test_backend_parity.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/test_backend_parity.c $(SRCS_ENGINE) \
-		$(BUILD)/engine_metal.o $(LDLIBS) $(METAL_FRAMEWORKS)
+		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
 $(BUILD)/test_batch_metal: src/test_batch.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/test_batch.c $(SRCS_ENGINE) \
-		$(BUILD)/engine_metal.o $(LDLIBS) $(METAL_FRAMEWORKS)
+		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
 $(BUILD)/perf_kernels: perf/harness/bench_kernels.c src/quants.c src/kernels.c src/gguf.c src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_kernels.c src/quants.c src/kernels.c src/gguf.c $(LDLIBS)
@@ -153,21 +155,22 @@ $(BUILD)/perf_engine: perf/harness/bench_engine.c $(SRCS_ENGINE) src/*.h | $(BUI
 
 $(BUILD)/perf_engine_metal: perf/harness/bench_engine.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -Isrc -o $@ perf/harness/bench_engine.c $(SRCS_ENGINE) \
-		$(BUILD)/engine_metal.o $(LDLIBS) $(METAL_FRAMEWORKS)
+		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
 $(BUILD)/perf_concurrency: perf/harness/bench_concurrency.c $(SRCS_ENGINE) $(SRCS_SERVICE) src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_concurrency.c $(SRCS_ENGINE) $(SRCS_SERVICE) $(LDLIBS)
 
 $(BUILD)/perf_concurrency_metal: perf/harness/bench_concurrency.c $(SRCS_ENGINE) $(SRCS_SERVICE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -Isrc -o $@ perf/harness/bench_concurrency.c $(SRCS_ENGINE) \
-		$(SRCS_SERVICE) $(BUILD)/engine_metal.o $(LDLIBS) $(METAL_FRAMEWORKS)
+		$(SRCS_SERVICE) $(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) \
+		$(METAL_FRAMEWORKS)
 
 $(BUILD)/perf_batch: perf/harness/bench_batch.c $(SRCS_ENGINE) src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_batch.c $(SRCS_ENGINE) $(LDLIBS)
 
 $(BUILD)/perf_batch_metal: perf/harness/bench_batch.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -Isrc -o $@ perf/harness/bench_batch.c $(SRCS_ENGINE) \
-		$(BUILD)/engine_metal.o $(LDLIBS) $(METAL_FRAMEWORKS)
+		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
 $(BUILD)/perf_tokenization: perf/harness/bench_tokenization.c $(SRCS_TOKENIZER) $(SRCS_SERVICE) src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_tokenization.c $(SRCS_TOKENIZER) \

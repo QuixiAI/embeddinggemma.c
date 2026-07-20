@@ -2,7 +2,8 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <mach-o/dyld.h>
+#import <mach-o/getsect.h>
+#import <mach-o/ldsyms.h>
 
 #include <math.h>
 
@@ -10,23 +11,32 @@ static void metal_set_error(char *err, size_t err_len, NSString *message) {
     if (err && err_len) snprintf(err, err_len, "%s", message.UTF8String);
 }
 
-static NSString *default_metallib_path(void) {
-    const char *override = getenv("EI_METALLIB_PATH");
-    if (override && *override) return [NSString stringWithUTF8String:override];
+static id<MTLLibrary> new_metal_library(id<MTLDevice> device,
+                                        const char *library_path,
+                                        NSError **error) {
+    const char *override = library_path && *library_path
+        ? library_path : getenv("EI_METALLIB_PATH");
+    if (override && *override) {
+        NSString *path = [NSString stringWithUTF8String:override];
+        return [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:error];
+    }
 
-    uint32_t size = 0;
-    _NSGetExecutablePath(NULL, &size);
-    char *path = malloc(size);
-    if (!path) return nil;
-    if (_NSGetExecutablePath(path, &size) != 0) {
-        free(path);
+    unsigned long size = 0;
+    const uint8_t *bytes = getsectiondata(&_mh_execute_header, "__DATA",
+                                          "__metallib", &size);
+    if (!bytes || size == 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"embeddinggemma.c"
+                                         code:1
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: @"embedded Metal library is missing"
+            }];
+        }
         return nil;
     }
-    NSString *executable = [[NSFileManager defaultManager]
-        stringWithFileSystemRepresentation:path length:strlen(path)];
-    free(path);
-    return [[executable stringByDeletingLastPathComponent]
-        stringByAppendingPathComponent:@"embeddinggemma.metallib"];
+    dispatch_data_t data = dispatch_data_create(
+        bytes, size, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    return [device newLibraryWithData:data error:error];
 }
 
 static id<MTLBuffer> new_rope_table(id<MTLDevice> device, float base) {
@@ -583,15 +593,12 @@ static void encode_pool_batch(EIMetalEngine *engine,
         return nil;
     }
 
-    NSString *path = libraryPath && *libraryPath
-        ? [NSString stringWithUTF8String:libraryPath]
-        : default_metallib_path();
     NSError *error = nil;
-    id<MTLLibrary> library = [_device newLibraryWithURL:[NSURL fileURLWithPath:path]
-                                                   error:&error];
+    id<MTLLibrary> library = new_metal_library(_device, libraryPath, &error);
     if (!library) {
         if (errorMessage) {
-            *errorMessage = [NSString stringWithFormat:@"failed to load %@: %@", path, error];
+            *errorMessage = [NSString stringWithFormat:
+                @"failed to load Metal library: %@", error];
         }
         return nil;
     }

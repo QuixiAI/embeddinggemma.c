@@ -5,7 +5,7 @@ Standalone C11 inference and HTTP serving for
 
 - GGUF v3 reader and SentencePiece tokenizer.
 - Q4_0/Q8_0 inference on scalar CPU, ARM64 NEON, and x86 SIMD paths.
-- Complete Apple Metal backend built as a standalone metallib.
+- Complete Apple Metal backend with kernels embedded in one executable.
 - CUDA backend with packed-Q4 warp kernels and FP16 tensor-core projections.
 - Model-specialized full/SWA attention, mean pooling, and L2 normalization.
 - Matryoshka outputs at 768, 512, 256, or 128 dimensions.
@@ -27,16 +27,17 @@ make
 
 The output is `build/embeddinggemma`.
 
-Build the Metal server and its colocated kernel library:
+Build the self-contained Metal server:
 
 ```sh
 make metal
 ```
 
-The outputs are `build/embeddinggemma-metal` and
-`build/embeddinggemma.metallib`. The Metal build follows QuixiCore-Metal's
-pattern: all `.metal` translation units are passed to one direct `xcrun metal`
-invocation, producing one standalone metallib with stable function names.
+The runtime output is `build/embeddinggemma-metal`; no sidecar file is needed.
+The Makefile passes every `.metal` translation unit to one direct `xcrun metal`
+invocation, then embeds the resulting metallib in the executable's Mach-O
+`__DATA,__metallib` section. `build/embeddinggemma.metallib` remains only as an
+intermediate artifact for kernel inspection and the `metal-kernels` target.
 
 Build the CUDA server for the RTX 3090/SM86 validation target:
 
@@ -102,7 +103,7 @@ RMS norm and directly emits the normalized input for the next projection.
 
 Metal diagnostic controls:
 
-- `EI_METALLIB_PATH`: override the metallib path.
+- `EI_METALLIB_PATH`: override the embedded metallib for kernel diagnostics.
 - `EI_METAL_FUSED_QK_ROPE=0`: use separate Q/K dispatches.
 - `EI_METAL_GEMV_R4_MIN_TOKENS=1..64`: change the R1/R4 boundary.
 - `EI_METAL_GEMM_MIN_TOKENS=1..65536`: enable staged GEMM at a threshold.

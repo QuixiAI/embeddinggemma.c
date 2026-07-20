@@ -20,6 +20,8 @@ EI_BATCH_LOOKAHEAD=0 python3 perf/bench_concurrency.py --backend metal \
   --tokens 1,1,1,513 --concurrency 64 --min-requests 64
 python3 perf/bench_dimensions.py --backend metal --encoding-format both
 python3 perf/bench_http.py --backend metal --keepalive on --response-cache-mb 64
+python3 perf/bench_servers.py --url http://127.0.0.1:42666 \
+  --api quixi --model embeddinggemma-300m
 ./build/perf_engine_metal --model model/embeddinggemma-300M-qat-Q4_0.gguf \
   --backend metal --tokens 512,1024,2048 --warmup 4 --iters 14 \
   --ab-metal-fp16-kv
@@ -64,6 +66,38 @@ EI_CUDA_SWA_TENSOR_TILE_TOKENS=0 ./build/perf_engine_cuda \
   --model model/embeddinggemma-300M-qat-Q4_0.gguf --backend cuda \
   --tokens 2048 --warmup 5 --iters 20
 make perf-batch
+```
+
+## Server Comparisons
+
+`bench_servers.py` applies one HTTP workload to quixiembed, Ollama, vLLM, and
+text-embeddings-inference. Start each server separately on the same otherwise
+idle device, then run the matching adapter:
+
+```sh
+python3 perf/bench_servers.py --url http://127.0.0.1:42666 \
+  --api quixi --model embeddinggemma-300m --label quixiembed
+python3 perf/bench_servers.py --url http://127.0.0.1:11434 \
+  --api ollama --model embeddinggemma --label ollama
+python3 perf/bench_servers.py --url http://127.0.0.1:8000 \
+  --api openai --model google/embeddinggemma-300m --label vllm
+python3 perf/bench_servers.py --url http://127.0.0.1:8080 \
+  --api openai --model google/embeddinggemma-300m \
+  --label text-embeddings-inference
+```
+
+The OpenAI adapter covers both vLLM and TEI's `/v1/embeddings` endpoint. Every
+timed string has a unique suffix to bypass exact-result caches. Keep dimensions,
+generated word count, explicit batch size, concurrency sweep, warmup, and timed
+rounds identical. Record server versions, model artifact/dtype, command lines,
+driver, device power state, and competing GPU processes beside the summaries.
+Do not compare runs from different hosts in a competitive ranking.
+
+The equivalent Make target accepts configuration variables:
+
+```sh
+make perf-servers PERF_SERVER_URL=http://127.0.0.1:8000 \
+  PERF_SERVER_API=openai PERF_SERVER_MODEL=google/embeddinggemma-300m
 ```
 
 Each run writes:

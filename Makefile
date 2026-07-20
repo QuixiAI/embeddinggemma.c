@@ -43,6 +43,9 @@ BUILD   := build
 DIST    ?= dist
 MODEL   ?= model/embeddinggemma-300M-qat-Q4_0.gguf
 VERSION := $(strip $(shell cat VERSION 2>/dev/null))
+PERF_SERVER_URL ?= http://127.0.0.1:42666
+PERF_SERVER_API ?= quixi
+PERF_SERVER_MODEL ?= embeddinggemma-300m
 
 ifeq ($(shell uname -s),Darwin)
 MACOSX_DEPLOYMENT_TARGET ?= 14.0
@@ -400,7 +403,7 @@ $(BUILD)/rocm:
 $(BUILD)/xpu:
 	mkdir -p $(BUILD)/xpu
 
-.PHONY: test test-unit test-defaults check test-http test-http-metal test-http-cuda test-http-rocm test-http-xpu test-metal test-cuda test-rocm test-xpu perf perf-engine perf-engine-metal perf-engine-cuda perf-engine-rocm perf-engine-xpu perf-concurrency perf-concurrency-cuda perf-concurrency-rocm perf-concurrency-xpu perf-dimensions perf-batch perf-tokenization metal metal-kernels cuda rocm xpu check-scripts clean clean-cpu clean-metal clean-cuda clean-rocm clean-xpu release-darwin release-linux-cpu release-linux-cuda release-linux-rocm release-linux-xpu release-checksums release-verify release-ready release-info help
+.PHONY: test test-unit test-defaults check test-http test-http-metal test-http-cuda test-http-rocm test-http-xpu test-metal test-cuda test-rocm test-xpu perf perf-engine perf-engine-metal perf-engine-cuda perf-engine-rocm perf-engine-xpu perf-concurrency perf-concurrency-cuda perf-concurrency-rocm perf-concurrency-xpu perf-dimensions perf-batch perf-tokenization perf-servers metal metal-kernels cuda rocm xpu check-scripts clean clean-cpu clean-metal clean-cuda clean-rocm clean-xpu release-darwin release-linux-cpu release-linux-cuda release-linux-rocm release-linux-xpu release-checksums release-verify release-ready release-info help
 test: $(BUILD)/embeddinggemma $(BUILD)/test_gguf $(BUILD)/test_tokenizer $(BUILD)/test_kernels $(BUILD)/test_embed $(BUILD)/test_batch $(BUILD)/test_inference_service $(BUILD)/test_response_cache
 	python3 testdata/test_model_manifest.py --binary ./$(BUILD)/test_gguf \
 		--model $(MODEL) --manifest testdata/model-manifest.json
@@ -484,6 +487,10 @@ perf-batch: $(BUILD)/perf_batch $(BUILD)/perf_batch_metal
 
 perf-tokenization: $(BUILD)/perf_tokenization
 	./$(BUILD)/perf_tokenization --model $(MODEL)
+
+perf-servers:
+	python3 perf/bench_servers.py --url $(PERF_SERVER_URL) \
+		--api $(PERF_SERVER_API) --model $(PERF_SERVER_MODEL)
 
 metal-kernels: $(METALLIB)
 
@@ -610,6 +617,7 @@ help:
 		'make check                         Run model-free unit and script checks' \
 		'make test | test-BACKEND          Run correctness and HTTP tests' \
 		'make perf-*                       Run kernel, engine, batch, or concurrency benchmarks' \
+		'make perf-servers                 Benchmark a running embedding HTTP server' \
 		'make clean-BACKEND                Remove backend objects before changing build flags' \
 		'make release-darwin               Stage Darwin ARM64 CPU and Metal executables' \
 		'make release-linux-BACKEND        Stage a Linux x86_64 executable' \

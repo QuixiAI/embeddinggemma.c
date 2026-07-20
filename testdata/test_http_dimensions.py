@@ -39,6 +39,23 @@ def post(url, payload, expected_status=200):
     return json.loads(body)
 
 
+def get(url, expected_status=200):
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            status = response.status
+            content_type = response.headers.get_content_type()
+            body = response.read()
+    except urllib.error.HTTPError as error:
+        status = error.code
+        content_type = error.headers.get_content_type()
+        body = error.read()
+    if status != expected_status:
+        raise AssertionError(
+            f"expected HTTP {expected_status}, got {status}: {body!r}"
+        )
+    return content_type, body
+
+
 def wait_until_ready(process, url):
     deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
@@ -92,6 +109,51 @@ def check_keep_alive(base_url):
             raise AssertionError("pipelined responses were not order-preserving")
         if connection.recv(1) != b"":
             raise AssertionError("server did not close after Connection: close")
+
+
+def check_discovery(base_url):
+    content_type, body = get(base_url + "/")
+    if content_type != "application/json":
+        raise AssertionError(f"root returned {content_type!r}")
+    root = json.loads(body)
+    expected = {
+        "name": "quixiembed",
+        "status": "ok",
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+        "health": "/healthz",
+    }
+    if any(root.get(key) != value for key, value in expected.items()):
+        raise AssertionError(f"unexpected root discovery response: {root!r}")
+    if root.get("routes") != ["GET /api/tags", "POST /api/embed"]:
+        raise AssertionError(f"unexpected advertised routes: {root.get('routes')!r}")
+
+    content_type, body = get(base_url + "/healthz")
+    if content_type != "application/json" or json.loads(body) != {"status": "ok"}:
+        raise AssertionError("health endpoint did not return JSON readiness")
+
+    content_type, body = get(base_url + "/docs")
+    if content_type != "text/html":
+        raise AssertionError(f"docs returned {content_type!r}")
+    html = body.decode("utf-8")
+    for marker in ("quixiembed API", "/healthz", "/api/tags", "/api/embed"):
+        if marker not in html:
+            raise AssertionError(f"docs are missing {marker!r}")
+
+    content_type, body = get(base_url + "/openapi.json")
+    if content_type != "application/json":
+        raise AssertionError(f"OpenAPI returned {content_type!r}")
+    openapi = json.loads(body)
+    if openapi.get("openapi") != "3.1.0":
+        raise AssertionError("OpenAPI document does not declare version 3.1.0")
+    expected_paths = {"/", "/docs", "/openapi.json", "/healthz", "/api/tags", "/api/embed"}
+    if set(openapi.get("paths", {})) != expected_paths:
+        raise AssertionError(f"unexpected OpenAPI paths: {openapi.get('paths')!r}")
+
+    content_type, body = get(base_url + "/missing", expected_status=404)
+    error = json.loads(body)
+    if content_type != "application/json" or "/docs" not in error.get("error", ""):
+        raise AssertionError("unknown route did not point users to documentation")
 
 
 def check_dimensions(base_url):
@@ -230,6 +292,7 @@ def main():
     base_url = f"http://127.0.0.1:{port}"
     try:
         wait_until_ready(process, base_url)
+        check_discovery(base_url)
         check_keep_alive(base_url)
         check_dimensions(base_url)
     finally:

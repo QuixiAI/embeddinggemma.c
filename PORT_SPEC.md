@@ -89,6 +89,11 @@ llama.cpp deep-read) before implementing.
 
 ## Serving contract (db/03 `get_embedding()`)
 
+- `GET /` -> `200` JSON service discovery with documentation, OpenAPI, health,
+  and inference-route links.
+- `GET /docs` -> `200` self-contained HTML API documentation.
+- `GET /openapi.json` -> `200` OpenAPI 3.1 JSON.
+- `GET /healthz` -> `200` JSON after the model and workspace are ready.
 - `GET /api/tags` → `200` JSON (health probe).
 - `POST /api/embed` accepts `{"model": "...", "input": ["...", ...],
   "dimensions": 256, "encoding_format": "float"}` and returns L2-normalized,

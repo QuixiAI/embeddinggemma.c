@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "engine.h"
+#include "http_docs.h"
 #include "inference_service.h"
 #include "response_cache.h"
 
@@ -423,18 +424,27 @@ static void send_all(int fd, const char *buf, size_t n) {
     }
 }
 
-static void http_response(int fd, int status, const char *reason,
-                          const char *body, bool keep_alive) {
+static void http_response_typed(int fd, int status, const char *reason,
+                                const char *content_type, const char *body,
+                                bool keep_alive) {
     char hdr[512];
     int n = snprintf(hdr, sizeof hdr,
         "HTTP/1.1 %d %s\r\n"
-        "Content-Type: application/json\r\n"
+        "Content-Type: %s\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
         "Content-Length: %zu\r\n"
         "Connection: %s\r\n"
         "\r\n",
-        status, reason, strlen(body), keep_alive ? "keep-alive" : "close");
+        status, reason, content_type, strlen(body),
+        keep_alive ? "keep-alive" : "close");
     if (n > 0) send_all(fd, hdr, (size_t)n);
     send_all(fd, body, strlen(body));
+}
+
+static void http_response(int fd, int status, const char *reason,
+                          const char *body, bool keep_alive) {
+    http_response_typed(fd, status, reason, "application/json; charset=utf-8",
+                        body, keep_alive);
 }
 
 static void http_error(int fd, int status, const char *reason, const char *msg,
@@ -766,6 +776,17 @@ static bool handle_client(http_connection *connection,
     if (!parsed) {
         http_error(connection->fd, 400, "Bad Request",
                    "malformed request line", false);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
+        http_response(connection->fd, 200, "OK", EI_ROOT_JSON, keep_alive);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/healthz") == 0) {
+        http_response(connection->fd, 200, "OK", EI_HEALTH_JSON, keep_alive);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/docs") == 0) {
+        http_response_typed(connection->fd, 200, "OK",
+                            "text/html; charset=utf-8", EI_DOCS_HTML,
+                            keep_alive);
+    } else if (strcmp(method, "GET") == 0 &&
+               strcmp(path, "/openapi.json") == 0) {
+        http_response(connection->fd, 200, "OK", EI_OPENAPI_JSON, keep_alive);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/tags") == 0) {
         handle_tags(connection->fd, opts, keep_alive);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/embed") == 0) {
@@ -773,7 +794,7 @@ static bool handle_client(http_connection *connection,
                      keep_alive, response_cache);
     } else {
         http_error(connection->fd, 404, "Not Found",
-                   "supported routes are GET /api/tags and POST /api/embed",
+                   "route not found; see GET /docs or GET /openapi.json",
                    keep_alive);
     }
 

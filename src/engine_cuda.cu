@@ -180,12 +180,14 @@ __device__ __forceinline__ int warp_sum_int(int value) {
     return value;
 }
 
+#if __CUDA_ARCH__ >= 610
 __device__ __forceinline__ uint32_t load_u32_unaligned(const uint8_t *bytes) {
     return static_cast<uint32_t>(bytes[0]) |
            (static_cast<uint32_t>(bytes[1]) << 8) |
            (static_cast<uint32_t>(bytes[2]) << 16) |
            (static_cast<uint32_t>(bytes[3]) << 24);
 }
+#endif
 
 __device__ __forceinline__ float q4_dot(const block_q4_0 *weights,
                                         const float *input, int n_cols,
@@ -221,6 +223,7 @@ __device__ __forceinline__ float q4_q8_dot(const block_q4_0 *weights,
         int dot = 0;
 #pragma unroll
         for (int group = 0; group < 4; group++) {
+#if __CUDA_ARCH__ >= 610
             const uint32_t packed = load_u32_unaligned(q4.qs + group * 4);
             const int low = static_cast<int>(packed & 0x0f0f0f0fu);
             const int high = static_cast<int>((packed >> 4) & 0x0f0f0f0fu);
@@ -228,8 +231,20 @@ __device__ __forceinline__ float q4_q8_dot(const block_q4_0 *weights,
             const int q8_high = *reinterpret_cast<const int *>(q8.qs + 16 + group * 4);
             dot = __dp4a(low, q8_low, dot);
             dot = __dp4a(high, q8_high, dot);
+#else
+#pragma unroll
+            for (int item = 0; item < 4; item++) {
+                const uint8_t packed = q4.qs[group * 4 + item];
+                dot += (static_cast<int>(packed & 0x0f) - 8) *
+                       static_cast<int>(q8.qs[group * 4 + item]);
+                dot += (static_cast<int>(packed >> 4) - 8) *
+                       static_cast<int>(q8.qs[16 + group * 4 + item]);
+            }
+#endif
         }
+#if __CUDA_ARCH__ >= 610
         dot -= 8 * static_cast<int>(q8.sum);
+#endif
         sum = fmaf(__half2float(q4.d) * __half2float(q8.d),
                    static_cast<float>(dot), sum);
     }
@@ -387,6 +402,7 @@ __device__ __forceinline__ void load_input_mma_fragment(
 
 __device__ __forceinline__ void mma_m16n8k16(
     float accumulator[4], const __half2 input[4], const __half2 weights[2]) {
+#if __CUDA_ARCH__ >= 800
     const uint32_t *a = reinterpret_cast<const uint32_t *>(input);
     const uint32_t *b = reinterpret_cast<const uint32_t *>(weights);
     asm volatile(
@@ -396,6 +412,11 @@ __device__ __forceinline__ void mma_m16n8k16(
           "+f"(accumulator[2]), "+f"(accumulator[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
           "r"(b[0]), "r"(b[1]));
+#else
+    (void)accumulator;
+    (void)input;
+    (void)weights;
+#endif
 }
 
 __global__ void q4_mma_projection_kernel(
@@ -2066,6 +2087,11 @@ extern "C" void *ei_cuda_engine_create(const ei_model *model,
     if (!cuda_check(cudaSetDevice(device), "select CUDA device", err, err_len)) {
         return nullptr;
     }
+    cudaDeviceProp device_properties;
+    if (!cuda_check(cudaGetDeviceProperties(&device_properties, device),
+                    "inspect CUDA device", err, err_len)) {
+        return nullptr;
+    }
 
     cuda_engine *engine = new cuda_engine;
     engine->model = model;
@@ -2193,6 +2219,12 @@ extern "C" void *ei_cuda_engine_create(const ei_model *model,
             return nullptr;
         }
         engine->native_q4_gemm = std::strcmp(native_q4_env, "1") == 0;
+    }
+    if (engine->native_q4_gemm && device_properties.major < 8) {
+        set_error(err, err_len,
+                  "EI_CUDA_NATIVE_Q4_GEMM requires compute capability 8.0 or newer");
+        delete engine;
+        return nullptr;
     }
     const char *q8_latency_env = std::getenv("EI_CUDA_Q8_LATENCY");
     if (q8_latency_env && *q8_latency_env) {

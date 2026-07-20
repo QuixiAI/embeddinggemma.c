@@ -5,9 +5,17 @@ CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Werror -g
 LDLIBS  ?= -lm -pthread
 NVCC    ?= nvcc
 CUDA_HOME ?= /usr/local/cuda
-CUDA_ARCH ?= 86
 NVCCFLAGS ?= -std=c++17 -O3 --use_fast_math -lineinfo
-CUDA_GENCODE := -gencode arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH)
+# Build native code for every architecture supported by the installed compiler,
+# plus PTX for forward compatibility. Set CUDA_ARCHS=86 for a faster local build.
+ifdef CUDA_ARCH
+CUDA_ARCHS ?= $(CUDA_ARCH)
+else
+CUDA_ARCHS ?= $(patsubst sm_%,%,$(shell $(NVCC) --list-gpu-code 2>/dev/null))
+endif
+CUDA_PTX_ARCH ?= $(lastword $(CUDA_ARCHS))
+CUDA_GENCODE := $(foreach arch,$(CUDA_ARCHS),-gencode arch=compute_$(arch),code=sm_$(arch)) \
+	-gencode arch=compute_$(CUDA_PTX_ARCH),code=compute_$(CUDA_PTX_ARCH)
 CUDA_LDLIBS := -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcublas -lcudart
 CURL_CFLAGS ?= $(shell curl-config --cflags 2>/dev/null)
 CURL_LIBS ?= $(shell curl-config --libs 2>/dev/null || printf '%s' '-lcurl')

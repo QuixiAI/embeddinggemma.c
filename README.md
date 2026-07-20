@@ -39,14 +39,18 @@ invocation, then embeds the resulting metallib in the executable's Mach-O
 `__DATA,__metallib` section. `build/embeddinggemma.metallib` remains only as an
 intermediate artifact for kernel inspection and the `metal-kernels` target.
 
-Build the CUDA server for the RTX 3090/SM86 validation target:
+Build the portable CUDA server:
 
 ```sh
-make cuda NVCC=/usr/local/cuda/bin/nvcc CUDA_ARCH=86
+make cuda NVCC=/usr/local/cuda/bin/nvcc
 ```
 
 The output is `build/embeddinggemma-cuda`. CUDA 12.9, cuBLAS, a C++ linker,
 and an NVIDIA driver are required. `CUDA_HOME` defaults to `/usr/local/cuda`.
+The default is a fat binary containing native code for every GPU architecture
+reported by the installed CUDA compiler, plus PTX for its newest target. Set
+`CUDA_ARCHS=86` to build only SM86 during local development. The legacy
+`CUDA_ARCH=86` spelling remains supported.
 
 The default model location is
 `$XDG_CACHE_HOME/embeddinggemma.c/embeddinggemma-300M-qat-Q4_0.gguf`, or
@@ -118,7 +122,8 @@ Metal diagnostic controls:
 - `EI_METAL_TRIPLE_QKV_GEMV=1`: enable the rejected short Q/K/V experiment.
 
 The CUDA T=1..4 route fuses RMS normalization with Q8 activation quantization,
-then applies packed Q4_0 x Q8_0 projections with SM86 `dp4a`. From five packed
+then applies packed Q4_0 x Q8_0 projections using `dp4a` on compute capability
+6.1 and newer, with a scalar integer fallback on older GPUs. From five packed
 tokens upward, weights dequantized once at load feed cuBLAS FP16 tensor-core
 GEMM with FP32 accumulation. Q/K/V and up/gate are issued as combined GEMMs;
 Q/K normalization and RoPE write directly to FP16 attention buffers without an
@@ -163,7 +168,7 @@ CUDA diagnostic controls:
 - `EI_CUDA_SWA_TENSOR_MIN_TOKENS=1..65536`: move the banded-SWA boundary;
   default 1536.
 - `EI_CUDA_NATIVE_Q4_GEMM=0|1`: use packed-Q4 MMA without expanded projection
-  weights; default 0.
+  weights on compute capability 8.0 and newer; default 0.
 
 These route defaults were selected on the machine recorded in
 `perf/optimization_status.md`; re-benchmark before changing them for another
@@ -225,7 +230,7 @@ make test-metal
 Run CUDA golden, CPU/CUDA drift, packed-batch, and HTTP dimension tests:
 
 ```sh
-make test-cuda NVCC=/usr/local/cuda/bin/nvcc CUDA_ARCH=86
+make test-cuda NVCC=/usr/local/cuda/bin/nvcc CUDA_ARCHS=86
 ```
 
 The tests compare core GGUF metadata and all 314 tensor descriptors with the

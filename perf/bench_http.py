@@ -193,7 +193,9 @@ def summary(rows: list[dict[str, float | int | str | bool]],
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=("cpu", "metal"), required=True)
+    parser.add_argument(
+        "--backend", choices=("cpu", "metal", "cuda", "xpu"), required=True
+    )
     parser.add_argument("--keepalive", choices=("on", "off"), required=True)
     parser.add_argument("--encoding-format", choices=("float", "base64", "both"),
                         default="both")
@@ -215,12 +217,22 @@ def main() -> int:
     parser.add_argument("--no-build", action="store_true")
     args = parser.parse_args()
 
-    binary = args.binary or REPO_ROOT / "build" / (
-        "embeddinggemma-metal" if args.backend == "metal" else "embeddinggemma"
-    )
+    binary_name = {
+        "cpu": "embeddinggemma",
+        "metal": "embeddinggemma-metal",
+        "cuda": "embeddinggemma-cuda",
+        "xpu": "embeddinggemma-xpu",
+    }[args.backend]
+    binary = args.binary or REPO_ROOT / "build" / binary_name
     if not args.no_build:
+        target = {
+            "cpu": "all",
+            "metal": "metal",
+            "cuda": "cuda",
+            "xpu": "xpu",
+        }[args.backend]
         subprocess.run(
-            ["make", "metal" if args.backend == "metal" else "all"],
+            ["make", target],
             cwd=REPO_ROOT,
             check=True,
         )

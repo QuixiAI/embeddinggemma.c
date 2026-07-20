@@ -55,6 +55,9 @@ int main(int argc, char **argv) {
     for (size_t sequence = 0; sequence < batch_size; sequence++) {
         float similarity = cosine(reference + sequence * EI_N_EMBD,
                                   batched + sequence * EI_N_EMBD);
+        if (!isfinite(similarity)) {
+            ei_die("%s batch parity produced a nonfinite cosine", backend);
+        }
         if (similarity < minimum) minimum = similarity;
         printf("%s batch parity sequence=%zu tokens=%zu cosine=%.9f\n",
                backend, sequence, lengths[sequence], similarity);
@@ -64,7 +67,9 @@ int main(int argc, char **argv) {
     free(reference);
     free(ids);
     ei_engine_free(&engine);
-    const float minimum_expected = strcmp(backend, "cuda") == 0 ? 0.998f : 0.9999f;
+    float minimum_expected = 0.9999f;
+    if (strcmp(backend, "cuda") == 0) minimum_expected = 0.998f;
+    if (strcmp(backend, "xpu") == 0) minimum_expected = 0.999f;
     if (minimum < minimum_expected) {
         fprintf(stderr, "%s packed batch parity failed: minimum cosine %.9f\n",
                 backend, minimum);

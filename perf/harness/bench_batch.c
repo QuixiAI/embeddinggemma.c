@@ -122,10 +122,17 @@ static void bench_level(ei_engine *engine, int32_t tokens, int32_t batch_size,
     for (int32_t sequence = 0; sequence < batch_size; sequence++) {
         float similarity = cosine(packed + (size_t)sequence * EI_N_EMBD,
                                   serial + (size_t)sequence * EI_N_EMBD);
+        if (!isfinite(similarity)) {
+            ei_die("packed/serial parity produced a nonfinite cosine");
+        }
         if (similarity < minimum) minimum = similarity;
     }
-    const float minimum_expected = strcmp(ei_engine_backend(engine), "cuda") == 0
-        ? 0.998f : 0.9999f;
+    float minimum_expected = 0.9999f;
+    if (strcmp(ei_engine_backend(engine), "cuda") == 0) {
+        minimum_expected = 0.998f;
+    } else if (strcmp(ei_engine_backend(engine), "xpu") == 0) {
+        minimum_expected = 0.9998f;
+    }
     if (minimum < minimum_expected) {
         ei_die("packed/serial parity failed: %.9f", minimum);
     }
@@ -156,7 +163,10 @@ static void bench_level(ei_engine *engine, int32_t tokens, int32_t batch_size,
 
 static void bench_level_fp16_ab(ei_engine *baseline, ei_engine *fp16,
                                 int32_t tokens, int32_t batch_size,
-                                int32_t warmup, int32_t iterations) {
+                                int32_t warmup, int32_t iterations,
+                                const char *backend, const char *variant,
+                                const char *candidate_field,
+                                float minimum_expected) {
     size_t total = (size_t)tokens * (size_t)batch_size;
     int32_t *ids = ei_xmalloc(total * sizeof(*ids));
     size_t *offsets = ei_xmalloc(((size_t)batch_size + 1) * sizeof(*offsets));
@@ -191,21 +201,27 @@ static void bench_level_fp16_ab(ei_engine *baseline, ei_engine *fp16,
     for (int32_t sequence = 0; sequence < batch_size; sequence++) {
         float similarity = cosine(baseline_output + (size_t)sequence * EI_N_EMBD,
                                   fp16_output + (size_t)sequence * EI_N_EMBD);
+        if (!isfinite(similarity)) {
+            ei_die("A/B parity produced a nonfinite cosine");
+        }
         if (similarity < minimum) minimum = similarity;
     }
-    if (minimum < 0.9999f) ei_die("FP16 K/V parity failed: %.9f", minimum);
+    if (minimum < minimum_expected) {
+        ei_die("FP16 attention parity failed: %.9f", minimum);
+    }
     qsort(baseline_ms, (size_t)iterations, sizeof(*baseline_ms), compare_double);
     qsort(fp16_ms, (size_t)iterations, sizeof(*fp16_ms), compare_double);
     double baseline_median = median_sorted(baseline_ms, iterations);
     double fp16_median = median_sorted(fp16_ms, iterations);
-    printf("{\"schema\":1,\"backend\":\"metal\","
+    printf("{\"schema\":1,\"backend\":\"%s\","
            "\"kernel\":\"engine_embed_tokens_batch\","
-           "\"variant\":\"fp16_kv_ab\","
+           "\"variant\":\"%s\","
            "\"shape\":{\"tokens\":%d,\"batch_size\":%d,\"total_tokens\":%zu},"
-           "\"threads\":1,\"fp16_ms\":%.9g,\"baseline_ms\":%.9g,"
+           "\"threads\":1,\"%s\":%.9g,\"baseline_ms\":%.9g,"
            "\"throughput_speedup\":%.9g,\"requests_per_second\":%.9g,"
            "\"minimum_cosine\":%.9g}\n",
-           tokens, batch_size, total, fp16_median, baseline_median,
+           backend, variant, tokens, batch_size, total, candidate_field,
+           fp16_median, baseline_median,
            baseline_median / fp16_median, 1000.0 * (double)batch_size / fp16_median,
            minimum);
     free(fp16_ms);
@@ -225,6 +241,13 @@ int main(int argc, char **argv) {
     int32_t warmup = 2;
     int32_t iterations = 7;
     bool ab_metal_fp16_kv = false;
+    bool ab_xpu_fp16_attention = false;
+    bool ab_xpu_attention_routing = false;
+    bool ab_xpu_v_only = false;
+    bool ab_xpu_xe2_flash = false;
+    bool ab_xpu_command_graph = false;
+    bool ab_xpu_xe2_w4 = false;
+    bool ab_xpu_rms_register_cache = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) model = argv[++i];
         else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) backend = argv[++i];
@@ -234,28 +257,179 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) warmup = atoi(argv[++i]);
         else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) iterations = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ab-metal-fp16-kv") == 0) ab_metal_fp16_kv = true;
-        else ei_die("usage: %s --model model.gguf [--backend cpu|metal|cuda] [--tokens N] "
+        else if (strcmp(argv[i], "--ab-xpu-fp16-attention") == 0) ab_xpu_fp16_attention = true;
+        else if (strcmp(argv[i], "--ab-xpu-attention-routing") == 0) ab_xpu_attention_routing = true;
+        else if (strcmp(argv[i], "--ab-xpu-v-only") == 0) ab_xpu_v_only = true;
+        else if (strcmp(argv[i], "--ab-xpu-xe2-flash") == 0) ab_xpu_xe2_flash = true;
+        else if (strcmp(argv[i], "--ab-xpu-command-graph") == 0) ab_xpu_command_graph = true;
+        else if (strcmp(argv[i], "--ab-xpu-xe2-w4") == 0) ab_xpu_xe2_w4 = true;
+        else if (strcmp(argv[i], "--ab-xpu-rms-register-cache") == 0) ab_xpu_rms_register_cache = true;
+        else ei_die("usage: %s --model model.gguf [--backend cpu|metal|cuda|xpu] [--tokens N] "
                     "[--batch-sizes 1,2,4] [--max-total-tokens N]", argv[0]);
     }
     if (!model || tokens < 1 || tokens > EI_N_CTX || max_total_tokens < tokens ||
         warmup < 0 || iterations < 1) ei_die("invalid batch benchmark arguments");
     int32_t levels[MAX_BATCH_LEVELS];
     int32_t n_levels = parse_levels(batch_value, levels);
-    if (ab_metal_fp16_kv) {
-        if (strcmp(backend, "metal") != 0) {
-            ei_die("--ab-metal-fp16-kv requires --backend metal");
+    if (ab_xpu_rms_register_cache) {
+        if (strcmp(backend, "xpu") != 0) {
+            ei_die("--ab-xpu-rms-register-cache requires --backend xpu");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        setenv("EI_XPU_RMS_REGISTER_CACHE", "0", 1);
+        ei_engine_load_backend(&baseline, model, "xpu");
+        setenv("EI_XPU_RMS_REGISTER_CACHE", "1", 1);
+        ei_engine_load_backend(&candidate, model, "xpu");
+        unsetenv("EI_XPU_RMS_REGISTER_CACHE");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "xpu",
+                                    "rms_register_cache_ab", "register_ms",
+                                    0.999f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
+    if (ab_xpu_xe2_w4) {
+        if (strcmp(backend, "xpu") != 0) {
+            ei_die("--ab-xpu-xe2-w4 requires --backend xpu");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        setenv("EI_XPU_XE2_W4", "0", 1);
+        ei_engine_load_backend(&baseline, model, "xpu");
+        setenv("EI_XPU_XE2_W4", "1", 1);
+        ei_engine_load_backend(&candidate, model, "xpu");
+        unsetenv("EI_XPU_XE2_W4");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "xpu",
+                                    "xe2_w4_ab", "w4_ms", 0.999f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
+    if (ab_xpu_command_graph) {
+        if (strcmp(backend, "xpu") != 0) {
+            ei_die("--ab-xpu-command-graph requires --backend xpu");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        setenv("EI_XPU_COMMAND_GRAPH", "0", 1);
+        ei_engine_load_backend(&baseline, model, "xpu");
+        setenv("EI_XPU_COMMAND_GRAPH", "1", 1);
+        ei_engine_load_backend(&candidate, model, "xpu");
+        unsetenv("EI_XPU_COMMAND_GRAPH");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "xpu",
+                                    "command_graph_ab", "graph_ms", 0.999f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
+    if (ab_xpu_xe2_flash) {
+        if (strcmp(backend, "xpu") != 0) {
+            ei_die("--ab-xpu-xe2-flash requires --backend xpu");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        setenv("EI_XPU_XE2_FLASH", "0", 1);
+        ei_engine_load_backend(&baseline, model, "xpu");
+        setenv("EI_XPU_XE2_FLASH", "1", 1);
+        ei_engine_load_backend(&candidate, model, "xpu");
+        unsetenv("EI_XPU_XE2_FLASH");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "xpu",
+                                    "xe2_flash_ab", "flash_ms", 0.9997f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
+    if (ab_xpu_v_only) {
+        if (strcmp(backend, "xpu") != 0) {
+            ei_die("--ab-xpu-v-only requires --backend xpu");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        setenv("EI_XPU_SINGLE_TOKEN_V_ONLY", "0", 1);
+        ei_engine_load_backend(&baseline, model, "xpu");
+        setenv("EI_XPU_SINGLE_TOKEN_V_ONLY", "1", 1);
+        ei_engine_load_backend(&candidate, model, "xpu");
+        unsetenv("EI_XPU_SINGLE_TOKEN_V_ONLY");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "xpu",
+                                    "single_token_v_only_ab", "v_only_ms",
+                                    0.9999f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
+    if (ab_xpu_attention_routing) {
+        if (strcmp(backend, "xpu") != 0) {
+            ei_die("--ab-xpu-attention-routing requires --backend xpu");
+        }
+        ei_engine baseline;
+        ei_engine candidate;
+        setenv("EI_XPU_TENSOR_ATTENTION_MIN_TOKENS", "128", 1);
+        ei_engine_load_backend(&baseline, model, "xpu");
+        unsetenv("EI_XPU_TENSOR_ATTENTION_MIN_TOKENS");
+        ei_engine_load_backend(&candidate, model, "xpu");
+        for (int32_t i = 0; i < n_levels; i++) {
+            if ((int64_t)levels[i] * tokens <= max_total_tokens) {
+                bench_level_fp16_ab(&baseline, &candidate, tokens, levels[i],
+                                    warmup, iterations, "xpu",
+                                    "batch_aware_attention_ab", "candidate_ms",
+                                    0.9997f);
+            }
+        }
+        ei_engine_free(&candidate);
+        ei_engine_free(&baseline);
+        return 0;
+    }
+    if (ab_metal_fp16_kv || ab_xpu_fp16_attention) {
+        const char *expected_backend =
+            ab_metal_fp16_kv ? "metal" : "xpu";
+        const char *environment = ab_metal_fp16_kv
+            ? "EI_METAL_FP16_KV_MIN_TOKENS" : "EI_XPU_FP16_ATTENTION";
+        const char *baseline_value = ab_metal_fp16_kv ? "65536" : "0";
+        const char *variant = ab_metal_fp16_kv
+            ? "fp16_kv_ab" : "fp16_dense_auto_ab";
+        const float minimum_expected =
+            ab_metal_fp16_kv ? 0.9999f : 0.9998f;
+        if (strcmp(backend, expected_backend) != 0) {
+            ei_die("FP16 A/B mode requires --backend %s", expected_backend);
         }
         ei_engine baseline;
         ei_engine fp16;
-        setenv("EI_METAL_FP16_KV_MIN_TOKENS", "65536", 1);
-        ei_engine_load_backend(&baseline, model, "metal");
-        setenv("EI_METAL_FP16_KV_MIN_TOKENS", "1", 1);
-        ei_engine_load_backend(&fp16, model, "metal");
-        unsetenv("EI_METAL_FP16_KV_MIN_TOKENS");
+        setenv(environment, baseline_value, 1);
+        ei_engine_load_backend(&baseline, model, expected_backend);
+        setenv(environment, ab_metal_fp16_kv ? "1" : "auto", 1);
+        ei_engine_load_backend(&fp16, model, expected_backend);
+        unsetenv(environment);
         for (int32_t i = 0; i < n_levels; i++) {
             if ((int64_t)levels[i] * tokens <= max_total_tokens) {
                 bench_level_fp16_ab(&baseline, &fp16, tokens, levels[i],
-                                    warmup, iterations);
+                                    warmup, iterations, expected_backend,
+                                    variant, "fp16_ms", minimum_expected);
             }
         }
         ei_engine_free(&fp16);

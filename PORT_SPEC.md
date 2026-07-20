@@ -125,18 +125,21 @@ llama.cpp deep-read) before implementing.
 | macOS ARM64 CPU | implemented, parity tested | C11 + NEON dot-product path |
 | x86 CPU | implemented, parity tested | scalar, SSSE3, and AVX2 paths |
 | macOS Metal | implemented, parity tested | Objective-C host + standalone metallib; short-shape residual/next-norm fusion; FP16 K/V at long sequence lengths with FP32 accumulation |
-| CUDA SM86 | implemented, parity tested | Q4 x Q8 DP4A latency path; direct-FP16 combined-QKV epilogue; Flash, online, banded-SWA, and tensor-core attention; native packed-Q4 MMA diagnostics; CUDA graph replay |
+| NVIDIA CUDA | implemented, parity tested | Q4 x Q8 DP4A latency path; direct-FP16 combined-QKV epilogue; Flash, online, banded-SWA, and tensor-core attention; native packed-Q4 MMA diagnostics; CUDA graph replay |
 | ROCm/HIP | pending | planned `.hip` backend and GPU-host validation |
-| XPU SYCL | pending | planned SYCL backend and Intel GPU validation |
+| XPU SYCL | implemented, parity tested | resident FP16 weights; oneMKL XMX GEMM; fused norm/RoPE, online attention, and pooling; optional Xe2 Flash Attention |
 
 Core inference is C11 and links the OS C library, `libm`, and pthreads. The
-server additionally links `libcurl` for model download. CPU SIMD lives in
-`quants.c` and `kernels.c`; the Metal host is `engine_metal.m`; Metal source is
-split by family under `src/metal/kernels/` and compiled into one metallib. The
-CUDA host and kernels live in `engine_cuda.cu` and link CUDA Runtime plus
-cuBLAS. Production CUDA attention uses shared-tile FP16 GQA for short sequences
-and tensor-core QK/PV for long sequences, with rectangular symmetric-SWA bands,
-FP32 softmax, and FP32 accumulation.
+server has no linked HTTP client dependency: a model cache miss invokes `curl`
+or `wget` with POSIX `posix_spawnp`, and an existing model requires neither.
+CPU SIMD lives in `quants.c` and `kernels.c`; the Metal host is
+`engine_metal.m`; Metal source is split by family under `src/metal/kernels/` and
+compiled into one metallib. The CUDA host and kernels live in `engine_cuda.cu`
+and link CUDA Runtime plus cuBLAS. Production CUDA attention uses shared-tile
+FP16 GQA for short sequences and tensor-core QK/PV for long sequences, with
+rectangular symmetric-SWA bands, FP32 softmax, and FP32 accumulation. The XPU
+SYCL backend lives in `engine_xpu.cpp`, with optional Xe2 kernels adapted from
+`vllm-xpu-kernels` in `engine_xpu_flash.cpp`.
 
 ## Phase order
 

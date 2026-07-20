@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Warmed end-to-end CPU/Metal/CUDA inference benchmark and result recorder."""
+"""Warmed end-to-end CPU/Metal/CUDA/XPU benchmark and result recorder."""
 
 from __future__ import annotations
 
@@ -63,7 +63,10 @@ def write_summary(rows: list[dict[str, object]], meta: dict[str, object], out_di
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="model/embeddinggemma-300M-qat-Q4_0.gguf")
-    parser.add_argument("--backend", choices=("cpu", "metal", "cuda", "both"), default="both")
+    parser.add_argument(
+        "--backend", choices=("cpu", "metal", "cuda", "xpu", "both"),
+        default="both",
+    )
     parser.add_argument("--tokens", default="1,4,8,32,128,512,2048")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
@@ -80,6 +83,8 @@ def main() -> int:
             targets.append("build/perf_engine_metal")
         if "cuda" in backends:
             targets.append("build/perf_engine_cuda")
+        if "xpu" in backends:
+            targets.append("build/perf_engine_xpu")
         run(["make", *targets])
 
     rows: list[dict[str, object]] = []
@@ -89,6 +94,7 @@ def main() -> int:
             "cpu": "./build/perf_engine",
             "metal": "./build/perf_engine_metal",
             "cuda": "./build/perf_engine_cuda",
+            "xpu": "./build/perf_engine_xpu",
         }[backend]
         cmd = [
             binary,
@@ -122,7 +128,10 @@ def main() -> int:
         "python": platform.python_version(),
         "device": command_output([
             "nvidia-smi", "--query-gpu=name", "--format=csv,noheader", "-i", "0"
-        ]) if "cuda" in backends else command_output(["sysctl", "-n", "hw.model"]),
+        ]) if "cuda" in backends else (
+            command_output(["sycl-ls"]) if "xpu" in backends
+            else command_output(["sysctl", "-n", "hw.model"])
+        ),
         "os": platform.platform(),
         "xcode": command_output(["xcodebuild", "-version"]).replace("\n", " "),
     }

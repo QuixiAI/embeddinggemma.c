@@ -14,8 +14,33 @@ Standalone C11 inference and HTTP serving for
 - Bounded HTTP, tokenizer, and inference queues for concurrent serving.
 - `GET /api/tags` and `POST /api/embed` HTTP routes.
 
-The CPU, Metal, and CUDA paths are implemented and parity-tested. ROCm/HIP and
-XPU SYCL remain planned targets.
+The CPU, Metal, CUDA, and XPU SYCL paths are implemented and parity-tested.
+ROCm/HIP remains a planned target.
+
+## Install
+
+Install the latest binary as `~/.local/bin/quixiembed`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/QuixiAI/embeddinggemma.c/main/install.sh | sh
+```
+
+The installer selects Metal on Apple Silicon. On Linux x86_64 it selects CUDA
+when an NVIDIA device and its runtime dependencies are available, otherwise it
+selects CPU. It verifies the binary against the release's `SHA256SUMS` before
+replacing an existing installation.
+
+Override automatic selection or pin a release when needed:
+
+```sh
+./install.sh --variant cpu
+./install.sh --version v0.2.3
+./install.sh --install-dir "$HOME/bin"
+```
+
+The equivalent environment variables are `QUIXIEMBED_VARIANT`,
+`QUIXIEMBED_VERSION`, and `QUIXIEMBED_INSTALL_DIR`. Published binaries currently
+cover Darwin ARM64 (`cpu`, `metal`) and Linux x86_64 (`cpu`, `cuda`, `xpu`).
 
 ## Build
 
@@ -52,12 +77,26 @@ reported by the installed CUDA compiler, plus PTX for its newest target. Set
 `CUDA_ARCHS=86` to build only SM86 during local development. The legacy
 `CUDA_ARCH=86` spelling remains supported.
 
+Build the portable Intel XPU SYCL server:
+
+```sh
+source /opt/intel/oneapi/oneapi-vars.sh
+make xpu SYCL_CXX=icpx
+```
+
+The output is `build/embeddinggemma-xpu` and defaults to the XPU backend.
+oneAPI DPC++, oneMKL, and a Level Zero GPU runtime are required.
+
 The default model location is
 `$XDG_CACHE_HOME/embeddinggemma.c/embeddinggemma-300M-qat-Q4_0.gguf`, or
 `$HOME/.cache/embeddinggemma.c/embeddinggemma-300M-qat-Q4_0.gguf` when
 `XDG_CACHE_HOME` is unset. The server creates the cache directory and downloads
-the model when it is absent. Resolution order is `--model PATH`,
-`EI_MODEL_PATH`, then the cache path.
+the model when it is absent. Model acquisition has no linked HTTP dependency:
+the server invokes `curl`, then `wget`, and atomically installs the completed
+download. Neither tool is needed when the model already exists. Minimal systems
+without either command must provide an existing file with `--model PATH` or
+`EI_MODEL_PATH`. Resolution order is `--model PATH`, `EI_MODEL_PATH`, then the
+cache path.
 
 ## Backends
 
@@ -170,6 +209,55 @@ CUDA diagnostic controls:
 - `EI_CUDA_NATIVE_Q4_GEMM=0|1`: use packed-Q4 MMA without expanded projection
   weights on compute capability 8.0 and newer; default 0.
 
+The XPU route keeps model and workspace allocations resident, expands Q4_0
+projection weights to FP16 once, uses oneMKL XMX GEMM, and combines QKV and
+up/gate projections. It includes fused FP16 QKV norm/RoPE, batch-aware
+online/dense attention, one-token V-only attention, cooperative short-row RMS,
+and cooperative long-sequence pooling.
+
+An optional Xe2 Flash-attention build uses the head-256 chunk-prefill kernel
+from a local `vllm-xpu-kernels` checkout. It is selected automatically for
+single sequences of at least 256 tokens or packed batches where every sequence
+has at least 128 tokens:
+
+```sh
+make xpu XPU_XE2_FLASH=1
+```
+
+The first Xe2 build automatically fetches `vllm-xpu-kernels` at
+`bab46865358da4eda3b866c41dd71a80e878d843` and SYCL-TLA at
+`cd763790ad2f74d7294435ecf77682bac0062c3a` into `.xpu-deps`. Run
+`make xpu-deps` to fetch them without building. The standalone Flash boundary
+does not require PyTorch headers. `VLLM_XPU_KERNELS=/path/to/checkout` still
+selects an explicit local checkout; `CUTLASS_SYCL` can override its default
+nested SYCL-TLA path.
+
+XPU diagnostic controls:
+
+- `EI_XPU_DEVICE=0..N`: select the Level Zero GPU; default 0.
+- `EI_XPU_TENSOR_ATTENTION_MIN_TOKENS=1..65536`: force one dense-attention
+  threshold instead of the batch-aware route.
+- `EI_XPU_FP16_ATTENTION=0|1|auto`: control FP16 Q/K/V attention storage.
+- `EI_XPU_SINGLE_TOKEN_V_ONLY=0|1`: control exact one-token V-only attention.
+- `EI_XPU_COOPERATIVE_RMS_MAX_ROWS=0..128`: set the cooperative RMS boundary.
+- `EI_XPU_RMS_REGISTER_CACHE=0|1`: control Xe2 register-cached fused residual/RMS.
+- `EI_XPU_COOPERATIVE_POOL=0|1|auto`: control cooperative final pooling.
+- `EI_XPU_XE2_FLASH=0|1|auto`: disable, force, or safely route Xe2 Flash in an
+  `XPU_XE2_FLASH=1` build. Forced mode bypasses automatic shape thresholds.
+- `EI_XPU_XE2_FLASH_MIN_TOKENS=1..65536`: set the single-sequence Flash
+  threshold; default 256.
+- `EI_XPU_XE2_FLASH_BATCH_MIN_TOKENS=1..65536`: set the minimum length of every
+  sequence in a packed Flash batch; default 128.
+- `EI_XPU_Q4_M_TILED=1`: enable M2-M8 weight reuse in the direct Q4 diagnostic
+  path; also force that path with `EI_XPU_GEMM_MIN_TOKENS=65536`.
+- `EI_XPU_COMMAND_GRAPH=0|1|auto`: control exact-shape SYCL graph replay.
+  Auto mode uses it for all-single-token batches up to four requests.
+- `EI_XPU_XE2_W4=0|1`: control the Xe2 W4A16 fused up/gate route. It is
+  selected automatically only for a single two-token sequence.
+- `XPU_ONEDNN=1` builds the rejected oneDNN projection experiments;
+  `EI_XPU_ONEDNN_F16=1` selects fixed-shape FP16 and
+  `EI_XPU_ONEDNN_W4=1` selects weight-only S4.
+
 These route defaults were selected on the machine recorded in
 `perf/optimization_status.md`; re-benchmark before changing them for another
 GPU generation.
@@ -255,8 +343,10 @@ make perf
 make perf-engine
 make perf-engine-metal
 make perf-engine-cuda
+make perf-engine-xpu XPU_XE2_FLASH=1
 make perf-concurrency
 make perf-concurrency-cuda
+make perf-concurrency-xpu XPU_XE2_FLASH=1
 make perf-batch
 make perf-tokenization
 
@@ -274,11 +364,30 @@ python3 perf/bench_http.py --backend metal --keepalive on --response-cache-mb 64
 python3 perf/bench_engine.py --backend cuda --tokens 1,7,32,128,512,2048
 python3 perf/bench_concurrency.py --backend cuda --tokens 32 \
   --concurrency 1,2,4,8,16,32
+python3 perf/bench_engine.py --backend xpu --tokens 1,7,32,128,512,2048
+python3 perf/bench_concurrency.py --backend xpu --tokens 32 \
+  --concurrency 1,2,4,8,16,32
 ```
 
 Results are written beneath `perf/results/`. The optimization log, including
 the original 21-pass loop, vLLM/TEI serving work, retained changes, and rejected
 experiments, is in `perf/optimization_status.md`.
+
+Representative retained throughput is shown below. These are warmed, median
+single-engine measurements of the 300M Q4_0 model, not normalized hardware
+comparisons; compiler, driver, power, and system load differ between hosts.
+
+| backend | tested hardware | T1 req/s | T32 input tok/s | T2048 input tok/s |
+|---|---|---:|---:|---:|
+| CPU | Apple M5 Max | 370 | 1,051 | 1,350 |
+| Metal | Apple M5 Max | 570 | 8,009 | 10,465 |
+| CUDA | NVIDIA RTX 3090 | 584 | 13,897 | 102,755 |
+| XPU SYCL | Intel Arc Pro B60 | 962 | 14,747 | 99,708 |
+
+The corresponding median latencies were CPU `2.70/30.46/1516.56 ms`, Metal
+`1.76/4.00/195.70 ms`, CUDA `1.71/2.30/19.93 ms`, and XPU
+`1.04/2.17/20.54 ms` for T1/T32/T2048. Full commands, warmup counts, parity
+checks, and per-pass A/B results are preserved in the optimization log.
 
 The concurrency harness submits unique cache-miss requests through the actual
 inference service. One backend thread owns the mutable engine workspace and
@@ -303,6 +412,14 @@ an explicit packed batch of 32 reaches 4,740 req/s. Full-context requests remain
 singleton batches, with a final single-engine rate of 50.2 req/s, so the default
 512-token packing cutoff remains latency-oriented.
 
+On the Arc Pro B60 validation host, the final Xe2 path reaches approximately
+19,850 req/s for explicit one-token batches of 32, 109,170 input tok/s for
+32-token batches of 32 (3,411 req/s), and 135,860 input tok/s for 128-token
+batches of 32. A dynamic-service T32 run before the final Xe2 passes reached
+880.6 req/s at concurrency 32; later absolute service runs shared the GPUs with
+an unrelated resident workload, so the final packed measurements are reported
+instead of presenting those contended values as a regression.
+
 ## Run
 
 ```sh
@@ -319,6 +436,12 @@ CUDA:
 
 ```sh
 ./build/embeddinggemma-cuda --bind 0.0.0.0 --port 11434
+```
+
+XPU SYCL:
+
+```sh
+./build/embeddinggemma-xpu --bind 0.0.0.0 --port 11434
 ```
 
 Serving controls:

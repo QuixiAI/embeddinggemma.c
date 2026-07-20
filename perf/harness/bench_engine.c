@@ -61,9 +61,18 @@ static int parse_token_shapes(const char *value, int32_t out[MAX_TOKEN_SHAPES]) 
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s --model model.gguf [--backend auto|cpu|metal|cuda] "
+            "usage: %s --model model.gguf [--backend auto|cpu|metal|cuda|xpu] "
             "[--tokens 1,8,32,128] [--warmup n] [--iters n] "
-            "[--ab-gelu-quant] [--ab-metal-fp16-kv]\n",
+            "[--ab-gelu-quant] [--ab-metal-fp16-kv] "
+            "[--ab-xpu-fp16-attention] [--ab-xpu-swa-banded] "
+            "[--ab-xpu-v-only] [--ab-xpu-cooperative-rms] "
+            "[--ab-xpu-cooperative-pool] [--ab-xpu-xe2-flash] "
+            "[--ab-xpu-flash-event] "
+            "[--ab-xpu-command-graph] "
+            "[--ab-xpu-xe2-w4] "
+            "[--ab-xpu-rms-register-cache] "
+            "[--ab-xpu-onednn-w4] [--ab-xpu-onednn-f16] "
+            "[--ab-xpu-q4-m-tiled]\n",
             argv0);
 }
 
@@ -86,6 +95,20 @@ int main(int argc, char **argv) {
     int iters = 5;
     bool ab_gelu_quant = false;
     bool ab_metal_fp16_kv = false;
+    bool ab_xpu_fp16_attention = false;
+    bool ab_xpu_swa_banded = false;
+    bool ab_xpu_v_only = false;
+    bool ab_xpu_cooperative_rms = false;
+    bool ab_xpu_cooperative_pool = false;
+    bool ab_xpu_xe2_flash = false;
+    bool ab_xpu_flash_event = false;
+    bool ab_xpu_command_graph = false;
+    bool ab_xpu_xe2_w4 = false;
+    bool ab_xpu_rms_register_cache = false;
+    bool ab_xpu_onednn_w4 = false;
+    bool ab_xpu_onednn_f16 = false;
+    bool ab_xpu_q4_m_tiled = false;
+    const char *xpu_swa_tile = "1024";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
@@ -102,6 +125,34 @@ int main(int argc, char **argv) {
             ab_gelu_quant = true;
         } else if (strcmp(argv[i], "--ab-metal-fp16-kv") == 0) {
             ab_metal_fp16_kv = true;
+        } else if (strcmp(argv[i], "--ab-xpu-fp16-attention") == 0) {
+            ab_xpu_fp16_attention = true;
+        } else if (strcmp(argv[i], "--ab-xpu-swa-banded") == 0) {
+            ab_xpu_swa_banded = true;
+        } else if (strcmp(argv[i], "--xpu-swa-tile") == 0 && i + 1 < argc) {
+            xpu_swa_tile = argv[++i];
+        } else if (strcmp(argv[i], "--ab-xpu-v-only") == 0) {
+            ab_xpu_v_only = true;
+        } else if (strcmp(argv[i], "--ab-xpu-cooperative-rms") == 0) {
+            ab_xpu_cooperative_rms = true;
+        } else if (strcmp(argv[i], "--ab-xpu-cooperative-pool") == 0) {
+            ab_xpu_cooperative_pool = true;
+        } else if (strcmp(argv[i], "--ab-xpu-xe2-flash") == 0) {
+            ab_xpu_xe2_flash = true;
+        } else if (strcmp(argv[i], "--ab-xpu-flash-event") == 0) {
+            ab_xpu_flash_event = true;
+        } else if (strcmp(argv[i], "--ab-xpu-command-graph") == 0) {
+            ab_xpu_command_graph = true;
+        } else if (strcmp(argv[i], "--ab-xpu-xe2-w4") == 0) {
+            ab_xpu_xe2_w4 = true;
+        } else if (strcmp(argv[i], "--ab-xpu-rms-register-cache") == 0) {
+            ab_xpu_rms_register_cache = true;
+        } else if (strcmp(argv[i], "--ab-xpu-onednn-w4") == 0) {
+            ab_xpu_onednn_w4 = true;
+        } else if (strcmp(argv[i], "--ab-xpu-onednn-f16") == 0) {
+            ab_xpu_onednn_f16 = true;
+        } else if (strcmp(argv[i], "--ab-xpu-q4-m-tiled") == 0) {
+            ab_xpu_q4_m_tiled = true;
         } else {
             usage(argv[0]);
             return 2;
@@ -114,17 +165,93 @@ int main(int argc, char **argv) {
 
     int32_t shapes[MAX_TOKEN_SHAPES];
     int shape_count = parse_token_shapes(token_shapes, shapes);
-    if (ab_metal_fp16_kv) {
-        if (strcmp(backend, "metal") != 0) {
-            ei_die("--ab-metal-fp16-kv requires --backend metal");
+    if (ab_metal_fp16_kv || ab_xpu_fp16_attention || ab_xpu_swa_banded ||
+        ab_xpu_v_only || ab_xpu_cooperative_rms ||
+        ab_xpu_cooperative_pool || ab_xpu_xe2_flash || ab_xpu_flash_event ||
+        ab_xpu_command_graph || ab_xpu_xe2_w4 ||
+        ab_xpu_rms_register_cache || ab_xpu_onednn_w4 ||
+        ab_xpu_onednn_f16 || ab_xpu_q4_m_tiled) {
+        const char *expected_backend =
+            ab_metal_fp16_kv ? "metal" : "xpu";
+        const char *environment = ab_metal_fp16_kv
+            ? "EI_METAL_FP16_KV_MIN_TOKENS"
+            : ab_xpu_swa_banded ? "EI_XPU_SWA_TENSOR_TILE_TOKENS"
+            : ab_xpu_v_only ? "EI_XPU_SINGLE_TOKEN_V_ONLY"
+            : ab_xpu_cooperative_rms ? "EI_XPU_COOPERATIVE_RMS_MAX_ROWS"
+            : ab_xpu_cooperative_pool ? "EI_XPU_COOPERATIVE_POOL"
+            : ab_xpu_xe2_flash ? "EI_XPU_XE2_FLASH"
+            : ab_xpu_flash_event ? "EI_XPU_XE2_FLASH_HOST_FENCE"
+            : ab_xpu_command_graph ? "EI_XPU_COMMAND_GRAPH"
+            : ab_xpu_xe2_w4 ? "EI_XPU_XE2_W4"
+            : ab_xpu_rms_register_cache ? "EI_XPU_RMS_REGISTER_CACHE"
+            : ab_xpu_onednn_w4 ? "EI_XPU_ONEDNN_W4"
+            : ab_xpu_onednn_f16 ? "EI_XPU_ONEDNN_F16"
+            : ab_xpu_q4_m_tiled ? "EI_XPU_Q4_M_TILED"
+                                : "EI_XPU_FP16_ATTENTION";
+        const char *baseline_value = ab_metal_fp16_kv ? "65536"
+            : ab_xpu_flash_event ? "1" : "0";
+        const char *candidate_value = ab_metal_fp16_kv
+            ? "1" : ab_xpu_swa_banded ? xpu_swa_tile
+            : ab_xpu_v_only ? "1"
+            : ab_xpu_cooperative_rms ? "4"
+            : ab_xpu_cooperative_pool ? "1"
+            : ab_xpu_xe2_flash ? "1"
+            : ab_xpu_flash_event ? "0"
+            : ab_xpu_command_graph ? "1"
+            : ab_xpu_xe2_w4 ? "1"
+            : ab_xpu_rms_register_cache ? "1"
+            : ab_xpu_onednn_w4 ? "1"
+            : ab_xpu_onednn_f16 ? "1"
+            : ab_xpu_q4_m_tiled ? "1" : "auto";
+        const char *variant = ab_metal_fp16_kv ? "fp16_kv_ab"
+            : ab_xpu_swa_banded ? "swa_banded_ab"
+            : ab_xpu_v_only ? "single_token_v_only_ab"
+            : ab_xpu_cooperative_rms ? "cooperative_rms_ab"
+            : ab_xpu_cooperative_pool ? "cooperative_pool_ab"
+            : ab_xpu_xe2_flash ? "xe2_flash_ab"
+            : ab_xpu_flash_event ? "flash_event_ab"
+            : ab_xpu_command_graph ? "command_graph_ab"
+            : ab_xpu_xe2_w4 ? "xe2_w4_ab"
+            : ab_xpu_rms_register_cache ? "rms_register_cache_ab"
+            : ab_xpu_onednn_w4 ? "onednn_w4_ab"
+            : ab_xpu_onednn_f16 ? "onednn_f16_ab"
+            : ab_xpu_q4_m_tiled ? "q4_m_tiled_ab"
+                            : "fp16_dense_auto_ab";
+        const char *candidate_field =
+            ab_xpu_swa_banded ? "banded_ms"
+            : ab_xpu_v_only ? "v_only_ms"
+            : ab_xpu_cooperative_rms ? "cooperative_ms"
+            : ab_xpu_cooperative_pool ? "cooperative_ms"
+            : ab_xpu_xe2_flash ? "flash_ms"
+            : ab_xpu_flash_event ? "event_ms"
+            : ab_xpu_command_graph ? "graph_ms"
+            : ab_xpu_xe2_w4 ? "w4_ms"
+            : ab_xpu_rms_register_cache ? "register_ms"
+            : ab_xpu_onednn_w4 ? "w4_ms"
+            : ab_xpu_onednn_f16 ? "onednn_ms"
+            : ab_xpu_q4_m_tiled ? "m_tiled_ms" : "fp16_ms";
+        if (strcmp(backend, expected_backend) != 0) {
+            ei_die("FP16 A/B mode requires --backend %s", expected_backend);
         }
         ei_engine baseline;
         ei_engine fp16;
-        setenv("EI_METAL_FP16_KV_MIN_TOKENS", "65536", 1);
-        ei_engine_load_backend(&baseline, model_path, "metal");
-        setenv("EI_METAL_FP16_KV_MIN_TOKENS", "1", 1);
-        ei_engine_load_backend(&fp16, model_path, "metal");
-        unsetenv("EI_METAL_FP16_KV_MIN_TOKENS");
+        if (ab_xpu_q4_m_tiled) {
+            setenv("EI_XPU_GEMM_MIN_TOKENS", "65536", 1);
+        }
+        if (ab_xpu_swa_banded) {
+            setenv("EI_XPU_SWA_TENSOR_MIN_TOKENS", "1", 1);
+        }
+        setenv(environment, baseline_value, 1);
+        ei_engine_load_backend(&baseline, model_path, expected_backend);
+        setenv(environment, candidate_value, 1);
+        ei_engine_load_backend(&fp16, model_path, expected_backend);
+        unsetenv(environment);
+        if (ab_xpu_q4_m_tiled) {
+            unsetenv("EI_XPU_GEMM_MIN_TOKENS");
+        }
+        if (ab_xpu_swa_banded) {
+            unsetenv("EI_XPU_SWA_TENSOR_MIN_TOKENS");
+        }
 
         for (int shape = 0; shape < shape_count; shape++) {
             int32_t tokens = shapes[shape];
@@ -148,16 +275,21 @@ int main(int argc, char **argv) {
                 }
             }
             double similarity = cosine(baseline_output, fp16_output);
+            if (!isfinite(similarity) || similarity < 0.998) {
+                ei_die("A/B parity failed: %.9g", similarity);
+            }
             qsort(baseline_samples, (size_t)iters, sizeof(*baseline_samples), compare_double);
             qsort(fp16_samples, (size_t)iters, sizeof(*fp16_samples), compare_double);
             double baseline_median = median_sorted(baseline_samples, iters);
             double fp16_median = median_sorted(fp16_samples, iters);
-            printf("{\"schema\":%d,\"backend\":\"metal\","
+            printf("{\"schema\":%d,\"backend\":\"%s\","
                    "\"kernel\":\"engine_embed_tokens\","
-                   "\"variant\":\"fp16_kv_ab\",\"shape\":{\"tokens\":%d},"
-                   "\"threads\":1,\"fp16_ms\":%.9g,\"baseline_ms\":%.9g,"
+                   "\"variant\":\"%s\",\"shape\":{\"tokens\":%d},"
+                   "\"threads\":1,\"%s\":%.9g,\"baseline_ms\":%.9g,"
                    "\"throughput_speedup\":%.9g,\"cosine\":%.9g}\n",
-                   PERF_SCHEMA, tokens, fp16_median, baseline_median,
+                   PERF_SCHEMA, expected_backend, variant, tokens,
+                   candidate_field,
+                   fp16_median, baseline_median,
                    baseline_median / fp16_median, similarity);
             free(fp16_samples);
             free(baseline_samples);

@@ -6,6 +6,9 @@
 #if defined(EI_ENABLE_CUDA)
 #include "engine_cuda.h"
 #endif
+#if defined(EI_ENABLE_XPU)
+#include "engine_xpu.h"
+#endif
 
 #include <math.h>
 
@@ -50,12 +53,32 @@ void ei_engine_load_backend(ei_engine *e, const char *model_path, const char *ba
 
     const char *requested = backend && *backend ? backend : "auto";
     if (strcmp(requested, "auto") != 0 && strcmp(requested, "cpu") != 0 &&
-        strcmp(requested, "metal") != 0 && strcmp(requested, "cuda") != 0) {
-        ei_die("unknown inference backend '%s' (expected auto, cpu, metal, or cuda)",
+        strcmp(requested, "metal") != 0 && strcmp(requested, "cuda") != 0 &&
+        strcmp(requested, "xpu") != 0 && strcmp(requested, "sycl") != 0) {
+        ei_die("unknown inference backend '%s' (expected auto, cpu, metal, cuda, or xpu)",
                requested);
     }
+#if defined(EI_ENABLE_XPU)
+    if (strcmp(requested, "auto") == 0 || strcmp(requested, "xpu") == 0 ||
+        strcmp(requested, "sycl") == 0) {
+        char xpu_err[512];
+        e->xpu = ei_xpu_engine_create(&e->model, xpu_err, sizeof xpu_err);
+        if (e->xpu) {
+            e->backend_name = "xpu";
+        } else if (strcmp(requested, "xpu") == 0 || strcmp(requested, "sycl") == 0) {
+            ei_die("XPU backend initialization failed: %s", xpu_err);
+        } else {
+            fprintf(stderr, "XPU unavailable, using CPU: %s\n", xpu_err);
+        }
+    }
+#else
+    if (strcmp(requested, "xpu") == 0 || strcmp(requested, "sycl") == 0) {
+        ei_die("this binary was built without XPU SYCL support");
+    }
+#endif
 #if defined(EI_ENABLE_METAL)
-    if (strcmp(requested, "auto") == 0 || strcmp(requested, "metal") == 0) {
+    if (!e->xpu && (strcmp(requested, "auto") == 0 ||
+                    strcmp(requested, "metal") == 0)) {
         char metal_err[512];
         e->metal = ei_metal_engine_create(&e->model, NULL, metal_err, sizeof metal_err);
         if (e->metal) {
@@ -72,7 +95,7 @@ void ei_engine_load_backend(ei_engine *e, const char *model_path, const char *ba
     }
 #endif
 #if defined(EI_ENABLE_CUDA)
-    if (!e->metal && strcmp(requested, "cpu") != 0 &&
+    if (!e->xpu && !e->metal && strcmp(requested, "cpu") != 0 &&
         strcmp(requested, "metal") != 0) {
         char cuda_err[512];
         e->cuda = ei_cuda_engine_create(&e->model, cuda_err, sizeof cuda_err);
@@ -89,7 +112,7 @@ void ei_engine_load_backend(ei_engine *e, const char *model_path, const char *ba
         ei_die("this binary was built without CUDA support");
     }
 #endif
-    if (!e->metal && !e->cuda) e->thread_pool = ei_thread_pool_create(0);
+    if (!e->xpu && !e->metal && !e->cuda) e->thread_pool = ei_thread_pool_create(0);
 }
 
 void ei_engine_load(ei_engine *e, const char *model_path) {
@@ -103,6 +126,9 @@ void ei_engine_free(ei_engine *e) {
 #endif
 #if defined(EI_ENABLE_CUDA)
     ei_cuda_engine_free(e->cuda);
+#endif
+#if defined(EI_ENABLE_XPU)
+    ei_xpu_engine_free(e->xpu);
 #endif
     ei_thread_pool_destroy(e->thread_pool);
     free(e->workspace_positions);
@@ -773,6 +799,12 @@ bool ei_engine_reserve(ei_engine *e, size_t total_tokens, size_t batch_size,
                                        err, err_len);
     }
 #endif
+#if defined(EI_ENABLE_XPU)
+    if (e->xpu) {
+        return ei_xpu_engine_reserve(e->xpu, total_tokens, batch_size,
+                                     err, err_len);
+    }
+#endif
 #if defined(EI_ENABLE_CUDA)
     if (e->cuda) {
         return ei_cuda_engine_reserve(e->cuda, total_tokens, batch_size,
@@ -791,6 +823,12 @@ bool ei_engine_embed_tokens(ei_engine *e, const int32_t *ids, size_t n_tokens,
 #if defined(EI_ENABLE_METAL)
     if (e->metal) {
         return ei_metal_engine_embed_tokens(e->metal, ids, n_tokens, out, err, err_len);
+    }
+#endif
+#if defined(EI_ENABLE_XPU)
+    if (e->xpu) {
+        return ei_xpu_engine_embed_tokens(e->xpu, ids, n_tokens, out,
+                                          err, err_len);
     }
 #endif
 #if defined(EI_ENABLE_CUDA)
@@ -857,6 +895,12 @@ bool ei_engine_embed_tokens_batch(ei_engine *e, const int32_t *ids,
     if (e->metal) {
         return ei_metal_engine_embed_tokens_batch(
             e->metal, ids, offsets, batch_size, out, err, err_len);
+    }
+#endif
+#if defined(EI_ENABLE_XPU)
+    if (e->xpu) {
+        return ei_xpu_engine_embed_tokens_batch(e->xpu, ids, offsets,
+                                                batch_size, out, err, err_len);
     }
 #endif
 #if defined(EI_ENABLE_CUDA)

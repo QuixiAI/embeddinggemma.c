@@ -54,10 +54,18 @@ typedef struct {
     bool add_bos, add_eos, add_space_prefix;
 } ei_model;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void ei_model_load(ei_model *m, const char *path);
 void ei_model_free(ei_model *m);
 
 /* True when layer il uses the 512-token symmetric sliding window. */
 bool ei_layer_is_swa(const ei_model *m, int il);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* EI_MODEL_H */

@@ -210,7 +210,9 @@ def summary(rows: list[dict[str, float | int | str]], metadata: dict[str, object
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=("cpu", "metal"), required=True)
+    parser.add_argument(
+        "--backend", choices=("cpu", "metal", "cuda", "xpu"), required=True
+    )
     parser.add_argument("--binary", type=Path)
     parser.add_argument(
         "--model",
@@ -230,11 +232,20 @@ def main() -> int:
     parser.add_argument("--no-build", action="store_true")
     args = parser.parse_args()
 
-    binary = args.binary or REPO_ROOT / "build" / (
-        "embeddinggemma-metal" if args.backend == "metal" else "embeddinggemma"
-    )
+    binary_name = {
+        "cpu": "embeddinggemma",
+        "metal": "embeddinggemma-metal",
+        "cuda": "embeddinggemma-cuda",
+        "xpu": "embeddinggemma-xpu",
+    }[args.backend]
+    binary = args.binary or REPO_ROOT / "build" / binary_name
     if not args.no_build:
-        target = "metal" if args.backend == "metal" else "all"
+        target = {
+            "cpu": "all",
+            "metal": "metal",
+            "cuda": "cuda",
+            "xpu": "xpu",
+        }[args.backend]
         subprocess.run(["make", target], cwd=REPO_ROOT, check=True)
 
     port = reserve_port()

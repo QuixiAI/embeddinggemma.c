@@ -1,18 +1,21 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "engine.h"
 #include "inference_service.h"
 #include "response_cache.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
-#include <curl/curl.h>
 #include <errno.h>
 #include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define MODEL_URL "https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/embeddinggemma-300M-qat-Q4_0.gguf"
@@ -20,7 +23,11 @@
 #define MAX_BODY_BYTES (16u * 1024u * 1024u)
 #define MAX_HEADER_BYTES (64u * 1024u)
 
-#if defined(EI_ENABLE_CUDA)
+extern char **environ;
+
+#if defined(EI_ENABLE_XPU)
+#define DEFAULT_INFERENCE_BACKEND "xpu"
+#elif defined(EI_ENABLE_CUDA)
 #define DEFAULT_INFERENCE_BACKEND "cuda"
 #elif defined(EI_ENABLE_METAL)
 #define DEFAULT_INFERENCE_BACKEND "metal"
@@ -863,26 +870,41 @@ static void mkdir_p(const char *path) {
     free(tmp);
 }
 
-static size_t curl_write_file(void *ptr, size_t size, size_t nmemb, void *userdata) {
-    return fwrite(ptr, size, nmemb, (FILE *)userdata) * size;
-}
+typedef enum {
+    DOWNLOADER_UNAVAILABLE,
+    DOWNLOADER_FAILED,
+    DOWNLOADER_SUCCEEDED,
+} downloader_result;
 
-typedef struct {
-    int last_percent;
-} download_progress;
-
-static int curl_progress(void *userdata, curl_off_t total, curl_off_t now,
-                         curl_off_t ultotal, curl_off_t ulnow) {
-    (void)ultotal;
-    (void)ulnow;
-    download_progress *p = (download_progress *)userdata;
-    if (total <= 0) return 0;
-    int percent = (int)((now * 100) / total);
-    if (percent >= p->last_percent + 10 || (percent == 100 && p->last_percent != 100)) {
-        fprintf(stderr, "download progress: %d%%\n", percent);
-        p->last_percent = percent;
+static downloader_result run_downloader(const char *program,
+                                        char *const arguments[]) {
+    pid_t child;
+    int rc = posix_spawnp(&child, program, NULL, NULL, arguments, environ);
+    if (rc == ENOENT) return DOWNLOADER_UNAVAILABLE;
+    if (rc != 0) {
+        fprintf(stderr, "cannot start %s: %s\n", program, strerror(rc));
+        return DOWNLOADER_FAILED;
     }
-    return 0;
+
+    int status;
+    do {
+        rc = waitpid(child, &status, 0);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) {
+        fprintf(stderr, "cannot wait for %s: %s\n", program, strerror(errno));
+        return DOWNLOADER_FAILED;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return DOWNLOADER_SUCCEEDED;
+    }
+    if (WIFEXITED(status)) {
+        fprintf(stderr, "%s exited with status %d\n",
+                program, WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        fprintf(stderr, "%s terminated by signal %d\n",
+                program, WTERMSIG(status));
+    }
+    return DOWNLOADER_FAILED;
 }
 
 static void download_model(const char *model_path) {
@@ -890,65 +912,52 @@ static void download_model(const char *model_path) {
     mkdir_p(model_dir);
     free(model_dir);
 
-    size_t tmp_len = strlen(model_path) + strlen(".download") + 1u;
+    size_t tmp_len = strlen(model_path) + strlen(".download.XXXXXX") + 1u;
     char *tmp_path = ei_xmalloc(tmp_len);
-    snprintf(tmp_path, tmp_len, "%s.download", model_path);
+    snprintf(tmp_path, tmp_len, "%s.download.XXXXXX", model_path);
+
+    int tmp_fd = mkstemp(tmp_path);
+    if (tmp_fd < 0) {
+        free(tmp_path);
+        ei_die("cannot create temporary download file: %s", strerror(errno));
+    }
+    if (close(tmp_fd) != 0) {
+        unlink(tmp_path);
+        free(tmp_path);
+        ei_die("cannot close temporary download file: %s", strerror(errno));
+    }
 
     fprintf(stderr, "model missing; downloading %s\n", MODEL_URL);
     fprintf(stderr, "destination: %s\n", model_path);
 
-    FILE *f = fopen(tmp_path, "wb");
-    if (!f) {
-        free(tmp_path);
-        ei_die("cannot open temporary download file: %s", strerror(errno));
+    char *curl_arguments[] = {
+        "curl", "-fL", "--retry", "3", "--retry-delay", "1",
+        "--connect-timeout", "30", "--progress-bar",
+        "--user-agent", "embeddinggemma.c/1.0",
+        "-o", tmp_path, MODEL_URL, NULL,
+    };
+    downloader_result curl_result =
+        run_downloader("curl", curl_arguments);
+
+    downloader_result wget_result = DOWNLOADER_UNAVAILABLE;
+    if (curl_result != DOWNLOADER_SUCCEEDED) {
+        char *wget_arguments[] = {
+            "wget", "--tries=3", "--timeout=30",
+            "-O", tmp_path, MODEL_URL, NULL,
+        };
+        wget_result = run_downloader("wget", wget_arguments);
     }
 
-    CURLcode init = curl_global_init(CURL_GLOBAL_DEFAULT);
-    if (init != CURLE_OK) {
-        fclose(f);
+    if (curl_result != DOWNLOADER_SUCCEEDED &&
+        wget_result != DOWNLOADER_SUCCEEDED) {
         unlink(tmp_path);
         free(tmp_path);
-        ei_die("curl_global_init failed: %s", curl_easy_strerror(init));
-    }
-
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        fclose(f);
-        unlink(tmp_path);
-        free(tmp_path);
-        curl_global_cleanup();
-        ei_die("curl_easy_init failed");
-    }
-
-    download_progress progress = { .last_percent = -10 };
-    curl_easy_setopt(curl, CURLOPT_URL, MODEL_URL);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "embeddinggemma.c/1.0");
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_file);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, f);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_progress);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &progress);
-
-    CURLcode rc = curl_easy_perform(curl);
-    long http = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);
-    curl_easy_cleanup(curl);
-    curl_global_cleanup();
-
-    if (fclose(f) != 0 && rc == CURLE_OK) {
-        rc = CURLE_WRITE_ERROR;
-    }
-
-    if (rc != CURLE_OK) {
-        unlink(tmp_path);
-        free(tmp_path);
-        if (http) {
-            ei_die("download failed: HTTP %ld: %s", http, curl_easy_strerror(rc));
+        if (curl_result == DOWNLOADER_UNAVAILABLE &&
+            wget_result == DOWNLOADER_UNAVAILABLE) {
+            ei_die("model is missing and neither curl nor wget is available; "
+                   "install one or provide --model PATH");
         }
-        ei_die("download failed: %s", curl_easy_strerror(rc));
+        ei_die("model download failed; provide --model PATH to use an existing file");
     }
 
     if (regular_file_exists(model_path)) {
@@ -972,7 +981,7 @@ static void ensure_model_available(const char *model_path) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s [--bind ADDR] [--port PORT] [--backend auto|cpu|metal|cuda]\n"
+        "usage: %s [--bind ADDR] [--port PORT] [--backend auto|cpu|metal|cuda|xpu]\n"
         "          [--model PATH] [--workers N] [--max-queue N]\n"
         "          [--cache-entries N] [--max-batch-tokens N]\n"
         "          [--max-batch-requests N]\n"
@@ -1027,7 +1036,9 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
             opts->backend = argv[++i];
             if (strcmp(opts->backend, "auto") != 0 && strcmp(opts->backend, "cpu") != 0 &&
                 strcmp(opts->backend, "metal") != 0 &&
-                strcmp(opts->backend, "cuda") != 0) return false;
+                strcmp(opts->backend, "cuda") != 0 &&
+                strcmp(opts->backend, "xpu") != 0 &&
+                strcmp(opts->backend, "sycl") != 0) return false;
         } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             opts->model_path = argv[++i];
         } else if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {

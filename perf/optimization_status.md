@@ -1650,3 +1650,439 @@ The last three independent optimization passes produced no significant gain,
 so this loop stops here per the handbook criterion. The retained results from
 this loop are CUDA banded SWA tensor attention, Metal short-shape residual/next
 norm fusion, and CUDA direct-FP16 QKV epilogues.
+
+## 2026-07-20: XPU SYCL Functional Baseline
+
+Status: baseline recorded; optimization passes in progress.
+
+Environment: one Intel Arc Pro B60 selected from a two-B60 host, oneAPI 2026.1,
+Level Zero 1.14.37020, immediate command lists, mixed-FP16 oneMKL GEMM, and a
+resident unrelated two-GPU vLLM workload. Absolute timings therefore include
+some external contention; route decisions use reversed-order A/B runs.
+
+Current implementation: persistent device model/workspace allocations, native
+Q8 embedding decode, subgroup norms and online attention, direct packed-Q4
+projection diagnostics, load-time FP16 expansion of all projection matrices,
+combined QKV and up/gate oneMKL GEMMs, fused QKV norm/RoPE/V epilogue, fused
+residual/next norm, and dense oneMKL QK/PV attention from 128 tokens.
+
+References inspected:
+
+- `QuixiCore-XPU/kernels/quantization/gguf_gemv`
+- `QuixiCore-XPU/kernels/norms/rms_norm`
+- `QuixiCore-XPU/kernels/attention/attention`
+- `vllm-xpu-kernels/csrc/xpu/sycl/decode`
+- `vllm-xpu-kernels/csrc/xpu/attn/xe_2`
+- `vllm-xpu-kernels/csrc/xpu/grouped_gemm`
+
+Correctness: all 10 llama.cpp goldens pass at minimum cosine `0.999910653`.
+CPU/XPU synthetic drift is at least `0.996121168`; direct packed-Q4 versus
+expanded-FP16 projection is at least `0.999994934`; online versus tensor
+attention is at least `0.999997437`; packed versus serialized execution is at
+least `0.999954283`; HTTP Matryoshka dimensions pass.
+
+Retained whole-engine baseline, five warmups and 20 iterations:
+
+| tokens | median ms | tokens/s |
+|---:|---:|---:|
+| 1 | 4.6694 | 214.2 |
+| 7 | 4.7763 | 1,465.6 |
+| 32 | 7.6252 | 4,196.6 |
+| 128 | 9.9928 | 12,809.3 |
+| 512 | 20.3124 | 25,206.3 |
+| 2048 | 67.5650 | 30,311.5 |
+
+Dynamic unique T32 requests scale from `135.067 req/s` at concurrency 1 to
+`880.631 req/s` at concurrency 32 (`6.52x`, 28,180 input tokens/s, average
+batch 32). A forced collection delay was rejected: it reduced concurrency-32
+throughput while increasing single-request latency.
+
+Attention crossover experiments show that a scalar threshold is insufficient.
+Tensor attention wins for one sequence from about T80, but per-sequence GEMM
+submissions make it 1.48x slower at T128/B4 and 2.50x slower at T128/B16.
+Tensor wins again at T256/B4 and T512/B2. This motivates grouped GEMM and a
+batch-aware route before final threshold tuning.
+
+Rejected experiment: SYCL command-graph capture including oneMKL was neutral at
+T1 and 15-25% slower from T7 through T2048 than immediate in-order submission,
+so it was removed.
+
+Raw results:
+
+- Remote `perf/results/2026-07-20/014007-xpu-retained/`
+- Remote `perf/results/2026-07-20/014033-xpu-t32-retained/`
+- Focused reversed-order attention and packed-route command output.
+
+### XPU Pass 1: Event Profiling
+
+Status: retained as an opt-in diagnostic; no measurable disabled-path cost.
+
+`EI_XPU_PROFILE=1` now creates a profiling-enabled Level Zero queue and reports
+per-label SYCL event totals for copies, kernels, and oneMKL calls. With profiling
+disabled, a five-warmup/20-iteration check measured 4.645 ms at T1, 7.355 ms at
+T32, 18.751 ms at T512, and 69.378 ms at T2048, within the variance of the
+functional baseline.
+
+The device-event breakdown changed the optimization order. At T1, the 47 fused
+residual/next-normalization calls total about 1.31 ms. At T512, dense QK,
+softmax, and PV total about 3.00 ms while pooling plus its result transfer total
+about 1.02 ms. At T2048, QK/softmax/PV total about 35.9 ms, pooling plus result
+transfer about 6.64 ms, and the four projection classes about 6.88 ms. Event
+profiling changes queue behavior and clock state, so these values rank work but
+are not used as end-to-end speedup claims.
+
+### XPU Pass 2: Grouped oneMKL Dense Attention
+
+Status: rejected.
+
+The dense route was changed from six oneMKL calls per sequence and layer to one
+grouped QK call, one batch-wide softmax dispatch, and one grouped PV call. Score
+matrices were packed by sequence, and all grouped descriptor and pointer arrays
+were kept alive until the queue completed to satisfy asynchronous lifetime
+requirements. The implementation compiled, but a forced dense T128 run did not
+complete a single measured iteration within 60 seconds; the retained path is
+about 10 ms end to end. The same timeout occurred before and after correcting
+descriptor lifetime. oneMKL 2026.1 grouped GEMM is therefore unusable for this
+small heterogeneous three-head geometry on the tested Level Zero stack. The
+experiment was removed; a custom fused attention kernel remains the viable way
+to eliminate these submissions.
+
+### XPU Pass 3: FP16 Q/K/V Attention Storage
+
+Status: retained for dense-attention sequences; rejected for unconditional
+online attention.
+
+The combined QKV epilogue can now write Q/K/V directly to FP16. Online
+attention converts loads to FP32 and keeps FP32 softmax/output accumulators;
+dense attention uses mixed FP16 QK with FP32 scores, writes normalized
+probabilities to FP16, and uses mixed FP16 PV with FP32 output. Forced-route
+cosine versus the FP32 path is at least `0.999989022` over T1..T2048.
+
+Alternating single-request A/B measured `1.0566x` at T128, `1.2771x` at T512,
+and `1.4645x` at T2048. Packed dense T128 measured `1.0796x`, `1.0592x`, and
+`1.1008x` at batches 4, 8, and 16. Unconditionally storing FP16 for short
+online-attention batches was noisy and often slower (as low as `0.739x` in a
+contended T32/B4 run), so production uses FP16 only when every sequence in the
+batch takes the dense route. `EI_XPU_FP16_ATTENTION=0|1|auto` preserves exact
+off, forced-on, and production A/B modes.
+
+### XPU Pass 4: Batch-Aware Attention Routing
+
+Status: retained.
+
+The scalar T128 dense-attention threshold was replaced by batch-aware defaults:
+T80 for one sequence, T192 for batches 2..4, T384 for batches 5..8, and T512
+for larger batches. Setting `EI_XPU_TENSOR_ATTENTION_MIN_TOKENS` still forces an
+exact scalar threshold for diagnostics. Paired in-process A/B against the old
+T128 rule measured `1.204x`, `1.318x`, and `1.523x` at T128/B4, B8, and B16.
+At T256 it measured `1.256x` at B8 and `1.461x` at B16. T192/B4 moved slightly
+in favor of dense attention after FP16 Q/K/V landed, which set the final B2..4
+crossover to T192. Route cosine remained at least `0.999981582` for the retained
+benchmark shapes.
+
+### XPU Pass 5: Banded Symmetric-SWA GEMMs
+
+Status: implemented as a diagnostic and disabled by default.
+
+Long sliding-window layers can partition queries into compact bands, compute
+only the corresponding key range, apply exact edge masks, and feed FP16
+probabilities to PV. A 1024-query tile preserved cosine `0.999999678` or better,
+but measured `0.959x` at T1024, `0.955x` at T1536, and only `1.019x` at T2048.
+Tiles of 512 and 256 were slower (`0.925x` and `0.660x` at T2048) because extra
+oneMKL submissions outweighed reduced FLOPs. Production leaves the tile at zero;
+`EI_XPU_SWA_TENSOR_TILE_TOKENS` and `EI_XPU_SWA_TENSOR_MIN_TOKENS` retain the
+complete experiment for future oneMKL/driver retesting.
+
+### XPU Pass 6: Single-Token V-Only Attention
+
+Status: retained.
+
+For a one-token sequence, softmax attention is exactly its value vector for
+every query head. Batches containing only one-token sequences now project only
+the 256-row V slice of the combined QKV weights, replicate V directly into the
+FP16 attention-output input, and skip Q/K projection, Q/K norm, RoPE, and
+attention. Alternating packed A/B measured `1.820x`, `1.805x`, `1.824x`,
+`1.788x`, `1.789x`, and `1.800x` at batches 1, 2, 4, 8, 16, and 32. Minimum
+cosine was `0.999988914`. `EI_XPU_SINGLE_TOKEN_V_ONLY=0|1` controls the route.
+
+### XPU Pass 7: Cooperative RMS and Pooling
+
+Status: retained with shape routing.
+
+Rows up to four tokens now assign one 128-thread workgroup to each RMS row,
+including the fused residual/next-normalization kernel, instead of launching
+eight 16-thread subgroups with most inactive. This measured `1.612x` at T1,
+`1.234x` at T2, and `1.208x` at T4, then became neutral by T7. Cosine remained
+at least `0.999994620` over the routed shapes.
+
+Final norm/mean/L2 pooling now has a cooperative 128-thread implementation with
+six accumulators per lane instead of 48. It measured `1.030x` at T128, `1.048x`
+at T256, `1.022x` at T512, and `1.060x` at T2048, while T32 regressed `1.4%`.
+Production therefore selects it for one-token or at-least-128-token sequences.
+For packed mixed-length batches, auto mode uses the cooperative kernel only
+when every sequence qualifies; this keeps a short request's embedding
+independent of a long neighbor's pooling route.
+`EI_XPU_COOPERATIVE_RMS_MAX_ROWS=0..128` and
+`EI_XPU_COOPERATIVE_POOL=0|1|auto` preserve exact experiment controls.
+
+### XPU Pass 8: Xe2 XMX Flash Attention
+
+Status: retained for single sequences when built with `XPU_XE2_FLASH=1`;
+multi-sequence varlen dispatch remains forced-only for diagnostics.
+
+The Xe2 chunk-prefill kernel from `vllm-xpu-kernels` is instantiated only for
+EmbeddingGemma's FP16, head-256, three-query/one-KV-head geometry. The optional
+build now carries the same split-barrier, 2D-block-I/O, subgroup-matrix, BMG
+device-link, and 256-GRF settings as the reference build. Q/K/V are consumed
+directly from the fused FP16 QKV epilogue and the FP16 context is passed
+directly to the output projection, removing score-matrix storage and six
+oneMKL attention calls per layer.
+
+The initial asynchronous prototype measured `1.079x`, `1.105x`, `1.044x`, `1.233x`,
+`1.190x`, `1.337x`, and `1.550x` at T32, T64, T128, T256, T512, T1024, and
+T2048. Minimum single-sequence cosine was `0.999975628`. Absolute timing was
+heavily affected by a resident two-GPU workload, so only paired ratios are
+used. These values were superseded by the fenced production measurements in
+the final-validation section below.
+
+The imported multi-sequence varlen scheduler was faster through B16 in initial
+paired runs, but repeated identical T32/B16 runs produced nondeterministic
+minimum cosine from `0.998176754` to `0.999876857`. An explicit queue-completion
+fence did not eliminate the drift and imposed severe latency. Production auto
+mode is therefore restricted to batch size one; `EI_XPU_XE2_FLASH=1` can still
+force multi-sequence experiments, while `0` disables the route exactly.
+The imported launcher does not return an event that oneMKL can consume, so the
+retained path completes each Flash dispatch before submitting its output
+projection. Without that fence, a T129 Flash request changed later packed
+results. Automatic routing begins at T256: a final mixed serialized/packed
+regression
+showed that selecting Flash only for serialized T32 requests reduced route
+consistency to cosine `0.998735249`, while the T129 route remained above
+`0.999997`. T32-T255 results remain available through forced mode but are not
+used in production.
+
+### XPU Pass 9: Fixed-Shape oneDNN XMX Projections
+
+Status: rejected; optional experiment retained behind `XPU_ONEDNN=1` and
+`EI_XPU_ONEDNN_F16=1`.
+
+The four projection geometries now have cached oneDNN matmul primitives using
+FP16 inputs/weights, FP32 outputs, and a transposed-stride view of the existing
+expanded weights. This tests oneDNN's fixed-shape XMX dispatch against the
+retained oneMKL row-major GEMMs without changing model precision. Alternating
+A/B measured `0.960x`, `0.986x`, `0.986x`, `1.002x`, `1.013x`, `1.033x`,
+`1.007x`, and `1.003x` at T1, T7, T32, T64, T128, T256, T512, and T2048.
+Cosine was at least `0.999983099`. The isolated 3.3% T256 result was not broad
+or large enough to justify another runtime and primitive cache in production.
+
+### XPU Pass 10: oneDNN S4 Weight-Only Projections
+
+Status: implemented as an optional diagnostic; disabled by default.
+
+GGUF Q4_0 projection weights can now be repacked once into signed S4 `[K,N]`
+storage with FP16 `[K/32,N]` block scales. Cached oneDNN weight-only matmuls
+consume FP16 activations and produce FP32 outputs, reducing projection weight
+storage by 4x versus expanded FP16 while preserving cosine `0.999984499` or
+better over the measured shapes. A short seven-iteration sweep appeared to
+gain `1.145x` at T32 and `1.076x` at T128, but a four-warmup/21-iteration
+repeat measured only `0.928x` at T32, `0.921x` at T48, `0.942x` at T64, and
+`0.958x` at T128. The initial result was GPU clock/contention variance. The
+portable binary therefore does not link oneDNN or allocate repacked weights;
+`XPU_ONEDNN=1 EI_XPU_ONEDNN_W4=1` preserves the complete experiment.
+
+### XPU Pass 11: M-Tiled Native Q4 Projection
+
+Status: implemented as a diagnostic and disabled by default.
+
+For M2..M8, one subgroup now owns an output row, decodes each Q4_0 block once,
+and accumulates all request rows in registers. This removes redundant packed
+weight reads from the original token-major direct kernel. Alternating A/B
+against that kernel measured `1.134x`, `1.102x`, `1.152x`, and `1.151x` at M2,
+M4, M7, and M8 with cosine exactly `1.0`; M1 regressed to `0.934x`. Whole-engine
+latency remained 23.8-38.5 ms versus roughly 3.7-5.0 ms for the retained FP16
+oneMKL route, so `EI_XPU_Q4_M_TILED=1` is available only when direct Q4 is
+forced with `EI_XPU_GEMM_MIN_TOKENS`.
+
+### XPU Final Validation and Loop Stop
+
+The portable build passed the XPU regression suite with CPU/XPU cosine at least
+`0.996161699`, packed-Q4/FP16-GEMM cosine at least `0.999996305`, online/dense
+attention cosine at least `0.999998212`. Repeated packed-versus-serialized XPU
+runs varied with oneMKL's M-dependent FP16 reduction path but remained at least
+`0.999484062`; the enforced XPU gate is `0.999`, stricter than CUDA's `0.998`.
+The Xe2-enabled build passed the same suite at minima `0.996134818`, `0.999995351`,
+and `0.999998212` respectively. The complete local CPU suite also passed,
+including all ten llama.cpp goldens (minimum cosine `0.999860704`), kernel
+tests, packed batches, service/cache tests, and HTTP Matryoshka dimensions.
+The remote XPU host lacks the libcurl development headers. Removing the linked
+libcurl dependency allowed the complete XPU HTTP executable to build there; its
+HTTP Matryoshka dimensions suite passed. Model cache misses now invoke `curl`
+or `wget` through POSIX `posix_spawnp`, while an existing model requires neither
+command.
+
+A final fenced three-warmup/11-iteration Xe2 A/B repeat measured `0.974x`,
+`1.091x`, `1.183x`, `1.304x`, and `1.535x` at T128, T256, T512, T1024, and
+T2048, with cosine at least `0.999997071`. T128 is below the production
+crossover; the retained T256-and-up shapes have cosine at least `0.999997999`.
+
+The final dynamic T32 snapshot under the resident two-GPU vLLM workload was:
+
+| concurrency | requests/s | input tokens/s | average batch |
+|---:|---:|---:|---:|
+| 1 | 58.0 | 1,856 | 1.0 |
+| 2 | 28.4 | 908 | 1.0 |
+| 4 | 62.4 | 1,997 | 3.4 |
+| 8 | 93.1 | 2,979 | 7.1 |
+| 16 | 124.3 | 3,976 | 12.8 |
+| 32 | 158.2 | 5,062 | 21.3 |
+
+These absolute values are a final-state smoke measurement, not a baseline
+comparison, because the unrelated workload changed GPU occupancy and clocks.
+All improvement claims above use alternating in-process A/B measurements.
+
+Passes 9, 10, and 11 produced no significant retained end-to-end gain after
+the Xe2 Flash win in Pass 8. The optimization loop therefore stops after three
+consecutive non-significant production passes, as required by the experiment
+protocol.
+
+## XPU Perfection Loop (2026-07-20)
+
+### XPU Pass 12: Event-Ordered Xe2 Flash
+
+Status: retained.
+
+The imported CUTLASS-SYCL launcher returned no event even though its underlying
+`compat::experimental::launch` call does. A model-specific launcher now returns
+that event, and an explicit device-side queue barrier orders the following
+oneMKL projection. This removes the per-layer `wait_and_throw` host fence and
+also makes Flash device time visible to the profiler. The old fence remains
+available as `EI_XPU_XE2_FLASH_HOST_FENCE=1` for A/B diagnostics.
+
+After a contaminated first sweep was discarded, a five-warmup/21-iteration
+alternating in-process repeat measured `1.034x`, `1.022x`, `1.010x`, and
+`1.005x` at T256, T512, T1024, and T2048. Cosine versus the fenced path was at
+least `0.999997956`. The gain is concentrated at the production Flash
+crossover, but every retained shape was non-regressing. A profiled warm T512
+run reported 24 Flash calls totaling about `1.48 ms` and an end-to-end forward
+time of about `5.93 ms`.
+
+### XPU Pass 13: Exact-Shape SYCL Graph Replay
+
+Status: retained for all-single-token batches B1-B4; forced mode remains
+available for diagnostics.
+
+The B60 and its Level Zero driver expose `ext_oneapi_graph`. The engine now
+captures the complete fixed-shape forward submission, including oneMKL and
+CUTLASS kernels, into a bounded eight-entry LRU. IDs and sequence metadata are
+copied before replay, so graph entries depend only on sequence lengths and do
+not cache request data. Workspace growth clears captured graphs before device
+pointers move.
+
+Five-warmup/21-iteration alternating packed A/B at one token measured
+`1.246x`, `1.165x`, `1.110x`, `1.016x`, `1.017x`, and `1.020x` for B1, B2, B4,
+B8, B16, and B32. Minimum cosine was `0.999989212`. Single-request T7-T2048
+and packed T32 B1-B32 improved only 1.0%-2.6%. Production auto mode therefore
+captures only all-single-token batches through B4; `EI_XPU_COMMAND_GRAPH=1`
+forces any exact shape and `0` disables capture. Unsupported devices disable
+auto mode rather than failing initialization.
+
+### XPU Pass 14: Xe2 W4A16 DPAS Projections
+
+Status: retained only for the two-token up/gate projection; the general route
+is rejected.
+
+GGUF Q4_0 weights can now be repacked into the signed-int4 row-major layout
+consumed by `vllm-xpu-kernels`' BMG DPAS policies. An isolated matrix suite
+validates QKV, value, attention-output, fused up/gate, and down geometries at
+M1, M7, and M32 with cosine at least `0.999999975`. The loader waits for each
+host-to-device copy before releasing its temporary packing buffers.
+
+Using W4A16 for all four per-layer projections was slower than FP16 oneMKL:
+five-warmup/21-iteration A/B measured `0.782x` to `0.877x` from T1 through
+T128. At T32, W4 projection device time was about `197 us` higher and 96
+FP16-to-FP32 conversion launches added another `127 us`. Fused up/gate was the
+one favorable geometry, so its FP16 output now feeds GELU directly. A
+seven-warmup/31-iteration repeat measured `1.118x` for a single T2 sequence
+with cosine `0.999998120`. Command-graph replay made T1 and packed one-token
+B1-B2 effectively neutral (`1.006x` and `1.011x`), so production routes only
+the exact single-sequence T2 shape.
+
+### XPU Pass 15: Register-Cached Residual/RMS
+
+Status: retained on Xe2 for M2 and larger.
+
+The fused residual/update/next-RMS kernel now keeps each lane's updated
+residual values in registers across the second reduction, eliminating the
+final global residual read. The subgroup path uses 48 values per lane under
+the Xe2 build's 256-GRF setting; the cooperative M2-M4 path needs six. M1 keeps
+the prior cooperative kernel because register caching measured `0.989x` there.
+
+Five-warmup/21-iteration paired A/B measured `1.167x`, `1.164x`, `1.136x`,
+`1.117x`, `1.055x`, `1.086x`, `1.056x`, `1.081x`, and `1.079x` at T7, T16,
+T32, T64, T128, T256, T512, T1024, and T2048. Packed T32 measured `1.140x`,
+`1.139x`, `1.122x`, `1.081x`, `1.064x`, and `1.074x` at B1, B2, B4, B8,
+B16, and B32. Candidate/baseline cosine was at least `0.999979124` for single
+requests and `0.999384940` for packed requests. Caching projection values too
+was rejected: it measured only `1.000x-1.007x` on most shapes and `0.962x` at
+T128 because the additional 48 registers per lane offset the saved read.
+
+### XPU Pass 16: Stable Packed Xe2 Flash Routing
+
+Status: retained for packed batches whose shortest sequence is at least 128
+tokens.
+
+After the Flash launcher began returning an event, the varlen route was
+retested with true forced-mode semantics. The old A/B harness had still applied
+the 256-token auto threshold when `EI_XPU_XE2_FLASH=1`; forced mode now bypasses
+shape thresholds, while auto mode evaluates the shortest sequence in a batch.
+
+Actual Flash at T32 and T64 was faster but remained below the packed parity
+gate at larger batches, reaching repeated minima `0.999310672` and
+`0.999653101`. T128 was stable across three repeated sweeps and measured
+`1.84x-2.75x` at B2-B32. T256 measured `1.22x`, `1.38x`, `3.42x`, `4.39x`, and
+`4.37x` at B2, B4, B8, B16, and B32; T512 measured `1.28x-1.34x` at B2-B8.
+A 20-repeat mixed `[128,129,192,255]` regression had minimum cosine
+`0.999993384`, and `[256,257,384,511]` had minimum `0.999979794`. Auto mode
+therefore keeps the T256 single-sequence crossover and uses a conservative
+T128 minimum for packed batches.
+
+### XPU Pass 17: Runtime Gating and Reproducible Xe2 Build
+
+Status: retained.
+
+The Xe2 binary now queries oneAPI's architecture ID and enables BMG-only
+Flash, W4A16, and 256-GRF residual/RMS defaults only on
+`intel_gpu_bmg_g21`/`intel_gpu_bmg_g31`. Forced Flash or W4 on another
+architecture fails initialization instead of dispatching incompatible device
+code. Portable SYCL builds keep these routes disabled.
+
+`make xpu XPU_XE2_FLASH=1` now fetches public, pinned dependencies into
+`.xpu-deps`: `vllm-xpu-kernels` commit
+`bab46865358da4eda3b866c41dd71a80e878d843` and SYCL-TLA commit
+`cd763790ad2f74d7294435ecf77682bac0062c3a`. Explicit checkout overrides remain
+available. The model-specific Flash translation unit now includes the CUTLASS
+scheduler and kernel directly, avoiding unrelated Torch dtype/paged-cache host
+helpers and removing the PyTorch-header build dependency. A clean managed
+checkout compiled both Flash and W4 and passed the complete Xe2 suite.
+
+### XPU Final Validation
+
+The local CPU suite passed all kernel, tokenizer, service/cache, packed-batch,
+HTTP-dimension, and llama.cpp golden tests; golden minimum cosine was
+`0.999860704`. The Metal suite passed its 29 ready pipelines, goldens at
+minimum cosine `0.999910295`, packed parity `1.0`, and backend/KV/tile checks.
+
+The portable XPU build passed goldens at minimum cosine `0.999909997`,
+CPU/XPU drift at `0.996052265`, projection parity at `0.999995351`, attention
+parity at `0.999996066`, packed parity at `0.999976337`, and HTTP dimensions.
+The pinned Xe2 build passed goldens at `0.999910116`, CPU/XPU drift at
+`0.996102154`, the default T2 W4 route at `0.998495936` versus CPU, projection
+parity at `0.999995410`, attention parity at `0.999997139`, mixed Flash at
+`0.999994040`, boundary Flash at `0.999993622`, packed parity at `0.999941945`,
+HTTP dimensions, and every isolated W4 geometry at `0.999999975` or better.
+
+Final default B60 medians were 1.04 ms at T1, 1.23 ms at T2, 2.17 ms at T32,
+3.57 ms at T256, 5.64 ms at T512, 9.82 ms at T1024, and 20.54 ms at T2048.
+Packed B32 reached about 19,850 requests/s at T1, 109,170 tokens/s at T32, and
+135,860 tokens/s at T128. These are absolute final-state measurements; the
+per-pass claims above use alternating in-process A/B.

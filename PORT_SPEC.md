@@ -105,7 +105,7 @@ llama.cpp deep-read) before implementing.
 - The DB sends texts already prefixed by `ensure_embedding_prefix`:
   `search_document: ` / `search_query: ` / `clustering: ` /
   `classification: `. The engine embeds bytes as given — no templating, ever.
-- Default bind `0.0.0.0:11434` (containers reach the host); configurable
+- Default bind `0.0.0.0:42666` (containers reach the host); configurable
   `--port/--bind`; `EMBEDDING_SERVICE_URL` remains the generic DB-side override.
 - Dynamic batching uses a bounded fit-aware queue scan while always dispatching
   the oldest request. `EI_BATCH_LOOKAHEAD=0` restores strict FIFO diagnostics.

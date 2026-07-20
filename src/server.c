@@ -20,6 +20,7 @@
 
 #define MODEL_URL "https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/embeddinggemma-300M-qat-Q4_0.gguf"
 #define DEFAULT_MODEL_NAME "embeddinggemma-300m"
+#define QUIXIEMBED_DEFAULT_PORT 42666
 #define MAX_BODY_BYTES (16u * 1024u * 1024u)
 #define MAX_HEADER_BYTES (64u * 1024u)
 
@@ -992,9 +993,10 @@ static void usage(const char *argv0) {
         "          [--batch-wait-us N] [--keepalive-connections N]\n"
         "          [--keepalive-max-requests N] [--keepalive-timeout-ms N]\n"
         "          [--response-cache-mb N]\n"
+        "default listen: 0.0.0.0:%d\n"
         "default model: $XDG_CACHE_HOME/embeddinggemma.c/%s\n"
         "               or $HOME/.cache/embeddinggemma.c/%s\n",
-        argv0, "embeddinggemma-300M-qat-Q4_0.gguf",
+        argv0, QUIXIEMBED_DEFAULT_PORT, "embeddinggemma-300M-qat-Q4_0.gguf",
         "embeddinggemma-300M-qat-Q4_0.gguf");
 }
 
@@ -1012,7 +1014,7 @@ static bool parse_size_arg(const char *value, size_t minimum, size_t maximum,
 static bool parse_args(int argc, char **argv, server_opts *opts) {
     bool keepalive_connections_set = false;
     opts->bind_host = "0.0.0.0";
-    opts->port = 11434;
+    opts->port = QUIXIEMBED_DEFAULT_PORT;
     opts->backend = DEFAULT_INFERENCE_BACKEND;
     opts->model_path = NULL;
     opts->workers = 64;

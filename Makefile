@@ -400,7 +400,7 @@ $(BUILD)/rocm:
 $(BUILD)/xpu:
 	mkdir -p $(BUILD)/xpu
 
-.PHONY: test test-unit check test-http test-http-metal test-http-cuda test-http-rocm test-http-xpu test-metal test-cuda test-rocm test-xpu perf perf-engine perf-engine-metal perf-engine-cuda perf-engine-rocm perf-engine-xpu perf-concurrency perf-concurrency-cuda perf-concurrency-rocm perf-concurrency-xpu perf-dimensions perf-batch perf-tokenization metal metal-kernels cuda rocm xpu check-scripts clean clean-cpu clean-metal clean-cuda clean-rocm clean-xpu release-darwin release-linux-cpu release-linux-cuda release-linux-rocm release-linux-xpu release-checksums release-verify release-ready release-info help
+.PHONY: test test-unit test-defaults check test-http test-http-metal test-http-cuda test-http-rocm test-http-xpu test-metal test-cuda test-rocm test-xpu perf perf-engine perf-engine-metal perf-engine-cuda perf-engine-rocm perf-engine-xpu perf-concurrency perf-concurrency-cuda perf-concurrency-rocm perf-concurrency-xpu perf-dimensions perf-batch perf-tokenization metal metal-kernels cuda rocm xpu check-scripts clean clean-cpu clean-metal clean-cuda clean-rocm clean-xpu release-darwin release-linux-cpu release-linux-cuda release-linux-rocm release-linux-xpu release-checksums release-verify release-ready release-info help
 test: $(BUILD)/embeddinggemma $(BUILD)/test_gguf $(BUILD)/test_tokenizer $(BUILD)/test_kernels $(BUILD)/test_embed $(BUILD)/test_batch $(BUILD)/test_inference_service $(BUILD)/test_response_cache
 	python3 testdata/test_model_manifest.py --binary ./$(BUILD)/test_gguf \
 		--model $(MODEL) --manifest testdata/model-manifest.json
@@ -418,7 +418,11 @@ test-unit: $(BUILD)/test_kernels $(BUILD)/test_inference_service $(BUILD)/test_r
 	./$(BUILD)/test_inference_service
 	./$(BUILD)/test_response_cache
 
-check: check-scripts test-unit
+test-defaults: $(BUILD)/embeddinggemma
+	@./$(BUILD)/embeddinggemma --help 2>&1 | \
+		grep -q '^default listen: 0.0.0.0:42666$$'
+
+check: check-scripts test-unit test-defaults
 
 test-http: $(BUILD)/embeddinggemma
 	python3 testdata/test_http_dimensions.py --binary ./$(BUILD)/embeddinggemma \

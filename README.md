@@ -36,7 +36,7 @@ Override automatic selection or pin a release when needed:
 
 ```sh
 ./install.sh --variant cpu
-./install.sh --version v0.2.4
+./install.sh --version v0.2.5
 ./install.sh --install-dir "$HOME/bin"
 ```
 
@@ -543,32 +543,35 @@ single-engine route reaches 206,011 input tok/s.
 
 ## Run
 
+The canonical quixiembed HTTP port is `42666`. Every backend uses it by
+default; `--port` remains available for deployments that need an override.
+
 ```sh
-./build/embeddinggemma --bind 0.0.0.0 --port 11434
+./build/embeddinggemma --bind 0.0.0.0 --port 42666
 ```
 
 Metal:
 
 ```sh
-./build/embeddinggemma-metal --bind 0.0.0.0 --port 11434
+./build/embeddinggemma-metal --bind 0.0.0.0 --port 42666
 ```
 
 CUDA:
 
 ```sh
-./build/embeddinggemma-cuda --bind 0.0.0.0 --port 11434
+./build/embeddinggemma-cuda --bind 0.0.0.0 --port 42666
 ```
 
 ROCm:
 
 ```sh
-./build/embeddinggemma-rocm --bind 0.0.0.0 --port 11434
+./build/embeddinggemma-rocm --bind 0.0.0.0 --port 42666
 ```
 
 XPU SYCL:
 
 ```sh
-./build/embeddinggemma-xpu --bind 0.0.0.0 --port 11434
+./build/embeddinggemma-xpu --bind 0.0.0.0 --port 42666
 ```
 
 Serving controls:
@@ -614,7 +617,7 @@ safe.
 Example request:
 
 ```sh
-curl -sS -X POST http://127.0.0.1:11434/api/embed \
+curl -sS -X POST http://127.0.0.1:42666/api/embed \
   -H 'Content-Type: application/json' \
   -d '{"model":"embeddinggemma-300m","input":["search_query: what powers the cell"],"dimensions":256}'
 ```
@@ -630,7 +633,7 @@ array response above. `"base64"` returns each embedding as a base64 string
 containing exactly `dimensions * 4` little-endian IEEE-754 float32 bytes:
 
 ```sh
-curl -sS -X POST http://127.0.0.1:11434/api/embed \
+curl -sS -X POST http://127.0.0.1:42666/api/embed \
   -H 'Content-Type: application/json' \
   -d '{"input":["search_query: what powers the cell"],"dimensions":256,"encoding_format":"base64"}'
 ```

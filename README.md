@@ -1,4 +1,4 @@
-# embeddinggemma
+# embeddinggemma.c
 
 **The fastest way to serve EmbeddingGemma. Anywhere.**
 

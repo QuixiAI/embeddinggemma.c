@@ -96,21 +96,21 @@ runtime is unavailable.
 Pin a release, backend, or installation directory when needed:
 
 ```sh
-./install.sh --version v0.2.5
+./install.sh --version v0.3.0
 ./install.sh --variant cpu
 ./install.sh --install-dir "$HOME/bin"
 ```
 
-Published executables are deliberately small. Release `v0.2.5` contains:
+Published executables are deliberately small. Release `v0.3.0` contains:
 
 | platform | backend | executable size |
 |---|---|---:|
-| macOS ARM64 | CPU | 123 KiB |
-| macOS ARM64 | Metal | 400 KiB |
-| Linux x86_64 | CPU | 98 KiB |
+| macOS ARM64 | CPU | 139 KiB |
+| macOS ARM64 | Metal | 497 KiB |
+| Linux x86_64 | CPU | 106 KiB |
 | Linux x86_64 | CUDA | 8.7 MiB |
 | Linux x86_64 | ROCm | 1.2 MiB |
-| Linux x86_64 | XPU SYCL | 2.0 MiB |
+| Linux x86_64 | XPU SYCL | 2.1 MiB |
 
 The 278 MB Q4_0 model is downloaded separately from Hugging Face and is not
 distributed by this project.

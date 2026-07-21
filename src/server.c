@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "engine.h"
+#include "float_format.h"
 #include "http_docs.h"
 #include "inference_service.h"
 #include "response_cache.h"
@@ -10,7 +11,9 @@
 #include <errno.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/uio.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -412,21 +415,34 @@ static bool parse_embed_request(const char *body, string_list *inputs,
     return true;
 }
 
-static void send_all(int fd, const char *buf, size_t n) {
-    while (n > 0) {
-        ssize_t sent = send(fd, buf, n, 0);
+static void send_header_and_body(int fd, const char *hdr, size_t hdr_len,
+                                 const char *body, size_t body_len) {
+    struct iovec iov[2] = {
+        {(void *)(uintptr_t)hdr, hdr_len},
+        {(void *)(uintptr_t)body, body_len},
+    };
+    int index = 0;
+    while (index < 2) {
+        ssize_t sent = writev(fd, iov + index, 2 - index);
         if (sent < 0) {
             if (errno == EINTR) continue;
             return;
         }
-        buf += sent;
-        n -= (size_t)sent;
+        size_t remaining = (size_t)sent;
+        while (index < 2 && remaining >= iov[index].iov_len) {
+            remaining -= iov[index].iov_len;
+            index++;
+        }
+        if (index < 2) {
+            iov[index].iov_base = (char *)iov[index].iov_base + remaining;
+            iov[index].iov_len -= remaining;
+        }
     }
 }
 
-static void http_response_typed(int fd, int status, const char *reason,
-                                const char *content_type, const char *body,
-                                bool keep_alive) {
+static void http_response_raw(int fd, int status, const char *reason,
+                              const char *content_type, const char *body,
+                              size_t body_len, bool keep_alive) {
     char hdr[512];
     int n = snprintf(hdr, sizeof hdr,
         "HTTP/1.1 %d %s\r\n"
@@ -435,10 +451,17 @@ static void http_response_typed(int fd, int status, const char *reason,
         "Content-Length: %zu\r\n"
         "Connection: %s\r\n"
         "\r\n",
-        status, reason, content_type, strlen(body),
+        status, reason, content_type, body_len,
         keep_alive ? "keep-alive" : "close");
-    if (n > 0) send_all(fd, hdr, (size_t)n);
-    send_all(fd, body, strlen(body));
+    if (n <= 0) return;
+    send_header_and_body(fd, hdr, (size_t)n, body, body_len);
+}
+
+static void http_response_typed(int fd, int status, const char *reason,
+                                const char *content_type, const char *body,
+                                bool keep_alive) {
+    http_response_raw(fd, status, reason, content_type, body, strlen(body),
+                      keep_alive);
 }
 
 static void http_response(int fd, int status, const char *reason,
@@ -545,6 +568,10 @@ static http_read_result read_request(http_connection *connection,
         ssize_t n = recv(connection->fd, tmp, sizeof tmp, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+                connection->buffered.n == 0) {
+                return HTTP_READ_CLOSED;
+            }
             snprintf(err, err_len, "failed to read request");
             return HTTP_READ_ERROR;
         }
@@ -662,7 +689,9 @@ static void handle_embed(int fd, ei_inference_service *service,
         ei_response_cache_value cached;
         if (ei_response_cache_acquire(
                 response_cache, body, body_len, &cached)) {
-            http_response(fd, 200, "OK", cached.data, keep_alive);
+            http_response_raw(fd, 200, "OK",
+                              "application/json; charset=utf-8",
+                              cached.data, cached.len, keep_alive);
             ei_response_cache_release(response_cache, &cached);
             free_inputs(&inputs);
             return;
@@ -687,6 +716,7 @@ static void handle_embed(int fd, ei_inference_service *service,
     }
 
     sbuf out = {0};
+    sbuf_reserve(&out, inputs.n * ((size_t)dimensions * 16u + 3u) + 32u);
     sbuf_append_z(&out, "{\"embeddings\":[");
     for (size_t i = 0; i < inputs.n; i++) {
         float *emb = embeddings + i * EI_N_EMBD;
@@ -708,9 +738,10 @@ static void handle_embed(int fd, ei_inference_service *service,
         } else {
             sbuf_append_z(&out, "[");
             for (int32_t d = 0; d < dimensions; d++) {
-                char num[32];
-                int n = snprintf(num, sizeof num, "%s%.9g", d ? "," : "", emb[d]);
-                if (n < 0 || (size_t)n >= sizeof num) {
+                if (d) sbuf_append(&out, ",", 1);
+                sbuf_reserve(&out, EI_F32_TO_CHARS_CAPACITY);
+                const size_t n = ei_f32_to_chars(out.data + out.n, emb[d]);
+                if (n == 0) {
                     free_inputs(&inputs);
                     free(embeddings);
                     free(lengths);
@@ -720,7 +751,8 @@ static void handle_embed(int fd, ei_inference_service *service,
                                "failed to format embedding", keep_alive);
                     return;
                 }
-                sbuf_append(&out, num, (size_t)n);
+                out.n += n;
+                out.data[out.n] = '\0';
             }
             sbuf_append_z(&out, "]");
         }
@@ -730,7 +762,8 @@ static void handle_embed(int fd, ei_inference_service *service,
         ei_response_cache_insert(
             response_cache, body, body_len, out.data, out.n);
     }
-    http_response(fd, 200, "OK", out.data, keep_alive);
+    http_response_raw(fd, 200, "OK", "application/json; charset=utf-8",
+                      out.data, out.n, keep_alive);
     free(out.data);
     free(embeddings);
     free(lengths);
@@ -1043,7 +1076,7 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
     opts->cache_entries = 4096;
     opts->max_batch_tokens = 4096;
     opts->max_batch_requests = 64;
-    opts->max_batch_sequence_tokens = 512;
+    opts->max_batch_sequence_tokens = 1024;
     opts->max_client_batch_size = 32;
     opts->tokenizer_workers = 8;
     opts->batch_wait_us = 200;
@@ -1211,20 +1244,18 @@ static void keepalive_limiter_release(keepalive_limiter *limiter) {
     pthread_mutex_unlock(&limiter->mutex);
 }
 
-static bool wait_for_next_request(int fd, uint32_t timeout_ms) {
-    struct pollfd descriptor = { .fd = fd, .events = POLLIN };
-    int result;
-    do {
-        result = poll(&descriptor, 1, (int)timeout_ms);
-    } while (result < 0 && errno == EINTR);
-    return result > 0 && (descriptor.revents & POLLIN) != 0;
-}
-
 static void *server_worker_main(void *opaque) {
     server_worker *worker = opaque;
     for (;;) {
         int fd = socket_queue_pop(worker->queue);
         http_connection connection = { .fd = fd };
+        struct timeval receive_timeout = {
+            .tv_sec = worker->opts->keepalive_timeout_ms / 1000u,
+            .tv_usec = (suseconds_t)(
+                worker->opts->keepalive_timeout_ms % 1000u) * 1000,
+        };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+                   sizeof receive_timeout);
         bool keepalive_slot = worker->opts->keepalive_max_requests > 1 &&
             keepalive_limiter_try_acquire(worker->keepalive);
         for (size_t request = 0;; request++) {
@@ -1232,10 +1263,6 @@ static void *server_worker_main(void *opaque) {
                 request + 1u < worker->opts->keepalive_max_requests;
             if (!handle_client(&connection, worker->service, worker->opts,
                                worker->response_cache, allow_keep_alive)) {
-                break;
-            }
-            if (connection.buffered.n == 0 &&
-                !wait_for_next_request(fd, worker->opts->keepalive_timeout_ms)) {
                 break;
             }
         }
@@ -1338,6 +1365,10 @@ int main(int argc, char **argv) {
             opts.response_cache_bytes / (1024u * 1024u));
     for (;;) {
         int c = accept(s, NULL, NULL);
+        if (c >= 0) {
+            int nodelay = 1;
+            setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof nodelay);
+        }
         if (c < 0) {
             if (errno == EINTR) continue;
             fprintf(stderr, "accept failed: %s\n", strerror(errno));

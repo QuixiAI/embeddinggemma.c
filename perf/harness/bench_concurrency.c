@@ -254,7 +254,7 @@ int main(int argc, char **argv) {
     int32_t min_requests = 4;
     int32_t max_batch_tokens = 4096;
     int32_t max_batch_requests = 64;
-    int32_t max_batch_sequence_tokens = 512;
+    int32_t max_batch_sequence_tokens = 1024;
     int32_t batch_wait_us = 200;
 
     for (int i = 1; i < argc; i++) {

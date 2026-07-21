@@ -29,10 +29,11 @@ kernel void ei_kv_f32_to_f16(
     device const float *v [[buffer(1)]],
     device half *k_f16 [[buffer(2)]],
     device half *v_f16 [[buffer(3)]],
-    constant uint &count [[buffer(4)]],
+    constant uint &valid_count [[buffer(4)]],
+    constant uint &storage_count [[buffer(5)]],
     uint tid [[thread_position_in_grid]]) {
-    if (tid < count) {
-        k_f16[tid] = half(k[tid]);
-        v_f16[tid] = half(v[tid]);
+    if (tid < storage_count) {
+        k_f16[tid] = tid < valid_count ? half(k[tid]) : 0.0h;
+        v_f16[tid] = tid < valid_count ? half(v[tid]) : 0.0h;
     }
 }

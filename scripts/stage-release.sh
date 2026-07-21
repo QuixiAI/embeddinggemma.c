@@ -56,6 +56,8 @@ if [ "$platform" = darwin ]; then
     if [ "$variant" = metal ]; then
         otool -l "$temporary" | grep -q '__metallib' ||
             die 'Metal release binary has no embedded __metallib section'
+        otool -l "$temporary" | grep -q '__metal4lib' ||
+            die 'Metal release binary has no embedded __metal4lib section'
     fi
 else
     strip --strip-unneeded "$temporary"

@@ -61,9 +61,10 @@ export DEVELOPER_DIR
 endif
 endif
 
-# QuixiCore-Metal-style build: compile every Metal translation unit into one
-# metallib, then embed it into each Metal executable as a Mach-O section.
+# Compile the portable Metal 3.1 kernels and Metal 4 fast paths separately,
+# then embed both libraries into each self-contained Metal executable.
 METAL_FLAGS ?= -std=metal3.1 -O2 -Wall -Wextra -fno-fast-math
+METAL4_FLAGS ?= -std=metal4.0 -O2 -Wall -Wextra -fno-fast-math
 METAL_INCLUDE_DIR := src/metal/include
 METAL_SOURCES := \
 	src/metal/kernels/embedding.metal \
@@ -75,7 +76,14 @@ METAL_SOURCES := \
 	src/metal/kernels/pool.metal
 METAL_HEADERS := $(wildcard $(METAL_INCLUDE_DIR)/*.metal)
 METALLIB := $(BUILD)/embeddinggemma.metallib
-METALLIB_LDFLAGS := -Wl,-sectcreate,__DATA,__metallib,$(abspath $(METALLIB))
+METAL4_SOURCES := \
+	src/metal4/kernels/tensor_qgemm.metal \
+	src/metal4/kernels/flash_attention.metal
+METAL4_METALLIB := $(BUILD)/embeddinggemma-metal4.metallib
+METAL_LIBRARIES := $(METALLIB) $(METAL4_METALLIB)
+METALLIB_LDFLAGS := \
+	-Wl,-sectcreate,__DATA,__metallib,$(abspath $(METALLIB)) \
+	-Wl,-sectcreate,__DATA,__metal4lib,$(abspath $(METAL4_METALLIB))
 OBJC ?= clang
 OBJCFLAGS ?= -O2 -Wall -Wextra -Werror -fobjc-arc
 METAL_FRAMEWORKS := -framework Foundation -framework Metal
@@ -85,7 +93,7 @@ SRCS_MODEL := $(SRCS_CORE) src/model.c
 SRCS_TOKENIZER := $(SRCS_MODEL) src/tokenizer.c
 SRCS_ENGINE := $(SRCS_TOKENIZER) src/quants.c src/kernels.c src/parallel.c src/engine.c
 SRCS_SERVICE := src/inference_service.c
-SRCS_SERVER := src/server.c src/response_cache.c
+SRCS_SERVER := src/server.c src/response_cache.c src/float_format.c
 
 CUDA_CORE_OBJS := $(patsubst src/%.c,$(BUILD)/cuda/%.o,$(SRCS_ENGINE))
 CUDA_SERVICE_OBJS := $(patsubst src/%.c,$(BUILD)/cuda/%.o,$(SRCS_SERVICE))
@@ -179,6 +187,9 @@ $(BUILD)/test_inference_service: src/test_inference_service.c $(SRCS_SERVICE) sr
 
 $(BUILD)/test_response_cache: src/test_response_cache.c src/response_cache.c src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_response_cache.c src/response_cache.c src/gguf.c $(LDLIBS)
+
+$(BUILD)/test_float_format: src/test_float_format.c src/float_format.c src/float_format.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/test_float_format.c src/float_format.c $(LDLIBS)
 
 $(BUILD)/cuda/%.o: src/%.c src/*.h | $(BUILD)/cuda
 	$(CC) $(CFLAGS) -DEI_ENABLE_CUDA -Isrc -c -o $@ $<
@@ -335,20 +346,20 @@ $(BUILD)/perf_concurrency_xpu: $(BUILD)/xpu/perf_concurrency.o $(XPU_CORE_OBJS) 
 $(BUILD)/engine_metal.o: src/engine_metal.m src/engine_metal.h src/model.h src/gguf.h | $(BUILD)
 	$(OBJC) $(OBJCFLAGS) -Isrc -c -o $@ $<
 
-$(BUILD)/embeddinggemma-metal: $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
+$(BUILD)/embeddinggemma-metal: $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ $(SRCS_SERVER) $(SRCS_ENGINE) \
 		$(SRCS_SERVICE) $(BUILD)/engine_metal.o $(LDLIBS) \
 		$(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
-$(BUILD)/test_embed_metal: src/test_embed.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
+$(BUILD)/test_embed_metal: src/test_embed.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/test_embed.c $(SRCS_ENGINE) \
 		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
-$(BUILD)/test_backend_parity_metal: src/test_backend_parity.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
+$(BUILD)/test_backend_parity_metal: src/test_backend_parity.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/test_backend_parity.c $(SRCS_ENGINE) \
 		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
-$(BUILD)/test_batch_metal: src/test_batch.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
+$(BUILD)/test_batch_metal: src/test_batch.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/test_batch.c $(SRCS_ENGINE) \
 		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
@@ -358,14 +369,14 @@ $(BUILD)/perf_kernels: perf/harness/bench_kernels.c src/quants.c src/kernels.c s
 $(BUILD)/perf_engine: perf/harness/bench_engine.c $(SRCS_ENGINE) src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_engine.c $(SRCS_ENGINE) $(LDLIBS)
 
-$(BUILD)/perf_engine_metal: perf/harness/bench_engine.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
+$(BUILD)/perf_engine_metal: perf/harness/bench_engine.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -Isrc -o $@ perf/harness/bench_engine.c $(SRCS_ENGINE) \
 		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
 $(BUILD)/perf_concurrency: perf/harness/bench_concurrency.c $(SRCS_ENGINE) $(SRCS_SERVICE) src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_concurrency.c $(SRCS_ENGINE) $(SRCS_SERVICE) $(LDLIBS)
 
-$(BUILD)/perf_concurrency_metal: perf/harness/bench_concurrency.c $(SRCS_ENGINE) $(SRCS_SERVICE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
+$(BUILD)/perf_concurrency_metal: perf/harness/bench_concurrency.c $(SRCS_ENGINE) $(SRCS_SERVICE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -Isrc -o $@ perf/harness/bench_concurrency.c $(SRCS_ENGINE) \
 		$(SRCS_SERVICE) $(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) \
 		$(METAL_FRAMEWORKS)
@@ -373,7 +384,7 @@ $(BUILD)/perf_concurrency_metal: perf/harness/bench_concurrency.c $(SRCS_ENGINE)
 $(BUILD)/perf_batch: perf/harness/bench_batch.c $(SRCS_ENGINE) src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_batch.c $(SRCS_ENGINE) $(LDLIBS)
 
-$(BUILD)/perf_batch_metal: perf/harness/bench_batch.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METALLIB) | $(BUILD)
+$(BUILD)/perf_batch_metal: perf/harness/bench_batch.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -Isrc -o $@ perf/harness/bench_batch.c $(SRCS_ENGINE) \
 		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
@@ -387,6 +398,13 @@ $(METALLIB): $(METAL_SOURCES) $(METAL_HEADERS) | $(BUILD)
 		exit 1; \
 	}
 	xcrun -sdk macosx metal $(METAL_FLAGS) -I$(METAL_INCLUDE_DIR) $(METAL_SOURCES) -o $@
+
+$(METAL4_METALLIB): $(METAL4_SOURCES) | $(BUILD)
+	@xcrun --find metal >/dev/null 2>&1 || { \
+		echo "error: Metal compiler not found; install/select full Xcode with xcode-select" >&2; \
+		exit 1; \
+	}
+	xcrun -sdk macosx metal $(METAL4_FLAGS) $(METAL4_SOURCES) -o $@
 
 $(BUILD)/test_metal: src/test_metal.m | $(BUILD)
 	$(OBJC) $(OBJCFLAGS) -framework Foundation -framework Metal -o $@ $<
@@ -403,8 +421,8 @@ $(BUILD)/rocm:
 $(BUILD)/xpu:
 	mkdir -p $(BUILD)/xpu
 
-.PHONY: test test-unit test-defaults check test-http test-http-metal test-http-cuda test-http-rocm test-http-xpu test-metal test-cuda test-rocm test-xpu perf perf-engine perf-engine-metal perf-engine-cuda perf-engine-rocm perf-engine-xpu perf-concurrency perf-concurrency-cuda perf-concurrency-rocm perf-concurrency-xpu perf-dimensions perf-batch perf-tokenization perf-servers metal metal-kernels cuda rocm xpu check-scripts clean clean-cpu clean-metal clean-cuda clean-rocm clean-xpu release-darwin release-linux-cpu release-linux-cuda release-linux-rocm release-linux-xpu release-checksums release-verify release-ready release-info help
-test: $(BUILD)/embeddinggemma $(BUILD)/test_gguf $(BUILD)/test_tokenizer $(BUILD)/test_kernels $(BUILD)/test_embed $(BUILD)/test_batch $(BUILD)/test_inference_service $(BUILD)/test_response_cache
+.PHONY: test test-unit test-defaults check test-http test-http-metal test-http-cuda test-http-rocm test-http-xpu test-metal test-cuda test-rocm test-xpu perf perf-engine perf-engine-metal perf-engine-cuda perf-engine-rocm perf-engine-xpu perf-concurrency perf-concurrency-cuda perf-concurrency-rocm perf-concurrency-xpu perf-dimensions perf-batch perf-tokenization perf-servers perf-compare-llamacpp metal metal-kernels cuda rocm xpu check-scripts clean clean-cpu clean-metal clean-cuda clean-rocm clean-xpu release-darwin release-linux-cpu release-linux-cuda release-linux-rocm release-linux-xpu release-checksums release-verify release-ready release-info help
+test: $(BUILD)/embeddinggemma $(BUILD)/test_gguf $(BUILD)/test_tokenizer $(BUILD)/test_kernels $(BUILD)/test_embed $(BUILD)/test_batch $(BUILD)/test_inference_service $(BUILD)/test_response_cache $(BUILD)/test_float_format
 	python3 testdata/test_model_manifest.py --binary ./$(BUILD)/test_gguf \
 		--model $(MODEL) --manifest testdata/model-manifest.json
 	./$(BUILD)/test_tokenizer $(MODEL) testdata/goldens-tokens.json
@@ -413,13 +431,15 @@ test: $(BUILD)/embeddinggemma $(BUILD)/test_gguf $(BUILD)/test_tokenizer $(BUILD
 	./$(BUILD)/test_batch $(MODEL) cpu
 	./$(BUILD)/test_inference_service
 	./$(BUILD)/test_response_cache
+	./$(BUILD)/test_float_format
 	python3 testdata/test_http_dimensions.py --binary ./$(BUILD)/embeddinggemma \
 		--model $(MODEL) --backend cpu
 
-test-unit: $(BUILD)/test_kernels $(BUILD)/test_inference_service $(BUILD)/test_response_cache
+test-unit: $(BUILD)/test_kernels $(BUILD)/test_inference_service $(BUILD)/test_response_cache $(BUILD)/test_float_format
 	./$(BUILD)/test_kernels
 	./$(BUILD)/test_inference_service
 	./$(BUILD)/test_response_cache
+	./$(BUILD)/test_float_format
 
 test-defaults: $(BUILD)/embeddinggemma
 	@./$(BUILD)/embeddinggemma --help 2>&1 | \
@@ -492,7 +512,12 @@ perf-servers:
 	python3 perf/bench_servers.py --url $(PERF_SERVER_URL) \
 		--api $(PERF_SERVER_API) --model $(PERF_SERVER_MODEL)
 
-metal-kernels: $(METALLIB)
+perf-compare-llamacpp: $(BUILD)/embeddinggemma-metal
+	python3 perf/compare_llamacpp.py --model $(MODEL) \
+		--embeddinggemma-bin $(BUILD)/embeddinggemma-metal \
+		--llama-server $(HOME)/llama.cpp/build/bin/llama-server
+
+metal-kernels: $(METAL_LIBRARIES)
 
 metal: $(BUILD)/embeddinggemma-metal
 
@@ -502,8 +527,15 @@ rocm: $(BUILD)/embeddinggemma-rocm
 
 xpu: $(BUILD)/embeddinggemma-xpu
 
-test-metal: $(METALLIB) $(BUILD)/test_metal $(BUILD)/test_embed_metal $(BUILD)/test_backend_parity_metal $(BUILD)/test_batch_metal
+test-metal: $(METAL_LIBRARIES) $(BUILD)/test_metal $(BUILD)/test_embed_metal $(BUILD)/test_backend_parity_metal $(BUILD)/test_batch_metal
 	./$(BUILD)/test_metal $(METALLIB)
+	./$(BUILD)/test_metal $(METAL4_METALLIB) ei_q4_0_f32_tensor_mm
+	./$(BUILD)/test_metal $(METAL4_METALLIB) ei_q4_0_f32_tensor_mm_64
+	./$(BUILD)/test_metal $(METAL4_METALLIB) ei_q4_0_f32_qkv_tensor_mm
+	./$(BUILD)/test_metal $(METAL4_METALLIB) ei_q4_0_f32_qkv_tensor_mm_64
+	./$(BUILD)/test_metal $(METAL4_METALLIB) ei_q4_0_f32_up_gate_tensor_mm
+	./$(BUILD)/test_metal $(METAL4_METALLIB) ei_q4_0_f32_up_gate_tensor_mm_64
+	./$(BUILD)/test_metal $(METAL4_METALLIB) ei_flash_attention_f16_kv_256
 	EI_BACKEND=metal ./$(BUILD)/test_embed_metal $(MODEL) testdata/goldens-llamacpp.json
 	./$(BUILD)/test_backend_parity_metal $(MODEL)
 	./$(BUILD)/test_batch_metal $(MODEL) metal
@@ -539,7 +571,7 @@ clean-cpu:
 	rm -f $(BUILD)/embeddinggemma
 
 clean-metal:
-	rm -f $(METALLIB) $(BUILD)/engine_metal.o $(BUILD)/*metal $(BUILD)/*metal.o
+	rm -f $(METAL_LIBRARIES) $(BUILD)/engine_metal.o $(BUILD)/*metal $(BUILD)/*metal.o
 
 clean-cuda:
 	rm -rf $(BUILD)/cuda
@@ -618,6 +650,7 @@ help:
 		'make test | test-BACKEND          Run correctness and HTTP tests' \
 		'make perf-*                       Run kernel, engine, batch, or concurrency benchmarks' \
 		'make perf-servers                 Benchmark a running embedding HTTP server' \
+		'make perf-compare-llamacpp        Compare Metal HTTP throughput with llama.cpp' \
 		'make clean-BACKEND                Remove backend objects before changing build flags' \
 		'make release-darwin               Stage Darwin ARM64 CPU and Metal executables' \
 		'make release-linux-BACKEND        Stage a Linux x86_64 executable' \

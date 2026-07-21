@@ -87,10 +87,13 @@ int main(int argc, char **argv) {
 
     unsetenv("EI_METAL_GEMV_R4_MIN_TOKENS");
     setenv("EI_METAL_FP16_KV_MIN_TOKENS", "65536", 1);
+    setenv("EI_METAL_FLASH_ATTN_MIN_TOKENS", "65536", 1);
     ei_engine_load_backend(&metal_kv_f32, argv[1], "metal");
     setenv("EI_METAL_FP16_KV_MIN_TOKENS", "1", 1);
+    setenv("EI_METAL_FLASH_ATTN_MIN_TOKENS", "1", 1);
     ei_engine_load_backend(&metal_kv_f16, argv[1], "metal");
     unsetenv("EI_METAL_FP16_KV_MIN_TOKENS");
+    unsetenv("EI_METAL_FLASH_ATTN_MIN_TOKENS");
     const int32_t kv_shapes[] = { 1024, 2048 };
     float minimum_kv = 1.0f;
     for (size_t shape = 0; shape < sizeof(kv_shapes) / sizeof(kv_shapes[0]); shape++) {
@@ -104,11 +107,12 @@ int main(int argc, char **argv) {
                                     f32_output, err, sizeof err) ||
             !ei_engine_embed_tokens(&metal_kv_f16, ids, (size_t)tokens,
                                     f16_output, err, sizeof err)) {
-            ei_die("Metal K/V parity T=%d failed: %s", tokens, err);
+            ei_die("Metal attention parity T=%d failed: %s", tokens, err);
         }
         float similarity = cosine(f32_output, f16_output);
         if (similarity < minimum_kv) minimum_kv = similarity;
-        printf("Metal K/V parity T=%d f32/f16 %.9f\n", tokens, similarity);
+        printf("Metal attention parity T=%d legacy/flash %.9f\n",
+               tokens, similarity);
         free(ids);
         if (similarity < 0.99999f) {
             ei_engine_free(&metal_kv_f16);
@@ -155,7 +159,7 @@ int main(int argc, char **argv) {
         }
     }
     printf("synthetic backend drift: cpu/metal %.9f, production/R1 %.9f, "
-           "f32/f16 K/V %.9f, tile8/tile16 %.9f\n",
+           "legacy/flash attention %.9f, tile8/tile16 %.9f\n",
            minimum_cpu_metal, minimum_r1_r4, minimum_kv, minimum_tile);
     ei_engine_free(&metal16);
     ei_engine_free(&metal8);

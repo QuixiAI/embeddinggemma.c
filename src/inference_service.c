@@ -61,9 +61,14 @@ struct ei_inference_service {
     bool stopping;
     bool batch_lookahead;
     bool adaptive_batch_wait;
+    bool batch_wave;
+    bool solo_inline;
     bool backend_busy;
     uint64_t batch_hot_until_ns;
     uint64_t batch_hot_window_ns;
+    uint64_t batch_wait_cap_ns;
+    size_t active_requests;
+    size_t active_peak;
 
     pthread_mutex_t tokenizer_mutex;
     pthread_cond_t tokenizer_ready;
@@ -197,10 +202,17 @@ static void mark_batch_hot(ei_inference_service *service) {
         ? UINT64_MAX : now + service->batch_hot_window_ns;
 }
 
+static size_t expected_wave(const ei_inference_service *service);
+
 static bool should_collect_batch(const ei_inference_service *service) {
     if (service->config.batch_wait_us == 0) return false;
     if (!service->adaptive_batch_wait) return true;
     if (service->queue_head && service->queue_head->queue_next) return true;
+    if (service->batch_wave &&
+        service->active_requests > service->queued_requests &&
+        expected_wave(service) > service->queued_requests) {
+        return true;
+    }
     return monotonic_ns() < service->batch_hot_until_ns;
 }
 
@@ -208,10 +220,28 @@ static size_t batch_lookahead_limit(size_t max_requests) {
     return max_requests <= SIZE_MAX / 8u ? max_requests * 8u : SIZE_MAX;
 }
 
+static size_t expected_wave(const ei_inference_service *service) {
+    size_t wave = service->active_peak;
+    return wave < service->config.max_batch_requests
+        ? wave : service->config.max_batch_requests;
+}
+
+static void note_active_request_locked(ei_inference_service *service,
+                                       size_t count) {
+    service->active_requests += count;
+    if (service->active_requests > service->active_peak) {
+        service->active_peak = service->active_requests;
+    }
+}
+
 static bool batch_collection_ready(const ei_inference_service *service) {
     const cache_entry *entry = service->queue_head;
     if (!entry) return false;
     if (entry->n_tokens > service->config.max_batch_sequence_tokens) return true;
+    if (service->batch_wave) {
+        size_t wave = expected_wave(service);
+        if (wave > 0 && service->queued_requests >= wave) return true;
+    }
 
     if (service->batch_lookahead) {
         size_t requests = 1;
@@ -294,19 +324,40 @@ static void *backend_main(void *opaque) {
 
     pthread_mutex_lock(&service->mutex);
     for (;;) {
-        while (!service->stopping && !service->queue_head) {
+        // backend_busy also covers a solo inline execution on a worker
+        // thread; dispatching concurrently would race on the engine. Inline
+        // completion always signals queue_ready, so waiting on busy is safe
+        // even during shutdown.
+        while ((!service->queue_head && !service->stopping) ||
+               service->backend_busy) {
             pthread_cond_wait(&service->queue_ready, &service->mutex);
         }
-        if (service->stopping && !service->queue_head) break;
+        if (!service->queue_head) break;
 
         if (should_collect_batch(service)) {
-            struct timespec deadline;
-            collection_deadline(service->config.batch_wait_us, &deadline);
+            const uint64_t wait_ns =
+                (uint64_t)service->config.batch_wait_us * 1000ull;
+            const uint64_t start_ns = monotonic_ns();
+            const uint64_t cap_ns = start_ns + service->batch_wait_cap_ns;
+            uint64_t deadline_ns = start_ns + wait_ns;
+            size_t seen_queued = service->queued_requests;
             while (!service->stopping && !batch_collection_ready(service)) {
+                uint64_t now = monotonic_ns();
+                if (service->queued_requests > seen_queued) {
+                    seen_queued = service->queued_requests;
+                    uint64_t extended = now + wait_ns;
+                    if (extended > cap_ns) extended = cap_ns;
+                    if (extended > deadline_ns) deadline_ns = extended;
+                }
+                if (now >= deadline_ns) break;
+                struct timespec deadline;
+                collection_deadline(
+                    (uint32_t)((deadline_ns - now) / 1000ull) + 1u, &deadline);
                 int rc = pthread_cond_timedwait(
                     &service->queue_ready, &service->mutex, &deadline);
-                if (rc == ETIMEDOUT) break;
-                if (rc != 0) ei_die("batch collection wait failed: %s", strerror(rc));
+                if (rc != 0 && rc != ETIMEDOUT) {
+                    ei_die("batch collection wait failed: %s", strerror(rc));
+                }
             }
         }
 
@@ -393,6 +444,7 @@ static void *backend_main(void *opaque) {
         }
         pthread_mutex_lock(&service->mutex);
         service->backend_busy = false;
+        service->active_peak = service->active_requests;
         service->stats.batches++;
         service->stats.sequences += batch_size;
         service->stats.tokens += total_tokens;
@@ -438,6 +490,15 @@ ei_inference_service *ei_inference_service_create(
     const char *adaptive_wait = getenv("EI_ADAPTIVE_BATCH_WAIT");
     service->adaptive_batch_wait = !adaptive_wait ||
         strcmp(adaptive_wait, "0") != 0;
+    const char *wave = getenv("EI_BATCH_WAVE");
+    service->batch_wave = !wave || strcmp(wave, "0") != 0;
+    const char *solo = getenv("EI_SOLO_INLINE");
+    service->solo_inline = !solo || strcmp(solo, "0") != 0;
+    const char *wait_cap = getenv("EI_BATCH_WAIT_MAX_US");
+    uint64_t cap_us = wait_cap ? strtoull(wait_cap, NULL, 10)
+                               : (uint64_t)config->batch_wait_us * 4ull;
+    if (cap_us < config->batch_wait_us) cap_us = config->batch_wait_us;
+    service->batch_wait_cap_ns = cap_us * 1000ull;
     uint64_t wait_ns = (uint64_t)config->batch_wait_us * 1000ull;
     service->batch_hot_window_ns = wait_ns > 100000ull
         ? wait_ns * 10ull : 1000000ull;
@@ -541,6 +602,48 @@ static cache_entry *submit_tokens_locked(ei_inference_service *service,
     return entry;
 }
 
+static bool try_execute_solo_locked(ei_inference_service *service,
+                                    cache_entry *entry) {
+    if (!service->solo_inline || service->backend_busy) return false;
+    if (entry->state != EI_ENTRY_PENDING) return false;
+    if (service->queue_head != entry || entry->queue_next) return false;
+    if (service->queued_requests != 1) return false;
+    if (expected_wave(service) > 1) return false;
+    service->queue_head = NULL;
+    service->queue_tail = NULL;
+    service->queued_requests = 0;
+    service->backend_busy = true;
+    pthread_mutex_unlock(&service->mutex);
+
+    size_t offsets[2] = {0, entry->n_tokens};
+    float output[EI_N_EMBD];
+    char error[256];
+    bool ok = service->execute(service->execute_opaque, entry->ids, offsets,
+                               1, output, error, sizeof error);
+
+    pthread_mutex_lock(&service->mutex);
+    service->backend_busy = false;
+    service->active_peak = service->active_requests;
+    service->stats.batches++;
+    service->stats.sequences++;
+    service->stats.tokens += entry->n_tokens;
+    if (ok) {
+        memcpy(entry->embedding, output, sizeof(entry->embedding));
+        entry->state = EI_ENTRY_READY;
+        lru_push_front(service, entry);
+        service->ready_entries++;
+    } else {
+        entry->state = EI_ENTRY_FAILED;
+        snprintf(entry->error, sizeof entry->error, "%s", error);
+    }
+    pthread_cond_broadcast(&entry->done);
+    // The backend waits out backend_busy (including during shutdown); wake
+    // it so it can drain anything that queued during the inline run.
+    pthread_cond_signal(&service->queue_ready);
+    prune_cache(service);
+    return true;
+}
+
 static bool await_entry_locked(ei_inference_service *service, cache_entry *entry,
                                float *out, char *err, size_t err_len) {
     while (entry->state == EI_ENTRY_PENDING) {
@@ -565,10 +668,14 @@ bool ei_inference_service_embed_tokens(ei_inference_service *service,
         return false;
     }
     pthread_mutex_lock(&service->mutex);
+    note_active_request_locked(service, 1);
     cache_entry *entry = submit_tokens_locked(service, ids, n_tokens);
-    pthread_cond_signal(&service->queue_ready);
+    if (!try_execute_solo_locked(service, entry)) {
+        pthread_cond_signal(&service->queue_ready);
+    }
     bool ok = await_entry_locked(service, entry, out, err, err_len);
     if (ok && err && err_len) err[0] = '\0';
+    service->active_requests--;
     pthread_mutex_unlock(&service->mutex);
     return ok;
 }
@@ -645,10 +752,13 @@ bool ei_inference_service_embed_batch(ei_inference_service *service,
     }
 
     pthread_mutex_lock(&service->mutex);
+    note_active_request_locked(service, batch_size);
     for (size_t i = 0; i < batch_size; i++) {
         entries[i] = submit_tokens_locked(service, tokens[i].ids, tokens[i].n);
     }
-    pthread_cond_signal(&service->queue_ready);
+    if (batch_size != 1 || !try_execute_solo_locked(service, entries[0])) {
+        pthread_cond_signal(&service->queue_ready);
+    }
     bool ok = true;
     char first_error[256] = {0};
     for (size_t i = 0; i < batch_size; i++) {
@@ -660,6 +770,7 @@ bool ei_inference_service_embed_batch(ei_inference_service *service,
             ok = false;
         }
     }
+    service->active_requests -= batch_size;
     pthread_mutex_unlock(&service->mutex);
     for (size_t i = 0; i < batch_size; i++) ei_tokens_free(&tokens[i]);
     free(entries);

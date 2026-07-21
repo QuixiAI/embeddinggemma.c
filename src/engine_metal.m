@@ -13,9 +13,11 @@ static void metal_set_error(char *err, size_t err_len, NSString *message) {
 
 static id<MTLLibrary> new_metal_library(id<MTLDevice> device,
                                         const char *library_path,
+                                        const char *environment_name,
+                                        const char *section_name,
                                         NSError **error) {
     const char *override = library_path && *library_path
-        ? library_path : getenv("EI_METALLIB_PATH");
+        ? library_path : getenv(environment_name);
     if (override && *override) {
         NSString *path = [NSString stringWithUTF8String:override];
         return [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:error];
@@ -23,7 +25,7 @@ static id<MTLLibrary> new_metal_library(id<MTLDevice> device,
 
     unsigned long size = 0;
     const uint8_t *bytes = getsectiondata(&_mh_execute_header, "__DATA",
-                                          "__metallib", &size);
+                                          section_name, &size);
     if (!bytes || size == 0) {
         if (error) {
             *error = [NSError errorWithDomain:@"embeddinggemma.c"
@@ -97,6 +99,11 @@ static id<MTLBuffer> new_rope_table(id<MTLDevice> device, float base) {
     uint32_t _fused_residual_next_max_tokens;
     uint32_t _fused_up_gate_rows;
     bool _triple_qkv_gemv;
+    bool _metal4_tensor;
+    uint32_t _tensor_mm_min_tokens;
+    bool _flash_attention_active;
+    uint32_t _flash_attention_min_tokens;
+    uint32_t _flash_attention_batch_min_tokens;
 }
 
 - (instancetype)initWithModel:(const ei_model *)model
@@ -120,8 +127,13 @@ static id<MTLComputePipelineState> metal_pipeline(EIMetalEngine *engine, NSStrin
     return engine->_pipelines[name];
 }
 
+static bool metal_use_tensor_mm(EIMetalEngine *engine, uint32_t tokens) {
+    return engine->_metal4_tensor && tokens >= engine->_tensor_mm_min_tokens;
+}
+
 static bool metal_direct_fp16_kv(EIMetalEngine *engine, uint32_t tokens) {
     return engine->_fp16_kv_active && engine->_fused_qk_rope &&
+        !metal_use_tensor_mm(engine, tokens) &&
         tokens < engine->_gemm_min_tokens &&
         tokens >= engine->_gemv_r4_min_tokens;
 }
@@ -173,6 +185,22 @@ static void encode_q4_projection(EIMetalEngine *engine,
                                  id<MTLBuffer> output, uint32_t tokens) {
     uint32_t rows = (uint32_t)weight->ne[1];
     uint32_t cols = (uint32_t)weight->ne[0];
+    if (metal_use_tensor_mm(engine, tokens)) {
+        bool tile64 = tokens == 64;
+        [encoder setComputePipelineState:metal_pipeline(
+            engine, tile64 ? @"ei_q4_0_f32_tensor_mm_64"
+                           : @"ei_q4_0_f32_tensor_mm")];
+        [encoder setBuffer:engine->_model_buffer offset:weight->offset atIndex:0];
+        [encoder setBuffer:input offset:0 atIndex:1];
+        [encoder setBuffer:output offset:0 atIndex:2];
+        [encoder setBytes:&rows length:sizeof rows atIndex:3];
+        [encoder setBytes:&cols length:sizeof cols atIndex:4];
+        [encoder setBytes:&tokens length:sizeof tokens atIndex:5];
+        [encoder setThreadgroupMemoryLength:64 * 32 * sizeof(uint16_t) atIndex:0];
+        metal_dispatch_groups(encoder, tile64 ? 1 : (tokens + 127) / 128,
+                              (rows + 63) / 64, 1, 128, 1, 1);
+        return;
+    }
     bool use_gemm = tokens >= engine->_gemm_min_tokens;
     bool tile16 = use_gemm && engine->_gemm_tile_tokens == 16;
     bool rows4 = !use_gemm && tokens >= engine->_gemv_r4_min_tokens;
@@ -201,6 +229,24 @@ static void encode_q4_projection(EIMetalEngine *engine,
 static void encode_qkv_projection(EIMetalEngine *engine,
                                   id<MTLComputeCommandEncoder> encoder,
                                   const ei_layer *layer, uint32_t tokens) {
+    if (metal_use_tensor_mm(engine, tokens)) {
+        bool tile64 = tokens == 64;
+        [encoder setComputePipelineState:metal_pipeline(
+            engine, tile64 ? @"ei_q4_0_f32_qkv_tensor_mm_64"
+                           : @"ei_q4_0_f32_qkv_tensor_mm")];
+        [encoder setBuffer:engine->_model_buffer offset:layer->attn_q->offset atIndex:0];
+        [encoder setBuffer:engine->_model_buffer offset:layer->attn_k->offset atIndex:1];
+        [encoder setBuffer:engine->_model_buffer offset:layer->attn_v->offset atIndex:2];
+        [encoder setBuffer:engine->_norm offset:0 atIndex:3];
+        [encoder setBuffer:engine->_q offset:0 atIndex:4];
+        [encoder setBuffer:engine->_k offset:0 atIndex:5];
+        [encoder setBuffer:engine->_v offset:0 atIndex:6];
+        [encoder setBytes:&tokens length:sizeof tokens atIndex:7];
+        [encoder setThreadgroupMemoryLength:64 * 32 * sizeof(uint16_t) atIndex:0];
+        metal_dispatch_groups(encoder, tile64 ? 1 : (tokens + 127) / 128,
+                              20, 1, 128, 1, 1);
+        return;
+    }
     bool use_gemm = tokens >= engine->_gemm_min_tokens;
     bool tile16 = use_gemm && engine->_gemm_tile_tokens == 16;
     bool rows4 = !use_gemm && tokens >= engine->_gemv_r4_min_tokens;
@@ -238,6 +284,22 @@ static void encode_qkv_projection(EIMetalEngine *engine,
 static bool encode_up_gate_projection(EIMetalEngine *engine,
                                       id<MTLComputeCommandEncoder> encoder,
                                       const ei_layer *layer, uint32_t tokens) {
+    if (metal_use_tensor_mm(engine, tokens)) {
+        bool tile64 = tokens == 64;
+        [encoder setComputePipelineState:metal_pipeline(
+            engine, tile64 ? @"ei_q4_0_f32_up_gate_tensor_mm_64"
+                           : @"ei_q4_0_f32_up_gate_tensor_mm")];
+        [encoder setBuffer:engine->_model_buffer offset:layer->ffn_up->offset atIndex:0];
+        [encoder setBuffer:engine->_model_buffer offset:layer->ffn_gate->offset atIndex:1];
+        [encoder setBuffer:engine->_norm offset:0 atIndex:2];
+        [encoder setBuffer:engine->_up offset:0 atIndex:3];
+        [encoder setBuffer:engine->_gate offset:0 atIndex:4];
+        [encoder setBytes:&tokens length:sizeof tokens atIndex:5];
+        [encoder setThreadgroupMemoryLength:64 * 32 * sizeof(uint16_t) atIndex:0];
+        metal_dispatch_groups(encoder, tile64 ? 1 : (tokens + 127) / 128,
+                              36, 1, 128, 1, 1);
+        return false;
+    }
     bool use_gemm = tokens >= engine->_gemm_min_tokens;
     bool tile16 = use_gemm && engine->_gemm_tile_tokens == 16;
     bool rows4 = !use_gemm && tokens >= engine->_gemv_r4_min_tokens;
@@ -377,18 +439,33 @@ static void encode_gelu_mul(EIMetalEngine *engine, id<MTLComputeCommandEncoder> 
 
 static void encode_kv_f16(EIMetalEngine *engine, id<MTLComputeCommandEncoder> encoder,
                           uint32_t tokens) {
-    uint32_t count = tokens * EI_HEAD_DIM;
+    uint32_t valid_count = tokens * EI_HEAD_DIM;
+    uint32_t storage_count = ((tokens + 31) / 32) * 32 * EI_HEAD_DIM;
     [encoder setComputePipelineState:metal_pipeline(engine, @"ei_kv_f32_to_f16")];
     [encoder setBuffer:engine->_k offset:0 atIndex:0];
     [encoder setBuffer:engine->_v offset:0 atIndex:1];
     [encoder setBuffer:engine->_k_f16 offset:0 atIndex:2];
     [encoder setBuffer:engine->_v_f16 offset:0 atIndex:3];
-    [encoder setBytes:&count length:sizeof count atIndex:4];
-    metal_dispatch_threads(encoder, count, 256);
+    [encoder setBytes:&valid_count length:sizeof valid_count atIndex:4];
+    [encoder setBytes:&storage_count length:sizeof storage_count atIndex:5];
+    metal_dispatch_threads(encoder, storage_count, 256);
 }
 
 static void encode_attention(EIMetalEngine *engine, id<MTLComputeCommandEncoder> encoder,
                              uint32_t tokens, uint32_t window) {
+    if (engine->_flash_attention_active) {
+        [encoder setComputePipelineState:metal_pipeline(
+            engine, @"ei_flash_attention_f16_kv_256")];
+        [encoder setBuffer:engine->_q offset:0 atIndex:0];
+        [encoder setBuffer:engine->_k_f16 offset:0 atIndex:1];
+        [encoder setBuffer:engine->_v_f16 offset:0 atIndex:2];
+        [encoder setBuffer:engine->_ctx offset:0 atIndex:3];
+        [encoder setBytes:&tokens length:sizeof tokens atIndex:4];
+        [encoder setBytes:&window length:sizeof window atIndex:5];
+        metal_dispatch_groups(encoder, (tokens + 7) / 8,
+                              EI_N_HEAD, 1, 128, 1, 1);
+        return;
+    }
     bool fp16_kv = engine->_fp16_kv_active;
     NSString *name = fp16_kv ? @"ei_attention_f16_kv" : @"ei_attention_f32";
     [encoder setComputePipelineState:metal_pipeline(engine, name)];
@@ -403,7 +480,36 @@ static void encode_attention(EIMetalEngine *engine, id<MTLComputeCommandEncoder>
 
 static void encode_attention_batch(EIMetalEngine *engine,
                                    id<MTLComputeCommandEncoder> encoder,
-                                   uint32_t tokens, uint32_t window) {
+                                   uint32_t tokens, uint32_t window,
+                                   const size_t *offsets,
+                                   uint32_t batch_size) {
+    if (engine->_flash_attention_active) {
+        [encoder setComputePipelineState:metal_pipeline(
+            engine, @"ei_flash_attention_f16_kv_256")];
+        for (uint32_t sequence = 0; sequence < batch_size; sequence++) {
+            uint32_t sequence_tokens =
+                (uint32_t)(offsets[sequence + 1] - offsets[sequence]);
+            NSUInteger token_offset = offsets[sequence];
+            [encoder setBuffer:engine->_q
+                         offset:token_offset * EI_N_EMBD * sizeof(float)
+                        atIndex:0];
+            [encoder setBuffer:engine->_k_f16
+                         offset:token_offset * EI_HEAD_DIM * sizeof(uint16_t)
+                        atIndex:1];
+            [encoder setBuffer:engine->_v_f16
+                         offset:token_offset * EI_HEAD_DIM * sizeof(uint16_t)
+                        atIndex:2];
+            [encoder setBuffer:engine->_ctx
+                         offset:token_offset * EI_N_EMBD * sizeof(float)
+                        atIndex:3];
+            [encoder setBytes:&sequence_tokens
+                       length:sizeof sequence_tokens atIndex:4];
+            [encoder setBytes:&window length:sizeof window atIndex:5];
+            metal_dispatch_groups(encoder, (sequence_tokens + 7) / 8,
+                                  EI_N_HEAD, 1, 128, 1, 1);
+        }
+        return;
+    }
     bool fp16_kv = engine->_fp16_kv_active;
     NSString *name = fp16_kv ? @"ei_attention_f16_kv_batch"
                              : @"ei_attention_f32_batch";
@@ -498,6 +604,9 @@ static void encode_pool_batch(EIMetalEngine *engine,
     if (!self) return nil;
     _model = model;
     _gemm_min_tokens = UINT32_MAX;
+    _tensor_mm_min_tokens = 64;
+    _flash_attention_min_tokens = 128;
+    _flash_attention_batch_min_tokens = 192;
     _gemm_tile_tokens = 16;
     _gemv_r4_min_tokens = 7;
     _fp16_kv_min_tokens = 1024;
@@ -594,7 +703,8 @@ static void encode_pool_batch(EIMetalEngine *engine,
     }
 
     NSError *error = nil;
-    id<MTLLibrary> library = new_metal_library(_device, libraryPath, &error);
+    id<MTLLibrary> library = new_metal_library(
+        _device, libraryPath, "EI_METALLIB_PATH", "__metallib", &error);
     if (!library) {
         if (errorMessage) {
             *errorMessage = [NSString stringWithFormat:
@@ -633,7 +743,7 @@ static void encode_pool_batch(EIMetalEngine *engine,
         @"ei_kv_f32_to_f16",
         @"ei_mean_pool_rms_l2_f32",
     ];
-    NSMutableDictionary *pipelines = [NSMutableDictionary dictionaryWithCapacity:names.count];
+    NSMutableDictionary *pipelines = [NSMutableDictionary dictionaryWithCapacity:names.count + 1];
     for (NSString *name in names) {
         id<MTLFunction> function = [library newFunctionWithName:name];
         if (!function) {
@@ -649,6 +759,83 @@ static void encode_pool_batch(EIMetalEngine *engine,
             return nil;
         }
         pipelines[name] = pipeline;
+    }
+
+    _metal4_tensor = false;
+    if (@available(macOS 26.0, *)) {
+        _metal4_tensor = [_device supportsFamily:MTLGPUFamilyMetal4];
+    }
+    if (_metal4_tensor) {
+        id<MTLLibrary> metal4_library = new_metal_library(
+            _device, NULL, "EI_METAL4LIB_PATH", "__metal4lib", &error);
+        if (!metal4_library) {
+            if (errorMessage) {
+                *errorMessage = [NSString stringWithFormat:
+                    @"failed to load Metal 4 library: %@", error];
+            }
+            return nil;
+        }
+        NSArray<NSString *> *metal4_names = @[
+            @"ei_q4_0_f32_tensor_mm",
+            @"ei_q4_0_f32_tensor_mm_64",
+            @"ei_q4_0_f32_qkv_tensor_mm",
+            @"ei_q4_0_f32_qkv_tensor_mm_64",
+            @"ei_q4_0_f32_up_gate_tensor_mm",
+            @"ei_q4_0_f32_up_gate_tensor_mm_64",
+            @"ei_flash_attention_f16_kv_256",
+        ];
+        for (NSString *name in metal4_names) {
+            id<MTLFunction> function = [metal4_library newFunctionWithName:name];
+            id<MTLComputePipelineState> pipeline = function
+                ? [_device newComputePipelineStateWithFunction:function error:&error]
+                : nil;
+            if (!pipeline) {
+                if (errorMessage) {
+                    *errorMessage = [NSString stringWithFormat:
+                        @"Metal 4 pipeline %@ failed: %@", name, error];
+                }
+                return nil;
+            }
+            pipelines[name] = pipeline;
+        }
+    }
+
+    const char *tensor_mm_min = getenv("EI_METAL_TENSOR_MM_MIN_TOKENS");
+    if (tensor_mm_min && *tensor_mm_min) {
+        char *end = NULL;
+        long parsed = strtol(tensor_mm_min, &end, 10);
+        if (*end != '\0' || parsed < 1 || parsed > 65536) {
+            if (errorMessage) {
+                *errorMessage = @"EI_METAL_TENSOR_MM_MIN_TOKENS must be 1..65536";
+            }
+            return nil;
+        }
+        _tensor_mm_min_tokens = (uint32_t)parsed;
+    }
+    const char *flash_min = getenv("EI_METAL_FLASH_ATTN_MIN_TOKENS");
+    if (flash_min && *flash_min) {
+        char *end = NULL;
+        long parsed = strtol(flash_min, &end, 10);
+        if (*end != '\0' || parsed < 1 || parsed > 65536) {
+            if (errorMessage) {
+                *errorMessage = @"EI_METAL_FLASH_ATTN_MIN_TOKENS must be 1..65536";
+            }
+            return nil;
+        }
+        _flash_attention_min_tokens = (uint32_t)parsed;
+    }
+    const char *flash_batch_min = getenv(
+        "EI_METAL_FLASH_ATTN_BATCH_MIN_TOKENS");
+    if (flash_batch_min && *flash_batch_min) {
+        char *end = NULL;
+        long parsed = strtol(flash_batch_min, &end, 10);
+        if (*end != '\0' || parsed < 1 || parsed > 65536) {
+            if (errorMessage) {
+                *errorMessage = @"EI_METAL_FLASH_ATTN_BATCH_MIN_TOKENS must be 1..65536";
+            }
+            return nil;
+        }
+        _flash_attention_batch_min_tokens = (uint32_t)parsed;
     }
     _pipelines = [pipelines copy];
 
@@ -755,11 +942,18 @@ static void encode_pool_batch(EIMetalEngine *engine,
     NSUInteger count = offsets[batchSize];
     if (![self ensureCapacity:count batchSize:batchSize error:errorMessage]) return NO;
     NSUInteger max_sequence_tokens = 0;
+    NSUInteger min_sequence_tokens = NSUIntegerMax;
     for (NSUInteger sequence = 0; sequence < batchSize; sequence++) {
         NSUInteger sequence_tokens = offsets[sequence + 1] - offsets[sequence];
         if (sequence_tokens > max_sequence_tokens) max_sequence_tokens = sequence_tokens;
+        if (sequence_tokens < min_sequence_tokens) min_sequence_tokens = sequence_tokens;
     }
-    _fp16_kv_active = max_sequence_tokens >= _fp16_kv_min_tokens;
+    _flash_attention_active = _metal4_tensor &&
+        ((batchSize == 1 && count >= _flash_attention_min_tokens) ||
+         (batchSize > 1 &&
+          min_sequence_tokens >= _flash_attention_batch_min_tokens));
+    _fp16_kv_active = _flash_attention_active ||
+        max_sequence_tokens >= _fp16_kv_min_tokens;
     memcpy(_ids.contents, ids, count * sizeof(int32_t));
     uint32_t *metal_offsets = _offsets.contents;
     uint32_t *positions = _positions.contents;
@@ -774,13 +968,14 @@ static void encode_pool_batch(EIMetalEngine *engine,
         }
     }
 
-    id<MTLCommandBuffer> command = [_queue commandBuffer];
-    command.label = @"embeddinggemma forward";
-    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    id<MTLCommandBuffer> first_command = [_queue commandBuffer];
+    first_command.label = @"embeddinggemma forward head";
+    id<MTLComputeCommandEncoder> encoder = [first_command computeCommandEncoder];
     if (!encoder) {
         if (errorMessage) *errorMessage = @"failed to create Metal compute encoder";
         return NO;
     }
+    id<MTLCommandBuffer> command = first_command;
 
     uint32_t tokens = (uint32_t)count;
     const float eps = _model->rms_eps;
@@ -788,6 +983,22 @@ static void encode_pool_batch(EIMetalEngine *engine,
         tokens <= _fused_residual_next_max_tokens;
     encode_embedding(self, encoder, count);
     for (int layer_index = 0; layer_index < EI_N_LAYER; layer_index++) {
+        // Commit the first layers early so GPU execution overlaps CPU
+        // encoding of the remaining graph; the queue preserves order.
+        if (layer_index == 2 && command == first_command) {
+            [encoder endEncoding];
+            [first_command commit];
+            command = [_queue commandBuffer];
+            command.label = @"embeddinggemma forward tail";
+            encoder = [command computeCommandEncoder];
+            if (!encoder) {
+                [first_command waitUntilCompleted];
+                if (errorMessage) {
+                    *errorMessage = @"failed to create Metal compute encoder";
+                }
+                return NO;
+            }
+        }
         const ei_layer *layer = &_model->layers[layer_index];
         const bool swa = ei_layer_is_swa(_model, layer_index);
         id<MTLBuffer> rope_table = swa ? _rope_swa : _rope_full;
@@ -816,7 +1027,9 @@ static void encode_pool_batch(EIMetalEngine *engine,
             encode_kv_f16(self, encoder, tokens);
         }
         if (batchSize > 1) {
-            encode_attention_batch(self, encoder, tokens, swa ? _model->swa_window : 0);
+            encode_attention_batch(self, encoder, tokens,
+                                   swa ? _model->swa_window : 0,
+                                   offsets, (uint32_t)batchSize);
         } else {
             encode_attention(self, encoder, tokens, swa ? _model->swa_window : 0);
         }
@@ -849,6 +1062,14 @@ static void encode_pool_batch(EIMetalEngine *engine,
     [encoder endEncoding];
     [command commit];
     [command waitUntilCompleted];
+    if (command != first_command &&
+        first_command.status != MTLCommandBufferStatusCompleted) {
+        if (errorMessage) {
+            *errorMessage = [NSString stringWithFormat:
+                @"Metal forward failed: %@", first_command.error];
+        }
+        return NO;
+    }
     if (command.status != MTLCommandBufferStatusCompleted) {
         if (errorMessage) {
             *errorMessage = [NSString stringWithFormat:@"Metal forward failed: %@", command.error];

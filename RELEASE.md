@@ -62,8 +62,8 @@ The `release-*` targets clean the selected backend before compiling it.
 
 ## Darwin ARM64 CPU And Metal
 
-Requirements: Apple Silicon, macOS 14 or newer deployment target, full Xcode,
-and the installed Metal Toolchain component.
+Requirements: Apple Silicon, macOS 14 or newer deployment target, full Xcode 26
+or newer, and the installed Metal Toolchain component.
 
 ```sh
 cd "$worktree"
@@ -77,7 +77,8 @@ make release-darwin DIST=/tmp/embeddinggemma-dist
 
 `release-darwin` rebuilds CPU and Metal, strips and ad-hoc signs both files, and
 checks that both executables retain the configured macOS 14.0 minimum and that
-the Metal executable contains the embedded `__DATA,__metallib` section.
+the Metal executable contains both embedded `__DATA,__metallib` and
+`__DATA,__metal4lib` sections.
 Validate the staged executables, not only the unstripped build output:
 
 ```sh
@@ -93,8 +94,9 @@ python3 testdata/test_http_dimensions.py \
   --model "$MODEL" --backend metal
 ```
 
-The metallib is embedded in the Metal executable. It is an intermediate build
-file, not a release asset.
+Both metallibs are embedded in the Metal executable. They are intermediate
+build files, not release assets. Runtime selection preserves the Metal 3.1
+fallback on Apple Silicon GPUs without Metal 4 tensor support.
 
 ## Linux X86_64 CPU
 

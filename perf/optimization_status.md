@@ -2454,3 +2454,189 @@ at B256. A 256-request dynamic-service run at T32 reached 273/279/746/1,198/
 1,645/3,952 req/s at concurrency 1/2/4/8/16/32, with average batch 28.4 at C32.
 `roc-obj-ls` confirmed `gfx908`, `gfx90a`, `gfx942`, and `gfx950` code objects in
 the final binary.
+
+## 2026-07-20: Metal 4 Tensor Projections, Flash Attention, And Packing
+
+Status: retained for Metal on Apple GPUs reporting `MTLGPUFamilyMetal4`.
+
+The Metal build now embeds two libraries: the existing Metal 3.1 library in
+`__DATA,__metallib` and a `-std=metal4.0` library in `__DATA,__metal4lib`.
+Runtime selection requires `supportsFamily:MTLGPUFamilyMetal4`, so older
+Apple Silicon keeps the prior pipelines. `scripts/stage-release.sh` verifies
+both embedded sections.
+
+`src/metal4/kernels/tensor_qgemm.metal` adapts llama.cpp's `<metal_tensor>`
+MetalPerformancePrimitives Q4_0 matmul into model-specialized projections:
+`ei_q4_0_f32_tensor_mm`, a fused Q/K/V variant, a fused up/gate variant, and
+64-column instantiations of all three selected at exactly 64 flattened
+tokens. The general tile is 128 token columns by 64 output rows with a
+32-wide K tile and four simdgroups. The 64-token tile reduced the T64
+in-process median from 4.7305 ms to 3.9570 ms and turned the failing 64-token
+c1 HTTP cell from 202.3 versus 207.7 embeddings/s into 240.8 versus 207.8.
+
+`src/metal4/kernels/flash_attention.metal` adds
+`ei_flash_attention_f16_kv_256` for EmbeddingGemma's three query heads, one
+shared KV head, and head dimension 256, with eight query rows per
+threadgroup, 32-key online-softmax tiles, exact symmetric-window masking,
+half Q/K/V math, and FP32 softmax/output. Single-sequence flash begins at 128
+tokens and packed sequences at 192 tokens. FP16 K/V storage is zero-padded to
+tile alignment. A mixed-batch routing bug that keyed packed flash eligibility
+to the maximum sequence length forced short members onto FP16 flash and
+produced 0.999830604 cosine for a 32-token member; eligibility now keys to
+the minimum sequence length and the mixed `{1,7,32,129,192}` batch passes at
+minimum cosine 0.999956071.
+
+The request-packing cutoff rose from 512 to 1024 tokens after packed-versus-
+serialized measurements of roughly 1.34-1.41x at T512 B2/B4/B8 and
+1.04-1.05x at T1024 B2/B4; T2048 stayed serialized at roughly 0.997x.
+Representative full-graph in-process medians: T128 5.147 ms, T512 7.749 ms,
+T1024 12.673 ms, T2048 27.439 ms (about 74.6k input tokens/s, versus
+175.5 ms before tensor projections and flash attention).
+
+## 2026-07-20: Grisu2 Float Serialization For HTTP Responses
+
+Status: retained for all backends.
+
+The first fail-fast llama.cpp comparison stopped at 8 tokens c8 with 992.6
+versus 1107.6 embeddings/s. A worker-thread `sample` profile showed
+`snprintf("%.9g")` dominating through `__dtoa` and locale locks: 768 float
+formats per 768-dimensional response. `src/float_format.c` now carries a
+float-only C11 port of the Grisu2 shortest-round-trip formatter from
+llama.cpp's bundled nlohmann JSON (MIT, Loitsch and Lohmann attribution
+retained), and `src/server.c` reserves response capacity once and writes
+formatted floats directly into the response buffer. `test_float_format`
+verifies exact bitwise round trips for 1,000,012 finite values. The isolated
+cell recovered to 1,160.1 versus 1,105.2 embeddings/s, and the full 8-token
+sweep passed at 1.18/1.31/1.79/1.07/1.04/1.17x llama.cpp
+(`perf/results/2026-07-20/metal4-float-format-c8/`,
+`metal4-float-format-short/`).
+
+## 2026-07-20: Demand-Aware Wave Batch Collection
+
+Status: retained for all backends.
+
+A restarted comparison failed at 8 tokens c16 with 1309.5 versus 1641.8
+embeddings/s, conflicting with two earlier wins on the same shape. Three
+quiet-host reruns showed llama.cpp stable at 1632-1766 while we swung
+between 1696 and 2074 embeddings/s: the dynamic batcher was bimodal over
+HTTP. The old collector armed one fixed 200 us deadline per batch, and its
+readiness predicate (64 requests or 4,096 tokens) could never fire at c16,
+so wave formation depended on all resubmissions landing inside one window;
+when they straggled, the wave split and phase-locked (in-process, forcing an
+800 us wait produced average batch 16.00 and better latency than 200 us,
+proving truncation).
+
+The scheduler now tracks the peak number of concurrently in-flight requests
+since the previous dispatch. Collection starts whenever more clients are in
+flight than queued, keeps extending its deadline while new requests arrive
+(bounded by `EI_BATCH_WAIT_MAX_US`, default four times `--batch-wait-us`),
+and dispatches the moment the queue reaches the tracked peak.
+`EI_BATCH_WAVE=0` restores the fixed window. An intermediate design that
+targeted recent batch sizes instead of in-flight demand locked splits in
+(two of ten repeats collapsed to average batch 8.00) and was rejected.
+
+In-process T8 (`perf_concurrency_metal`, 2,000 requests):
+
+| concurrency | before req/s | after req/s | before batch | after batch |
+|---:|---:|---:|---:|---:|
+| 1 | 479.9 | 483.3 | 1.00 | 1.00 |
+| 2 | 490.3 | 758.1 | 1.03 | 1.99 |
+| 4 | 946.5 | 1,070.3 | 3.03 | 3.98 |
+| 8 | 1,837.5 | 2,113.0 | 6.10 | 7.97 |
+| 16 | 2,689.4 | 3,259.1 | 10.10 | 15.87 |
+| 32 | 4,627.2 | 5,900.9 | 17.70 | 31.75 |
+
+The c2 gain also fixes an alternating singleton pathology where the second
+client's hot window expired during the first client's execution. p95 latency
+fell at every level (c16: 6.98 ms to 4.97 ms). Batch parity cosine stayed
+0.999956071, T512 packing still fills 4,096-token batches, and T2048 stays
+serialized. Paired HTTP T8 c16 went from bimodal 1696-2074 to 2189/2186/1841
+against llama.cpp's 602-1641, and isolated c32 measured 3,174.0 versus
+2,774.4 (`perf/results/2026-07-20/metal4-c16-recheck-run*/`,
+`metal4-wave-t8-sweep/`, `metal4-c16-wave-run*/`, `metal4-c32-wave/`).
+
+Warm-sweep measurements also showed llama.cpp degrading under sustained
+mixed-concurrency serving (8-token c32 fell from about 2,770 fresh to about
+590 warm) while our server showed no hysteresis; published comparisons use
+the runner's new `--fresh-servers` mode so every cell measures both engines
+fresh.
+
+## 2026-07-21: T128 c1 Serving-Path And Encode-Overlap Recovery
+
+Status: retained for all backends (server and service changes) and Metal
+(split command encoding).
+
+The fresh-servers matrix stopped at 128 tokens c1 with 186.7 versus 189.1
+embeddings/s, and three isolated reruns confirmed a stable 1.4% loss
+(186.1-186.4 versus 188.6-189.2). Flash-versus-legacy and tensor-versus-
+legacy A/Bs showed the engine routing was already optimal (flash 5.166 ms
+versus legacy 5.306 ms; tensor 5.191 ms versus legacy 10.792 ms), and
+llama-bench with flash attention measured llama.cpp's engine at 5.146 ms —
+statistically equal to ours. The entire deficit was serving overhead, which a
+worker-thread `sample` profile broke down as roughly 47 us of Grisu2 float
+formatting, 21 us of tokenization, and 66 us of HTTP core per request.
+
+Five changes recovered the cell, applied and measured incrementally:
+
+1. Solo inline execution (`EI_SOLO_INLINE=0` to disable): a request arriving
+   with an idle backend, empty queue, and expected wave of one executes on
+   the submitting worker thread, removing two thread handoffs.
+2. Ryu digit generation replacing Grisu2 in `src/float_format.c` (Ulf Adams'
+   algorithm, tables generated exactly from big-integer arithmetic): 21.4 ns
+   per float, 16.5 us per 768-float response versus about 47 us before. The
+   1,000,012-value bitwise round-trip suite passes unchanged.
+3. Single-writev responses with TCP_NODELAY and no double strlen of the
+   9.7 KB body.
+4. Keep-alive reads use SO_RCVTIMEO instead of poll-then-recv, removing one
+   syscall and one scheduler hop per request; an idle timeout on a clean
+   connection boundary closes silently as before.
+5. Split Metal command encoding: the forward pass commits after layer 2 so
+   GPU execution overlaps CPU encoding of the remaining 22 layers. T128
+   in-process fell from 5.166 ms to 5.141 ms and T8 from about 2.04 ms to
+   2.009 ms with bit-identical checksums.
+
+Isolated T128 c1 after the fixes: 190.7/189.8/190.2/189.6 versus llama.cpp
+189.3/189.1/188.5/189.3 — four consecutive wins with our floor above their
+ceiling, from 186.2-186.4 before. Batch parity cosine 0.999956071, backend
+parity, HTTP Matryoshka, and the T8 concurrency ladder (485/758/3,277/5,921
+req/s at c1/c2/c16/c32) are unchanged
+(`perf/results/2026-07-21/t128c1-*/`).
+
+## 2026-07-21: Solo-Inline Versus Backend Dispatch Race
+
+Status: fixed; solo inline execution retained.
+
+The battery-power matrix reached 2048 tokens c2 and lost three consecutive
+paired measurements by 0.4-3% — while our own c1 cell won 1.42x. Serialized
+processing should never slow down when a second client appears, and
+in-process c2 matched c1 exactly, which isolated the regression to the
+service layer under HTTP timing. The cause was a race introduced with solo
+inline execution: an inline run claims `backend_busy`, but the backend
+dispatch loop only waited on queue emptiness — a request arriving during an
+inline run signaled the backend, which dispatched it concurrently into the
+non-reentrant engine. Interleaved encodes inflated per-request latency
+(41.7 ms versus 31 ms forward on battery) and could corrupt concurrent
+embeddings in the race window. Long forwards at 2048 tokens c2 kept
+re-opening the window, which is why this shape exposed it.
+
+The backend idle wait now also waits out `backend_busy` (inline completion
+always signals `queue_ready`, covering shutdown), so engine execution is
+single-flight again. Isolated 2048-token c2 on battery went from 24.0 versus
+24.1 losing to 34.3 versus 26.7 embeddings/s — a 1.28x win matching the c1
+margin — and batch parity (0.999956071), the T8 wave ladder, and in-process
+c1/c2 equality at T2048 all held (`perf/results/2026-07-21/t2048c2-racefix-*/`).
+
+## 2026-07-21: Complete llama.cpp Comparison Matrix
+
+Status: accepted and published in README.
+
+The full 54-cell fresh-servers matrix (8-2048 tokens x concurrency 1-32,
+5-second targets, caches disabled, llama.cpp b8981) completed with zero
+loss-retries: geometric-mean throughput 1.25x llama.cpp, range 1.01x-2.01x,
+minimum cross-server cosine at or above the 0.999 gate. Measured on battery
+power (recorded in the summary); ratios are paired and order-alternated, so
+the uniform battery throttle affects both engines equally. Full validation
+passed afterward: unit and Metal suites, HTTP Matryoshka, the
+1,000,012-value float round-trip check, runner compilation, release-script
+syntax, and both embedded Metal library sections
+(`perf/results/2026-07-21/metal4-final-battery2/`).

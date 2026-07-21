@@ -8,10 +8,23 @@ static void fail(NSString *message) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc != 2) fail(@"usage: test_metal <metallib>");
+        if (argc != 2 && argc != 3) {
+            fail(@"usage: test_metal <metallib> [function]");
+        }
 
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (device == nil) fail(@"Metal device is unavailable");
+        if (argc == 3) {
+            bool metal4 = false;
+            if (@available(macOS 26.0, *)) {
+                metal4 = [device supportsFamily:MTLGPUFamilyMetal4];
+            }
+            if (!metal4) {
+                printf("Metal 4 unavailable on %s; specialized pipeline skipped\n",
+                       device.name.UTF8String);
+                return 0;
+            }
+        }
 
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[1]]];
         NSError *error = nil;
@@ -20,7 +33,9 @@ int main(int argc, const char *argv[]) {
             fail([NSString stringWithFormat:@"failed to load metallib: %@", error]);
         }
 
-        NSArray<NSString *> *expected = @[
+        NSArray<NSString *> *expected = argc == 3
+            ? @[[NSString stringWithUTF8String:argv[2]]]
+            : @[
             @"ei_embedding_q8_0_f32",
             @"ei_q4_0_f32_gemv",
             @"ei_q4_0_f32_gemv_r4",

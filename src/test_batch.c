@@ -21,7 +21,7 @@ int main(int argc, char **argv) {
         ei_die("usage: %s <model.gguf> [cpu|metal|cuda]", argv[0]);
     }
     const char *backend = argc == 3 ? argv[2] : "cpu";
-    const size_t lengths[] = { 1, 7, 32, 129 };
+    const size_t lengths[] = { 1, 7, 32, 129, 192 };
     const size_t batch_size = sizeof(lengths) / sizeof(lengths[0]);
     size_t offsets[batch_size + 1];
     offsets[0] = 0;

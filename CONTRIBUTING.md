@@ -85,11 +85,13 @@ Build the self-contained Metal server:
 make metal
 ```
 
-The output is `build/embeddinggemma-metal`. Every `.metal` translation unit is
-compiled in one direct `xcrun metal` invocation, and the resulting metallib is
-embedded in the executable's Mach-O `__DATA,__metallib` section. The
-`build/embeddinggemma.metallib` file is an inspection intermediate, not a
-runtime sidecar. Darwin builds default to `MACOSX_DEPLOYMENT_TARGET=14.0`.
+The output is `build/embeddinggemma-metal`. The build compiles a portable Metal
+3.1 library and a Metal 4 tensor/flash library, then embeds them in Mach-O
+`__DATA,__metallib` and `__DATA,__metal4lib` sections. The corresponding files
+under `build/` are inspection intermediates, not runtime sidecars. The runtime
+selects Metal 4 on supported GPUs and keeps the Metal 3.1 path for older Apple
+Silicon. Building the fast path requires Xcode 26 or newer; Darwin executables
+still default to `MACOSX_DEPLOYMENT_TARGET=14.0`.
 
 Build the portable CUDA server:
 
@@ -220,15 +222,21 @@ Diagnostic controls:
 
 ### Metal
 
-Metal uses one-row direct Q4 GEMV at T=1..6 and four-row direct Q4 GEMV at
-T=7..2048. Retained fusions cover QKV and up/gate projections, Q/K norm plus
-RoPE, residual plus next RMS norm, and final norm/pooling. RoPE tables are
-precomputed. Attention uses online GQA, with FP16 K/V at sequence lengths of
-1024 and above while accumulation remains FP32.
+Metal 3.1 uses one-row direct Q4 GEMV at T=1..6 and four-row direct Q4 GEMV from
+T=7. On Metal 4 GPUs, Q4 tensor matmul takes over at 64 flattened tokens with
+combined QKV and up/gate dispatches. Model-specific flash attention starts at
+128 tokens for one sequence and 192 tokens in packed batches; it uses FP16 K/V
+with FP32 softmax and output accumulation. Retained portable fusions cover Q/K
+norm plus RoPE, residual plus next RMS norm, and final norm/pooling. RoPE tables
+are precomputed.
 
 Diagnostic controls:
 
 - `EI_METALLIB_PATH`: load an alternate metallib for kernel experiments.
+- `EI_METAL4LIB_PATH`: load an alternate Metal 4 fast-path library.
+- `EI_METAL_TENSOR_MM_MIN_TOKENS=1..65536`: move the tensor-matmul boundary.
+- `EI_METAL_FLASH_ATTN_MIN_TOKENS=1..65536`: move single-sequence flash attention.
+- `EI_METAL_FLASH_ATTN_BATCH_MIN_TOKENS=1..65536`: move packed flash attention.
 - `EI_METAL_FUSED_QK_ROPE=0`: restore separate Q and K dispatches.
 - `EI_METAL_GEMV_R4_MIN_TOKENS=1..64`: move the R1/R4 boundary.
 - `EI_METAL_GEMM_MIN_TOKENS=1..65536`: enable staged GEMM at a threshold.
@@ -347,6 +355,17 @@ Important production controls:
 - `--response-cache-mb N`: size the exact float-JSON response LRU.
 - `EI_BATCH_LOOKAHEAD=0`: restore strict FIFO batching for diagnostics.
 - `EI_ADAPTIVE_BATCH_WAIT=0`: always apply the configured collection delay.
+- `EI_BATCH_WAVE=0`: disable demand-aware wave collection. By default the
+  scheduler tracks the peak number of concurrently in-flight requests since
+  the previous dispatch and both keeps collecting while more clients are in
+  flight than queued and dispatches the moment the queue reaches that peak.
+- `EI_BATCH_WAIT_MAX_US=N`: cap the extended collection deadline. New arrivals
+  during collection extend the base `--batch-wait-us` deadline, bounded by
+  this cap; the default is four times the base delay.
+- `EI_SOLO_INLINE=0`: disable inline execution of solo requests. By default a
+  request that arrives with an idle backend, an empty queue, and an expected
+  wave of one executes on the submitting worker thread, skipping two thread
+  handoffs; concurrent traffic still routes through the batch collector.
 - `EI_HTTP_KEEPALIVE=0`: disable persistent HTTP connections.
 
 The inference owner preallocates token/output buffers, and accelerator engines

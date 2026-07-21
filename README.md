@@ -14,6 +14,29 @@ It is fast as fuck, and the CPU binary is about 100 KiB.
 - Matryoshka embeddings at 768, 512, 256, and 128 dimensions.
 - Automatic model download and a built-in HTTP server on port `42666`.
 
+## Faster than llama.cpp
+
+Measured over HTTP against llama.cpp build b8981 (`llama-server`, Metal) on
+an Apple M5 Max: identical GGUF, exact token counts, 768-float outputs, all
+caches disabled, both servers restarted fresh for every cell. embeddinggemma
+delivers more embeddings per second in **all 54 cells** — geometric mean
+**1.25x**, up to 2.01x:
+
+| tokens \ concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 1.20x | 1.44x | 1.40x | 1.28x | 1.33x | 1.42x |
+| 16 | 1.69x | 2.01x | 1.65x | 1.37x | 1.31x | 1.35x |
+| 32 | 1.22x | 1.73x | 1.33x | 1.23x | 1.19x | 1.23x |
+| 64 | 1.18x | 1.49x | 1.28x | 1.21x | 1.20x | 1.14x |
+| 128 | 1.01x | 1.36x | 1.16x | 1.11x | 1.12x | 1.03x |
+| 256 | 1.05x | 1.31x | 1.14x | 1.15x | 1.09x | 1.15x |
+| 512 | 1.16x | 1.28x | 1.16x | 1.03x | 1.48x | 1.05x |
+| 1,024 | 1.39x | 1.09x | 1.41x | 1.07x | 1.48x | 1.03x |
+| 2,048 | 1.39x | 1.05x | 1.40x | 1.02x | 1.44x | 1.04x |
+
+Reproduce with `make perf-compare-llamacpp`; methodology and raw results are
+documented in [`perf/`](perf/).
+
 ## Basic Usage
 
 Start the server. The correct backend is built into each platform binary and
@@ -33,7 +56,7 @@ curl -sS http://127.0.0.1:42666/api/embed \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "embeddinggemma-300m",
-    "input": ["search_query: what powers the cell"],
+    "input": ["task: search result | query: what powers the cell"],
     "dimensions": 256
   }'
 ```
@@ -44,7 +67,10 @@ The response is:
 {"embeddings":[[0.0123,-0.0456]]}
 ```
 
-`input` accepts one string or an array of strings. `dimensions` is optional and
+`input` accepts one string or an array of strings. Text is embedded exactly as
+provided, so include the [EmbeddingGemma prompt prefix](https://ai.google.dev/gemma/docs/embeddinggemma/model_card#prompt_instructions)
+for your task: `task: search result | query: {text}` for search queries and
+`title: none | text: {text}` for documents. `dimensions` is optional and
 may be `768`, `512`, `256`, or `128`; the default is `768`. Reduced Matryoshka
 embeddings are normalized again before being returned. Set
 `"encoding_format":"base64"` to receive packed little-endian float32 data

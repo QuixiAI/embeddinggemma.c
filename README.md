@@ -2,6 +2,12 @@
 
 **The fastest way to serve EmbeddingGemma. Anywhere.**
 
+Powered by QuixiCore Kernels 
+
+https://github.com/QuixiAI/QuixiCore
+
+https://github.com/QuixiAI/QuixiCore-Metal
+
 `embeddinggemma` is a tiny, model-specialized embeddings server for
 EmbeddingGemma 300M. It runs on CPU, Apple Metal, NVIDIA CUDA, AMD ROCm, and
 Intel XPU SYCL from a single native executable per platform.

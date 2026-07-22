@@ -507,6 +507,16 @@ def main() -> int:
                         help="consecutive paired losses required before a "
                              "cell aborts the run; retries are recorded in "
                              "the accepted rows")
+    parser.add_argument("--both-orders", action="store_true",
+                        help="measure each cell in both A/B orders and average "
+                             "each engine's two results, cancelling the fixed "
+                             "per-cell order bias (second-measured engine runs "
+                             "on a hotter host). Doubles per-cell time; use for "
+                             "publishable matrices.")
+    parser.add_argument("--inter-engine-cooldown", type=float, default=2.0,
+                        help="seconds to settle between the two engines within "
+                             "a cell so the second is not measured on a hot "
+                             "host; also inserted between A/B passes")
     parser.add_argument("--out-dir", type=Path)
     args = parser.parse_args()
     if args.target_seconds <= 0 or args.min_rounds <= 0 or args.max_rounds < args.min_rounds:
@@ -558,14 +568,43 @@ def main() -> int:
     embeddinggemma_rows: list[dict[str, int | float | str]] = []
     llamacpp_rows: list[dict[str, int | float | str]] = []
 
+    endpoint_rows = {
+        "embeddinggemma.c": (embeddinggemma_endpoint, embeddinggemma_rows),
+        "llama.cpp": (llamacpp_endpoint, llamacpp_rows),
+    }
+
+    def run_ordered_pass(order: list[str], token_count: int,
+                         concurrency: int) -> dict[str, dict[str, object]]:
+        """Measure both engines in the given order, settling between them so
+        the second-measured engine does not inherit the first's thermal or
+        power-draw state."""
+        rows: dict[str, dict[str, object]] = {}
+        for index, label in enumerate(order):
+            if index > 0 and args.inter_engine_cooldown:
+                time.sleep(args.inter_engine_cooldown)
+            endpoint, _ = endpoint_rows[label]
+            rows[label] = benchmark_shape(
+                label, endpoint, prompts[token_count], token_count,
+                concurrency, args.target_seconds, args.min_rounds,
+                args.max_rounds, args.encoding_format,
+            )
+        return rows
+
+    def average_rows(a: dict[str, object], b: dict[str, object]) -> dict[str, object]:
+        merged = dict(a)
+        for key, value in a.items():
+            other = b.get(key)
+            if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and isinstance(other, (int, float))
+                    and not isinstance(other, bool)):
+                merged[key] = (value + other) / 2.0
+        return merged
+
     def measure_shape(token_count: int, concurrency: int, shape_index: int,
                       ignore_pids: set[int]) -> None:
-        configurations = [
-            ("embeddinggemma.c", embeddinggemma_endpoint, embeddinggemma_rows),
-            ("llama.cpp", llamacpp_endpoint, llamacpp_rows),
-        ]
+        base_order = ["embeddinggemma.c", "llama.cpp"]
         if shape_index % 2:
-            configurations.reverse()
+            base_order.reverse()
         loss_attempts = 0
         while True:
             wait_for_quiet_host(
@@ -574,17 +613,14 @@ def main() -> int:
                 args.quiet_stable_seconds,
             )
             power_before = power_source()
-            measured = [
-                (
-                    rows,
-                    benchmark_shape(
-                        label, endpoint, prompts[token_count], token_count,
-                        concurrency, args.target_seconds, args.min_rounds,
-                        args.max_rounds, args.encoding_format,
-                    ),
-                )
-                for label, endpoint, rows in configurations
-            ]
+            passes = {label: [row] for label, row in
+                      run_ordered_pass(base_order, token_count, concurrency).items()}
+            if args.both_orders:
+                if args.inter_engine_cooldown:
+                    time.sleep(args.inter_engine_cooldown)
+                for label, row in run_ordered_pass(
+                        list(reversed(base_order)), token_count, concurrency).items():
+                    passes[label].append(row)
             if power_source() != power_before:
                 print(
                     f"  retrying {token_count} tokens x c{concurrency}: "
@@ -603,9 +639,12 @@ def main() -> int:
                     flush=True,
                 )
                 continue
-            current = {str(row["server"]): row for _, row in measured}
-            ours = float(current["embeddinggemma.c"]["embeddings_per_s"])
-            llama = float(current["llama.cpp"]["embeddings_per_s"])
+            final = {
+                label: (average_rows(runs[0], runs[1]) if len(runs) == 2 else runs[0])
+                for label, runs in passes.items()
+            }
+            ours = float(final["embeddinggemma.c"]["embeddings_per_s"])
+            llama = float(final["llama.cpp"]["embeddings_per_s"])
             if llama > ours:
                 loss_attempts += 1
                 if loss_attempts >= args.loss_retries:
@@ -623,9 +662,10 @@ def main() -> int:
                     flush=True,
                 )
                 continue
-            for rows, row in measured:
+            for label, row in final.items():
                 row["loss_retries"] = loss_attempts
-                rows.append(row)
+                row["both_orders"] = bool(args.both_orders)
+                endpoint_rows[label][1].append(row)
             return
 
     def check_similarities(similarities: dict[int, float]) -> None:
@@ -752,6 +792,8 @@ def main() -> int:
         "quiet_stable_seconds": args.quiet_stable_seconds,
         "fresh_servers": args.fresh_servers,
         "loss_retries": args.loss_retries,
+        "both_orders": args.both_orders,
+        "inter_engine_cooldown": args.inter_engine_cooldown,
         "power_source": power_source(),
         "embeddinggemma_command": embeddinggemma_command,
         "llamacpp_command": llama_command,

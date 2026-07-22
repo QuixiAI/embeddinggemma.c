@@ -133,6 +133,17 @@ in the results and summary, and discards any pair during which the power
 source changed (the two servers measure sequentially, so a mid-cell plug or
 unplug would skew one side).
 
+The two engines in a cell measure back-to-back, so at high token counts the
+first engine's sustained burst leaves the host hotter and the second-measured
+engine is penalized ~12-16%. Because concurrency is the inner loop, that order
+is fixed per cell and never averages out. Two mechanisms correct it:
+`--inter-engine-cooldown` (default 2s) settles the host between the two
+engines so the second is not measured hot; `--both-orders` measures each cell
+in both A/B orders and averages each engine's two results, cancelling any
+residual asymmetry. Use `--both-orders` for publishable matrices (it doubles
+per-cell time); the accepted rows record `both_orders` so results are
+self-describing.
+
 A cell where llama.cpp measures faster is re-measured from scratch (behind
 the quiet gate) up to `--loss-retries` times, default 3; only a winning pair
 is accepted, its retry count is recorded in the results, and three

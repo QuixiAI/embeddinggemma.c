@@ -2640,3 +2640,80 @@ passed afterward: unit and Metal suites, HTTP Matryoshka, the
 1,000,012-value float round-trip check, runner compilation, release-script
 syntax, and both embedded Metal library sections
 (`perf/results/2026-07-21/metal4-final-battery2/`).
+
+## 2026-07-21: The 2x Push — Compute-Bound Ceiling, Caching, And Opt-in int8
+
+A concerted effort to move from ~1.4x to 2x vs llama.cpp. It mapped the ceiling
+precisely; the honest conclusion is that same-hardware compute optimization
+cannot reach 2x for this model, and the real multiplier is caching.
+
+### Launch/capture levers — exhausted (compute-bound)
+
+Measured on all four GPU backends that per-forward launch/encode overhead is
+NOT the bottleneck:
+
+- Metal: an env-gated probe split CPU-encode+submit from GPU-wait. Encode is
+  only ~1-4% of the forward (0.05-0.10 ms of 1.5-8 ms); Metal is
+  GPU-compute-bound and its cheap encoding is already overlapped by the
+  split-command-buffer. A reusable indirect-command-buffer capture would chase
+  a ~2% ceiling — not built.
+- CUDA already graph-captures (launches free); a SwiGLU→quant fusion was
+  bit-identical but neutral/-3% (rejected).
+- ROCm: the same SwiGLU→quant fusion regressed -45% at T1 (coarse 32-row blocks
+  collapse occupancy); enabling the existing (default-off) HIP graph capture was
+  neutral on uniform load and -1.5% on mixed traffic (16-entry FIFO thrash).
+  Both kept opt-in/off.
+
+Lesson: fusion-to-cut-launches only helps where submission genuinely dominates.
+The one such backend is XPU (SYCL immediate-command-list submission is ~97% of a
+small-batch forward); its ctx->half attention-epilogue fusion
+(`EI_XPU_FUSE_ATTN_OUTPUT_HALF`) is +2-5% and retained opt-in.
+
+### W4A8 on the int8 matrix engines — real but small
+
+The model already carries int8 activations (DP4A/sdot4/NEON), but the default
+fast paths use the fp16 matrix engines. A naive IMMA swap beats the *equivalent*
+naive fp16 MMA by +8-16% yet loses ~2x to mature cuBLAS fp16. Per-32-block
+scales rule out vendor INT8 GEMMs (single-scale over K); requant to per-row int8
+was rejected by the user.
+
+A serious hand-written per-block int8 GEMM (shared-mem staging, cp.async
+double-buffering, tuned 64x64/4-stage) then **beat cuBLAS fp16 by 1.0-1.41x** on
+the projections (cp.async the biggest lever, 3x over naive), golden cosine held
+at 0.99987. But projections are only ~40% of the T2048 forward and are too small
+(K=768/1152) to be compute-bound — even cuBLAS runs them at ~30% of peak — so
+the end-to-end win is ~3% at T>=1024 (`EI_CUDA_W4A8_GEMM`, opt-in, gated high
+tokens; test_batch self-parity ~0.997, an int8-activation ceiling).
+
+int8 flash attention (`EI_CUDA_INT8_ATTN`): int8 Q.K^T via cuBLAS IMMA is ~1.5-2x
+on that GEMM but the quant+fp32-softmax overhead halves it — ~3% end-to-end at
+T>=1024, accuracy-safe within T512-2048 (route parity tightens to ~0.998). int8
+P.V (mode 2) quantizes heavy-tailed softmax probabilities and breaks accuracy
+(0.9839 < 0.99) — implemented behind =2 but not for use.
+
+### Verdict on 2x
+
+2x-vs-llama.cpp is not reachable by same-hardware compute optimization: short
+sequences are weight-bandwidth-bound (unfixable), and the entire compute-bound
+int8 effort adds ~6% at long sequences, opt-in, with accuracy tradeoffs. The
+real >2x (up to infinite on a hit) is the persistent exact cache for
+repeat/re-index/eval workloads.
+
+### Shipped (default, this session)
+
+- Persistent exact-embedding cache (`--persistent-cache-path`), shared code,
+  model-fingerprint-guarded, atomic writes.
+- Metal fused up/gate/GELU default-on (+2% low-token, cosine unchanged).
+- Benchmark both-orders averaging to cancel the fixed per-cell measurement-order
+  bias (collapsed the T2048 1.39x/1.05x sawtooth to a true ~1.30x).
+
+### Retained opt-in (default OFF, documented)
+
+- `EI_XPU_FUSE_ATTN_OUTPUT_HALF` (+2-5%), `EI_CUDA_W4A8_GEMM` and
+  `EI_CUDA_INT8_ATTN` (~3% each at T>=1024, ~6% combined, high-token, with the
+  route-parity/self-parity tradeoffs above).
+
+### Rejected (measured non-wins, not shipped)
+
+- CUDA and ROCm SwiGLU->quant fusion (neutral / -45%), ROCm default graph
+  capture (neutral / -1.5% mixed). Kept opt-in-off or not landed.

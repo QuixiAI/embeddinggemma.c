@@ -270,6 +270,14 @@ Diagnostic controls:
 - `EI_CUDA_SWA_TENSOR_TILE_TOKENS=0|128|256|512|1024`: select SWA banding.
 - `EI_CUDA_SWA_TENSOR_MIN_TOKENS`: move the banded-SWA boundary.
 - `EI_CUDA_NATIVE_Q4_GEMM=0|1`: enable the experimental packed-Q4 MMA route.
+- `EI_CUDA_W4A8_GEMM=0|1|2`: opt-in hand-written per-block int8 projection GEMM
+  (Q4 weight x int8 activation on the IMMA tensor cores; keeps native Q4 nibbles
+  and per-32-block scales via a cp.async double-buffered kernel). Beats cuBLAS
+  fp16 1.0-1.41x on the projections but ~3% end-to-end (T>=1024); `2` limits it
+  to the two decisive projections. Default off; batch self-parity ~0.997.
+- `EI_CUDA_INT8_ATTN=0|1|2`: opt-in int8 flash attention. `1` = int8 Q.K^T
+  (accuracy-safe, ~3% at T>=1024, route parity tightens to ~0.998); `2` also
+  int8 P.V, which breaks accuracy and is not for use. Default off.
 
 ### ROCm
 
@@ -327,6 +335,10 @@ Diagnostic controls:
   its single and packed-batch thresholds.
 - `EI_XPU_Q4_M_TILED=1`: enable direct-Q4 M2-M8 weight reuse diagnostics.
 - `EI_XPU_COMMAND_GRAPH=0|1|auto`: control exact-shape graph replay.
+- `EI_XPU_FUSE_ATTN_OUTPUT_HALF=0|1`: opt-in fusion that writes the online-
+  attention context as half inline, skipping a separate float-to-half
+  submission before the attn-output GEMM (+2-5% p50, submission-bound regime).
+  Default off; bit-identical on its active path.
 - `EI_XPU_XE2_W4=0|1`: control the Xe2 W4A16 up/gate route.
 - `XPU_ONEDNN=1`, `EI_XPU_ONEDNN_F16=1`, and `EI_XPU_ONEDNN_W4=1`: build and
   select rejected oneDNN experiments.

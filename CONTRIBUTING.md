@@ -353,6 +353,13 @@ Important production controls:
 - `--keepalive-connections N`, `--keepalive-max-requests N`, and
   `--keepalive-timeout-ms N`: control persistent HTTP connections.
 - `--response-cache-mb N`: size the exact float-JSON response LRU.
+- `--persistent-cache-path PATH`: persist the exact-embedding cache to disk.
+  The service loads matching entries at startup and flushes ready entries on
+  graceful shutdown (SIGTERM/SIGINT), so re-indexing and eval workloads survive
+  restarts as cache hits instead of recomputing from cold. The file is guarded
+  by a model fingerprint (size + first 64 KiB); a cache from a different model
+  or build is ignored, never served. Writes are atomic (temp file + rename);
+  a hard kill (SIGKILL) simply loses the current session's new entries.
 - `EI_BATCH_LOOKAHEAD=0`: restore strict FIFO batching for diagnostics.
 - `EI_ADAPTIVE_BATCH_WAIT=0`: always apply the configured collection delay.
 - `EI_BATCH_WAVE=0`: disable demand-aware wave collection. By default the

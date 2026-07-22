@@ -4,7 +4,11 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef enum {
     EI_ENTRY_PENDING,
@@ -470,6 +474,139 @@ static void *backend_main(void *opaque) {
     return NULL;
 }
 
+/* On-disk exact-cache format (little-endian host layout; guarded by the model
+ * fingerprint so a file from a different model or build is ignored, never
+ * served). Header: magic[8] "EIEMBED1", u32 version, u32 n_embd, u64
+ * fingerprint, u64 entry_count. Then entry_count records of: u64 hash, u32
+ * n_tokens, i32 ids[n_tokens], f32 embedding[EI_N_EMBD]. */
+static const char EI_CACHE_MAGIC[8] = {'E', 'I', 'E', 'M', 'B', 'E', 'D', '1'};
+#define EI_CACHE_VERSION 1u
+#define EI_CACHE_COUNT_OFFSET 24 /* magic(8)+version(4)+n_embd(4)+fingerprint(8) */
+
+static void load_persistent_cache(ei_inference_service *service) {
+    const char *path = service->config.cache_path;
+    if (!path || !*path) return;
+    FILE *file = fopen(path, "rb");
+    if (!file) return;
+    char magic[8];
+    uint32_t version = 0, n_embd = 0;
+    uint64_t fingerprint = 0, count = 0;
+    if (fread(magic, 1, sizeof magic, file) != sizeof magic ||
+        memcmp(magic, EI_CACHE_MAGIC, sizeof magic) != 0 ||
+        fread(&version, sizeof version, 1, file) != 1 ||
+        version != EI_CACHE_VERSION ||
+        fread(&n_embd, sizeof n_embd, 1, file) != 1 || n_embd != EI_N_EMBD ||
+        fread(&fingerprint, sizeof fingerprint, 1, file) != 1 ||
+        fingerprint != service->config.cache_fingerprint ||
+        fread(&count, sizeof count, 1, file) != 1) {
+        fclose(file);
+        return; /* absent/stale/other-model: ignore, it will be overwritten */
+    }
+    size_t loaded = 0;
+    for (uint64_t i = 0; i < count &&
+             service->ready_entries < service->config.cache_entries; i++) {
+        uint64_t hash = 0;
+        uint32_t n_tokens = 0;
+        if (fread(&hash, sizeof hash, 1, file) != 1 ||
+            fread(&n_tokens, sizeof n_tokens, 1, file) != 1 ||
+            n_tokens == 0 || n_tokens > EI_N_CTX) {
+            break; /* truncated or corrupt: keep what loaded cleanly */
+        }
+        cache_entry *entry = ei_xcalloc(1, sizeof(*entry));
+        entry->hash = hash;
+        entry->n_tokens = n_tokens;
+        entry->ids = ei_xmalloc(n_tokens * sizeof(*entry->ids));
+        entry->state = EI_ENTRY_READY;
+        if (fread(entry->ids, sizeof(*entry->ids), n_tokens, file) != n_tokens ||
+            fread(entry->embedding, sizeof(float), EI_N_EMBD, file) != EI_N_EMBD) {
+            free(entry->ids);
+            free(entry);
+            break;
+        }
+        if (pthread_cond_init(&entry->done, NULL) != 0) {
+            ei_die("failed to initialize inference completion");
+        }
+        cache_entry **slot =
+            &service->buckets[hash & (service->bucket_count - 1)];
+        entry->hash_next = *slot;
+        *slot = entry;
+        lru_push_front(service, entry);
+        service->ready_entries++;
+        loaded++;
+    }
+    fclose(file);
+    if (loaded) {
+        fprintf(stderr, "loaded %zu cached embeddings from %s\n", loaded, path);
+    }
+}
+
+/* Caller guarantees the bucket table is not mutated concurrently (holds the
+ * mutex, or runs single-threaded). Best-effort and atomic via a temp file +
+ * rename; any failure is silent. */
+static void write_persistent_cache_locked(ei_inference_service *service) {
+    const char *path = service->config.cache_path;
+    if (!path || !*path) return;
+    size_t path_len = strlen(path);
+    char *tmp = ei_xmalloc(path_len + 8);
+    memcpy(tmp, path, path_len);
+    memcpy(tmp + path_len, ".XXXXXX", 8);
+    int fd = mkstemp(tmp);
+    if (fd < 0) {
+        free(tmp);
+        return;
+    }
+    FILE *file = fdopen(fd, "wb");
+    if (!file) {
+        close(fd);
+        unlink(tmp);
+        free(tmp);
+        return;
+    }
+    uint32_t version = EI_CACHE_VERSION, n_embd = EI_N_EMBD;
+    uint64_t fingerprint = service->config.cache_fingerprint, count = 0;
+    bool ok =
+        fwrite(EI_CACHE_MAGIC, 1, sizeof EI_CACHE_MAGIC, file) == sizeof EI_CACHE_MAGIC &&
+        fwrite(&version, sizeof version, 1, file) == 1 &&
+        fwrite(&n_embd, sizeof n_embd, 1, file) == 1 &&
+        fwrite(&fingerprint, sizeof fingerprint, 1, file) == 1 &&
+        fwrite(&count, sizeof count, 1, file) == 1;
+    for (size_t bucket = 0; ok && bucket < service->bucket_count; bucket++) {
+        for (cache_entry *entry = service->buckets[bucket];
+             ok && entry; entry = entry->hash_next) {
+            if (entry->state != EI_ENTRY_READY) continue;
+            uint32_t n_tokens = (uint32_t)entry->n_tokens;
+            ok = fwrite(&entry->hash, sizeof entry->hash, 1, file) == 1 &&
+                 fwrite(&n_tokens, sizeof n_tokens, 1, file) == 1 &&
+                 fwrite(entry->ids, sizeof(*entry->ids), entry->n_tokens, file)
+                     == entry->n_tokens &&
+                 fwrite(entry->embedding, sizeof(float), EI_N_EMBD, file)
+                     == (size_t)EI_N_EMBD;
+            if (ok) count++;
+        }
+    }
+    if (ok) {
+        ok = fseek(file, EI_CACHE_COUNT_OFFSET, SEEK_SET) == 0 &&
+             fwrite(&count, sizeof count, 1, file) == 1;
+    }
+    if (fclose(file) != 0) ok = false;
+    if (ok && rename(tmp, path) == 0) {
+        fprintf(stderr, "persisted %llu cached embeddings to %s\n",
+                (unsigned long long)count, path);
+    } else {
+        unlink(tmp);
+    }
+    free(tmp);
+}
+
+void ei_inference_service_dump_cache(ei_inference_service *service) {
+    if (!service || !service->config.cache_path || !*service->config.cache_path) {
+        return;
+    }
+    pthread_mutex_lock(&service->mutex);
+    write_persistent_cache_locked(service);
+    pthread_mutex_unlock(&service->mutex);
+}
+
 ei_inference_service *ei_inference_service_create(
     const ei_tokenizer *tokenizer, ei_inference_execute_fn execute,
     void *execute_opaque, const ei_inference_service_config *config) {
@@ -506,6 +643,7 @@ ei_inference_service *ei_inference_service_create(
         ? config->cache_entries * 2 : 64;
     service->bucket_count = next_power_of_two(desired_buckets);
     service->buckets = ei_xcalloc(service->bucket_count, sizeof(*service->buckets));
+    load_persistent_cache(service);
     if (pthread_mutex_init(&service->mutex, NULL) != 0 ||
         pthread_cond_init(&service->queue_ready, NULL) != 0 ||
         pthread_mutex_init(&service->tokenizer_mutex, NULL) != 0 ||
@@ -545,6 +683,8 @@ void ei_inference_service_free(ei_inference_service *service) {
         pthread_join(service->tokenizer_threads[i], NULL);
     }
 
+    /* Threads are joined, so the bucket table is now single-threaded. */
+    write_persistent_cache_locked(service);
     for (size_t bucket = 0; bucket < service->bucket_count; bucket++) {
         cache_entry *entry = service->buckets[bucket];
         while (entry) {

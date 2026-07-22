@@ -14,6 +14,12 @@ typedef struct {
     size_t max_batch_sequence_tokens;
     size_t tokenizer_workers;
     uint32_t batch_wait_us;
+    /* Optional on-disk exact-cache persistence. When cache_path is set, the
+     * service loads matching entries at startup and dumps ready entries on
+     * ei_inference_service_dump_cache / free. cache_fingerprint must uniquely
+     * identify the model so a cache from a different model is never served. */
+    const char *cache_path;
+    uint64_t cache_fingerprint;
 } ei_inference_service_config;
 
 typedef struct {
@@ -48,5 +54,11 @@ bool ei_inference_service_embed_tokens(ei_inference_service *service,
                                        char *err, size_t err_len);
 void ei_inference_service_get_stats(ei_inference_service *service,
                                     ei_inference_service_stats *stats);
+
+/* Atomically write the current exact cache to config.cache_path. Safe to call
+ * while the service is live (locks internally). No-op when cache_path is
+ * unset. Best-effort: persistence failures are silent and never disrupt
+ * serving. */
+void ei_inference_service_dump_cache(ei_inference_service *service);
 
 #endif /* EI_INFERENCE_SERVICE_H */

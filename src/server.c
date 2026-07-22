@@ -81,6 +81,7 @@ typedef struct {
     size_t keepalive_max_requests;
     uint32_t keepalive_timeout_ms;
     size_t response_cache_bytes;
+    const char *persistent_cache_path;
 } server_opts;
 
 static void sbuf_reserve(sbuf *b, size_t additional) {
@@ -1036,6 +1037,38 @@ static void ensure_model_available(const char *model_path) {
     download_model(model_path);
 }
 
+/* Fingerprint the model so a persisted cache is only reused with the exact
+ * same model file. Hashes the file size and first 64 KiB (GGUF header +
+ * metadata + first tensors) — cheap and reliably distinguishes models without
+ * reading the whole 278 MB file. */
+static uint64_t model_fingerprint(const char *path) {
+    uint64_t hash = 1469598103934665603ull;
+    FILE *file = fopen(path, "rb");
+    if (!file) return 0;
+    unsigned char buffer[65536];
+    if (fseek(file, 0, SEEK_END) == 0) {
+        long size = ftell(file);
+        for (int i = 0; i < 8; i++) {
+            hash ^= (uint64_t)((size >> (i * 8)) & 0xff);
+            hash *= 1099511628211ull;
+        }
+        rewind(file);
+    }
+    size_t got = fread(buffer, 1, sizeof buffer, file);
+    for (size_t i = 0; i < got; i++) {
+        hash ^= buffer[i];
+        hash *= 1099511628211ull;
+    }
+    fclose(file);
+    return hash;
+}
+
+static volatile sig_atomic_t g_stop_requested = 0;
+static void handle_stop_signal(int sig) {
+    (void)sig;
+    g_stop_requested = 1;
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s [--bind ADDR] [--port PORT] [--backend auto|cpu|metal|cuda|rocm|xpu]\n"
@@ -1046,7 +1079,7 @@ static void usage(const char *argv0) {
         "          [--max-client-batch-size N] [--tokenizer-workers N]\n"
         "          [--batch-wait-us N] [--keepalive-connections N]\n"
         "          [--keepalive-max-requests N] [--keepalive-timeout-ms N]\n"
-        "          [--response-cache-mb N]\n"
+        "          [--response-cache-mb N] [--persistent-cache-path PATH]\n"
         "default listen: 0.0.0.0:%d\n"
         "default model: $XDG_CACHE_HOME/embeddinggemma.c/%s\n"
         "               or $HOME/.cache/embeddinggemma.c/%s\n",
@@ -1084,6 +1117,7 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
     opts->keepalive_max_requests = 100;
     opts->keepalive_timeout_ms = 1000;
     opts->response_cache_bytes = 64u * 1024u * 1024u;
+    opts->persistent_cache_path = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
             opts->bind_host = argv[++i];
@@ -1148,6 +1182,9 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
             size_t value;
             if (!parse_size_arg(argv[++i], 0, 4096, &value)) return false;
             opts->response_cache_bytes = value * 1024u * 1024u;
+        } else if (strcmp(argv[i], "--persistent-cache-path") == 0 &&
+                   i + 1 < argc) {
+            opts->persistent_cache_path = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             exit(0);
@@ -1295,6 +1332,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "loading model: %s\n", model_path);
     ei_engine engine;
     ei_engine_load_backend(&engine, model_path, opts.backend);
+    uint64_t cache_fingerprint = opts.persistent_cache_path
+        ? model_fingerprint(model_path) : 0;
     free(model_path);
     char reserve_error[256];
     if (!ei_engine_reserve(&engine, opts.max_batch_tokens,
@@ -1309,6 +1348,8 @@ int main(int argc, char **argv) {
         .max_batch_sequence_tokens = opts.max_batch_sequence_tokens,
         .tokenizer_workers = opts.tokenizer_workers,
         .batch_wait_us = opts.batch_wait_us,
+        .cache_path = opts.persistent_cache_path,
+        .cache_fingerprint = cache_fingerprint,
     };
     ei_inference_service *service = ei_inference_service_create(
         &engine.tokenizer, execute_engine_batch, &engine, &service_config);
@@ -1363,7 +1404,19 @@ int main(int argc, char **argv) {
             opts.max_batch_sequence_tokens, opts.cache_entries,
             opts.keepalive_connections,
             opts.response_cache_bytes / (1024u * 1024u));
-    for (;;) {
+
+    /* Graceful shutdown so the persistent cache is flushed. sigaction without
+     * SA_RESTART makes accept() return EINTR when a stop signal arrives. */
+    if (opts.persistent_cache_path) {
+        struct sigaction action;
+        memset(&action, 0, sizeof action);
+        action.sa_handler = handle_stop_signal;
+        sigemptyset(&action.sa_mask);
+        action.sa_flags = 0;
+        sigaction(SIGTERM, &action, NULL);
+        sigaction(SIGINT, &action, NULL);
+    }
+    while (!g_stop_requested) {
         int c = accept(s, NULL, NULL);
         if (c >= 0) {
             int nodelay = 1;
@@ -1380,4 +1433,9 @@ int main(int argc, char **argv) {
             close(c);
         }
     }
+    if (opts.persistent_cache_path) {
+        fprintf(stderr, "shutting down; persisting exact cache\n");
+        ei_inference_service_dump_cache(service);
+    }
+    return 0;
 }

@@ -632,7 +632,7 @@ static void encode_pool_batch(EIMetalEngine *engine,
     const char *fused_qk_rope = getenv("EI_METAL_FUSED_QK_ROPE");
     _fused_qk_rope = !fused_qk_rope || strcmp(fused_qk_rope, "0") != 0;
     const char *fused_up_gate_gelu = getenv("EI_METAL_FUSED_UP_GATE_GELU");
-    _fused_up_gate_gelu = fused_up_gate_gelu &&
+    _fused_up_gate_gelu = !fused_up_gate_gelu ||
         strcmp(fused_up_gate_gelu, "0") != 0;
     const char *triple_qkv_gemv = getenv("EI_METAL_TRIPLE_QKV_GEMV");
     _triple_qkv_gemv = triple_qkv_gemv &&

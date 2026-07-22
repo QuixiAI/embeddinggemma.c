@@ -141,6 +141,7 @@ struct xpu_engine {
     void *onednn = nullptr;
     bool q4_m_tiled = false;
     bool xe2_w4 = false;
+    bool fuse_attn_output_half = false;
     int command_graph_mode = 0;
     uint64_t graph_clock = 0;
     std::vector<xpu_graph_entry> graph_cache;
@@ -1154,7 +1155,8 @@ static void launch_qkv_epilogue(xpu_engine *engine, const ei_layer *layer,
 }
 
 static void launch_attention(xpu_engine *engine, size_t tokens,
-                             uint32_t window, uint32_t tensor_min_tokens) {
+                             uint32_t window, uint32_t tensor_min_tokens,
+                             sycl::half *output_half = nullptr) {
     constexpr size_t attention_subgroups = 4;
     constexpr size_t attention_workgroup = kSubgroup * attention_subgroups;
     const size_t tasks = tokens * EI_N_HEAD;
@@ -1168,6 +1170,7 @@ static void launch_attention(xpu_engine *engine, size_t tokens,
     const sycl::half *value_half = engine->v_half;
     const bool use_half = engine->fp16_attention;
     float *output = engine->ctx;
+    sycl::half *output_half_buffer = output_half;
     const uint32_t *offsets = engine->offsets;
     const uint32_t *sequence_ids = engine->sequence_ids;
     const sycl::event event = engine->queue.parallel_for(
@@ -1250,8 +1253,16 @@ static void launch_attention(xpu_engine *engine, size_t tokens,
 #pragma unroll
             for (size_t slot = 0; slot < EI_HEAD_DIM / kSubgroup; slot++) {
                 const size_t dim = lane + slot * kSubgroup;
-                output[query_token * EI_N_EMBD + head * EI_HEAD_DIM + dim] =
-                    out_values[slot] * inv_denominator;
+                const size_t index =
+                    query_token * EI_N_EMBD + head * EI_HEAD_DIM + dim;
+                const float result = out_values[slot] * inv_denominator;
+                output[index] = result;
+                // Fuse the ctx->half convert here so the attention-output GEMM
+                // reads half_input directly, skipping a separate submission.
+                if (output_half_buffer) {
+                    output_half_buffer[index] =
+                        static_cast<sycl::half>(result);
+                }
             }
         });
     record_profile(engine, "attention_online", event);
@@ -1858,6 +1869,12 @@ static bool execute_batch(xpu_engine *engine, const int32_t *ids,
                 }
                 const uint32_t window =
                     is_swa ? engine->model->swa_window : 0;
+                // When every sequence uses online attention, the attention
+                // kernel can write the half context inline, skipping the
+                // standalone float_to_half(ctx) submission before the GEMM.
+                const bool fuse_ctx_half = engine->fuse_attn_output_half &&
+                    use_gemm && !use_v_only && !use_xe2_flash &&
+                    all_sequences_use_online_attention;
                 if (use_xe2_flash) {
 #ifdef EI_XPU_XE2_FLASH
                     const sycl::event flash_event =
@@ -1878,12 +1895,14 @@ static bool execute_batch(xpu_engine *engine, const int32_t *ids,
 #endif
                 } else if (!use_v_only) {
                     launch_attention(engine, tokens, window,
-                                     tensor_attention_min_tokens);
+                                     tensor_attention_min_tokens,
+                                     fuse_ctx_half ? engine->half_input
+                                                   : nullptr);
                     launch_tensor_attention(engine, host_offsets, window,
                                             tensor_attention_min_tokens);
                 }
                 if (use_gemm) {
-                    if (!use_v_only && !use_xe2_flash) {
+                    if (!use_v_only && !use_xe2_flash && !fuse_ctx_half) {
                         launch_float_to_half(engine, engine->ctx,
                                              engine->half_input,
                                              tokens * EI_N_EMBD);
@@ -2306,6 +2325,18 @@ extern "C" void *ei_xpu_engine_create(const ei_model *model,
                     "EI_XPU_COMMAND_GRAPH=1 requires ext_oneapi_graph support");
             }
             engine->command_graph_mode = -1;
+        }
+        const char *fuse_attn_output_env =
+            std::getenv("EI_XPU_FUSE_ATTN_OUTPUT_HALF");
+        if (fuse_attn_output_env && *fuse_attn_output_env) {
+            if (std::strcmp(fuse_attn_output_env, "0") == 0) {
+                engine->fuse_attn_output_half = false;
+            } else if (std::strcmp(fuse_attn_output_env, "1") == 0) {
+                engine->fuse_attn_output_half = true;
+            } else {
+                throw std::runtime_error(
+                    "EI_XPU_FUSE_ATTN_OUTPUT_HALF must be 0 or 1");
+            }
         }
         const uint8_t *model_bytes = model->gguf.map + model->gguf.data_off;
         const size_t model_length = model->gguf.map_len - model->gguf.data_off;

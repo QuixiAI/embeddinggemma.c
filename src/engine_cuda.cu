@@ -84,6 +84,14 @@ struct cuda_engine {
     __half *q_half = nullptr;
     __half *k_half = nullptr;
     __half *v_half = nullptr;
+    int8_t *q8_attn = nullptr;
+    float *q8_attn_scale = nullptr;
+    int8_t *k8_attn = nullptr;
+    float *k8_attn_scale = nullptr;
+    int8_t *v8_attn = nullptr;
+    float *v8_attn_scale = nullptr;
+    int8_t *p8_attn = nullptr;
+    float *p8_attn_scale = nullptr;
     float *ctx = nullptr;
     float *up = nullptr;
     float *gate = nullptr;
@@ -107,6 +115,17 @@ struct cuda_engine {
     bool direct_fp16_context = false;
     bool native_q4_gemm = false;
     bool q8_latency = true;
+    bool w4a8_gemm = false;
+    bool w4a8_big_only = false;  // mode 2: only attn_output + ffn_down (GEMM's clear wins)
+    struct w4a8_weights {
+        uint8_t *qkv = nullptr; __half *qkv_s = nullptr;
+        uint8_t *ao = nullptr; __half *ao_s = nullptr;
+        uint8_t *up_gate = nullptr; __half *up_gate_s = nullptr;
+        uint8_t *down = nullptr; __half *down_s = nullptr;
+    } w4a8_layers[EI_N_LAYER] = {};
+    int8_t *w4a8_aq = nullptr;
+    __half *w4a8_as = nullptr;
+    int int8_attn = 0;  // EI_CUDA_INT8_ATTN: 0=off, 1=QK^T int8, 2=QK^T+PV int8
     float *attention_scores = nullptr;
     __half *attention_probs = nullptr;
 };
@@ -463,6 +482,246 @@ __global__ void q4_mma_projection_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// W4A8 GEMM (EI_CUDA_W4A8_GEMM): Q4_0 weight x int8 activation on the int8
+// tensor cores (IMMA mma.m16n8k32.s8). Keeps native Q4_0 nibbles and per-32-
+// block scales; the K=32 MMA tile is exactly one Q4/Q8 block. Weights and
+// activations are staged in a SoA layout (separate nibble/int8 array + fp16
+// scale array) so cp.async can prefetch 16-byte-aligned chunks; a software
+// pipeline (double/triple buffer) hides global-memory latency. Per K-block the
+// int32 partial is dequantized by wscale*xscale into an fp32 accumulator tile.
+// The -8 Q4 zero point is folded into the signed int8 weight (no sum term).
+//   wq: uint8 [N][bpr][16] nibbles   ws: half [N][bpr]
+//   aq: int8  [M][bpr][32]           as: half [M][bpr]
+//   out[token*out_stride + row] = sum_k a[token][k] * w[row][k]   (fp32)
+// ---------------------------------------------------------------------------
+namespace w4a8 {
+
+__device__ __forceinline__ void imma_m16n8k32(int acc[4], const uint32_t a[4],
+                                              const uint32_t b[2]) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    (void)acc; (void)a; (void)b;
+#endif
+}
+
+// Expand 4 packed Q4_0 nibbles (low or high) to signed int8, -8 folded in.
+__device__ __forceinline__ uint32_t pack_q4(const uint8_t *qs, int c, bool high) {
+    uint32_t p = 0;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int v = (high ? (qs[c + i] >> 4) : (qs[c + i] & 0x0f)) - 8;
+        p |= static_cast<uint32_t>(static_cast<uint8_t>(static_cast<int8_t>(v)))
+             << (i * 8);
+    }
+    return p;
+}
+
+__device__ __forceinline__ void cp_async16(void *smem, const void *gmem) {
+#if __CUDA_ARCH__ >= 800
+    unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
+#endif
+}
+__device__ __forceinline__ void cp_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n");
+#endif
+}
+template <int N> __device__ __forceinline__ void cp_wait() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#endif
+}
+
+template <int BM, int BN, int BK, int WARPS_M, int WARPS_N, int STAGES>
+__global__ __launch_bounds__(WARPS_M *WARPS_N * 32)
+void gemm_kernel(const uint8_t *__restrict__ wq, const __half *__restrict__ ws,
+                 const int8_t *__restrict__ aq, const __half *__restrict__ as,
+                 float *__restrict__ out, int M, int N, int K, int out_stride) {
+    constexpr int WM = BM / WARPS_M, WN = BN / WARPS_N;
+    constexpr int MMA_M = WM / 16, MMA_N = WN / 8;
+    constexpr int KW = BK * 32, KWW = BK * 16, NT = WARPS_M * WARPS_N * 32;
+    extern __shared__ char smem_raw[];
+    int8_t (*sA)[BM * KW] = reinterpret_cast<int8_t (*)[BM * KW]>(smem_raw);
+    uint8_t (*sB)[BN * KWW] = reinterpret_cast<uint8_t (*)[BN * KWW]>(
+        smem_raw + STAGES * BM * KW);
+    __half (*sAs)[BM * BK] = reinterpret_cast<__half (*)[BM * BK]>(
+        smem_raw + STAGES * BM * KW + STAGES * BN * KWW);
+    __half (*sBs)[BN * BK] = reinterpret_cast<__half (*)[BN * BK]>(
+        smem_raw + STAGES * BM * KW + STAGES * BN * KWW + STAGES * BM * BK * 2);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int group = lane >> 2, tig = lane & 3;
+    const int warpM = warp / WARPS_N, warpN = warp % WARPS_N;
+    const int m_base = blockIdx.y * BM, n_base = blockIdx.x * BN;
+    const int bpr = K / 32, nchunk = bpr / BK;
+
+    float acc[MMA_M][MMA_N][4];
+#pragma unroll
+    for (int i = 0; i < MMA_M; i++)
+#pragma unroll
+        for (int j = 0; j < MMA_N; j++)
+#pragma unroll
+            for (int r = 0; r < 4; r++) acc[i][j][r] = 0.0f;
+
+    auto load_chunk = [&](int kc, int buf) {
+        for (int u = tid; u < BM * BK * 2; u += NT) {
+            int m = u / (BK * 2), rem = u % (BK * 2), bb = rem >> 1, half = rem & 1;
+            int gm = m_base + m;
+            int8_t *d = &sA[buf][m * KW + bb * 32 + half * 16];
+            if (gm < M) cp_async16(d, aq + (static_cast<size_t>(gm) * bpr + kc * BK + bb) * 32 + half * 16);
+            else *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
+        }
+        for (int u = tid; u < BN * BK; u += NT) {
+            int n = u / BK, bb = u % BK, gn = n_base + n;
+            uint8_t *d = &sB[buf][n * KWW + bb * 16];
+            if (gn < N) cp_async16(d, wq + (static_cast<size_t>(gn) * bpr + kc * BK + bb) * 16);
+            else *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
+        }
+        for (int u = tid; u < BM * BK; u += NT) {
+            int m = u / BK, bb = u % BK, gm = m_base + m;
+            sAs[buf][u] = gm < M ? as[static_cast<size_t>(gm) * bpr + kc * BK + bb] : __float2half(0.f);
+        }
+        for (int u = tid; u < BN * BK; u += NT) {
+            int n = u / BK, bb = u % BK, gn = n_base + n;
+            sBs[buf][u] = gn < N ? ws[static_cast<size_t>(gn) * bpr + kc * BK + bb] : __float2half(0.f);
+        }
+        cp_commit();
+    };
+
+    int prefetch = 0;
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; s++) { if (s < nchunk) load_chunk(s, s); prefetch++; }
+    for (int kc = 0; kc < nchunk; kc++) {
+        int buf = kc % STAGES;
+        if (prefetch < nchunk) { load_chunk(prefetch, prefetch % STAGES); prefetch++; }
+        cp_wait<STAGES - 1>();
+        __syncthreads();
+#pragma unroll
+        for (int bb = 0; bb < BK; bb++) {
+            uint32_t af[MMA_M][4]; uint32_t bf[MMA_N][2];
+            float axs[MMA_M][2], bxs[MMA_N][2];
+#pragma unroll
+            for (int mi = 0; mi < MMA_M; mi++) {
+                int r0 = warpM * WM + mi * 16 + group, r1 = r0 + 8;
+                const int8_t *p0 = &sA[buf][r0 * KW + bb * 32], *p1 = &sA[buf][r1 * KW + bb * 32];
+                af[mi][0] = *reinterpret_cast<const uint32_t *>(p0 + tig * 4);
+                af[mi][2] = *reinterpret_cast<const uint32_t *>(p0 + 16 + tig * 4);
+                af[mi][1] = *reinterpret_cast<const uint32_t *>(p1 + tig * 4);
+                af[mi][3] = *reinterpret_cast<const uint32_t *>(p1 + 16 + tig * 4);
+                axs[mi][0] = __half2float(sAs[buf][r0 * BK + bb]);
+                axs[mi][1] = __half2float(sAs[buf][r1 * BK + bb]);
+            }
+#pragma unroll
+            for (int ni = 0; ni < MMA_N; ni++) {
+                int nrow = warpN * WN + ni * 8 + group;
+                const uint8_t *qs = &sB[buf][nrow * KWW + bb * 16];
+                bf[ni][0] = pack_q4(qs, tig * 4, false); bf[ni][1] = pack_q4(qs, tig * 4, true);
+                int n0 = warpN * WN + ni * 8 + tig * 2;
+                bxs[ni][0] = __half2float(sBs[buf][n0 * BK + bb]);
+                bxs[ni][1] = __half2float(sBs[buf][(n0 + 1) * BK + bb]);
+            }
+#pragma unroll
+            for (int mi = 0; mi < MMA_M; mi++)
+#pragma unroll
+                for (int ni = 0; ni < MMA_N; ni++) {
+                    int c[4] = {0, 0, 0, 0}; imma_m16n8k32(c, af[mi], bf[ni]);
+                    acc[mi][ni][0] = fmaf(axs[mi][0] * bxs[ni][0], static_cast<float>(c[0]), acc[mi][ni][0]);
+                    acc[mi][ni][1] = fmaf(axs[mi][0] * bxs[ni][1], static_cast<float>(c[1]), acc[mi][ni][1]);
+                    acc[mi][ni][2] = fmaf(axs[mi][1] * bxs[ni][0], static_cast<float>(c[2]), acc[mi][ni][2]);
+                    acc[mi][ni][3] = fmaf(axs[mi][1] * bxs[ni][1], static_cast<float>(c[3]), acc[mi][ni][3]);
+                }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int mi = 0; mi < MMA_M; mi++)
+#pragma unroll
+        for (int ni = 0; ni < MMA_N; ni++) {
+            int m0 = m_base + warpM * WM + mi * 16 + group, m1 = m0 + 8;
+            int n0 = n_base + warpN * WN + ni * 8 + tig * 2, n1 = n0 + 1;
+            if (m0 < M) { size_t base = static_cast<size_t>(m0) * out_stride;
+                if (n0 < N) out[base + n0] = acc[mi][ni][0]; if (n1 < N) out[base + n1] = acc[mi][ni][1]; }
+            if (m1 < M) { size_t base = static_cast<size_t>(m1) * out_stride;
+                if (n0 < N) out[base + n0] = acc[mi][ni][2]; if (n1 < N) out[base + n1] = acc[mi][ni][3]; }
+        }
+}
+
+template <int BM, int BN, int BK, int WARPS_M, int WARPS_N, int STAGES>
+static inline int smem_bytes() {
+    return STAGES * BM * BK * 32 + STAGES * BN * BK * 16 +
+           STAGES * BM * BK * 2 + STAGES * BN * BK * 2;
+}
+
+}  // namespace w4a8
+
+// Quantize an fp16 [M][K] activation to SoA int8 blocks + fp16 per-block scale
+// (symmetric amax/127). One warp per 32-element block. No zero-point/sum: the
+// -8 Q4 offset is folded into the weight nibbles by the GEMM.
+__global__ void quantize_w4a8_soa_kernel(const __half *input, int8_t *aq,
+                                         __half *as, uint32_t n_tokens,
+                                         uint32_t n_cols) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const uint32_t blocks_per_row = n_cols / kQK;
+    const size_t task = static_cast<size_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    const size_t task_count = static_cast<size_t>(n_tokens) * blocks_per_row;
+    if (task >= task_count) return;
+    const uint32_t row = static_cast<uint32_t>(task / blocks_per_row);
+    const uint32_t block_index = static_cast<uint32_t>(task -
+        static_cast<size_t>(row) * blocks_per_row);
+    const float value = __half2float(input[static_cast<size_t>(row) * n_cols +
+                                           block_index * kQK + lane]);
+    float amax = warp_max(fabsf(value));
+    amax = __shfl_sync(kWarpMask, amax, 0);
+    const float scale = amax / 127.0f;
+    int quant = scale == 0.0f ? 0 : __float2int_rn(value / scale);
+    quant = max(-128, min(127, quant));
+    aq[task * 32 + lane] = static_cast<int8_t>(quant);
+    if (lane == 0) as[task] = __float2half(scale);
+}
+
+// Same as above but reads an fp32 activation (fuses the attention-context
+// fp32->int8 quantize, skipping the fp16 staging buffer entirely).
+__global__ void quantize_w4a8_soa_f32_kernel(const float *input, int8_t *aq,
+                                             __half *as, uint32_t n_tokens,
+                                             uint32_t n_cols) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const uint32_t blocks_per_row = n_cols / kQK;
+    const size_t task = static_cast<size_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    const size_t task_count = static_cast<size_t>(n_tokens) * blocks_per_row;
+    if (task >= task_count) return;
+    const uint32_t row = static_cast<uint32_t>(task / blocks_per_row);
+    const uint32_t block_index = static_cast<uint32_t>(task -
+        static_cast<size_t>(row) * blocks_per_row);
+    const float value = input[static_cast<size_t>(row) * n_cols +
+                              block_index * kQK + lane];
+    float amax = warp_max(fabsf(value));
+    amax = __shfl_sync(kWarpMask, amax, 0);
+    const float scale = amax / 127.0f;
+    int quant = scale == 0.0f ? 0 : __float2int_rn(value / scale);
+    quant = max(-128, min(127, quant));
+    aq[task * 32 + lane] = static_cast<int8_t>(quant);
+    if (lane == 0) as[task] = __float2half(scale);
+}
+
+// Repack native Q4_0 blocks into the SoA nibble + fp16 scale arrays.
+__global__ void repack_q4_soa_kernel(const block_q4_0 *w, uint8_t *wq,
+                                     __half *ws, size_t n_blocks) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n_blocks) return;
+    const block_q4_0 blk = w[i];
+#pragma unroll
+    for (int k = 0; k < 16; k++) wq[i * 16 + k] = blk.qs[k];
+    ws[i] = blk.d;
+}
+
 __device__ __forceinline__ float gelu_tanh(float value);
 
 __global__ void f32_to_f16_kernel(const float *input, __half *output,
@@ -540,6 +799,33 @@ __global__ void up_gate_gelu_to_f16_kernel(const float *combined,
     const float up = combined[base + col];
     const float gate = combined[base + EI_N_FF + col];
     output[index] = __float2half(gelu_tanh(gate) * up);
+}
+
+// Fused gelu(gate)*up + per-block int8 quantize, writing SoA activations for
+// the W4A8 ffn_down GEMM directly (no fp16 staging buffer). One warp per block.
+__global__ void up_gate_gelu_quantize_soa_kernel(const float *combined,
+                                                 int8_t *aq, __half *as,
+                                                 uint32_t n_tokens) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    constexpr uint32_t blocks_per_row = EI_N_FF / kQK;
+    const size_t task = static_cast<size_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    const size_t task_count = static_cast<size_t>(n_tokens) * blocks_per_row;
+    if (task >= task_count) return;
+    const uint32_t token = static_cast<uint32_t>(task / blocks_per_row);
+    const uint32_t block_index = static_cast<uint32_t>(task -
+        static_cast<size_t>(token) * blocks_per_row);
+    const uint32_t col = block_index * kQK + lane;
+    const size_t base = static_cast<size_t>(token) * (2 * EI_N_FF);
+    const float value = gelu_tanh(combined[base + EI_N_FF + col]) *
+                        combined[base + col];
+    float amax = warp_max(fabsf(value));
+    amax = __shfl_sync(kWarpMask, amax, 0);
+    const float scale = amax / 127.0f;
+    int quant = scale == 0.0f ? 0 : __float2int_rn(value / scale);
+    quant = max(-128, min(127, quant));
+    aq[task * 32 + lane] = static_cast<int8_t>(quant);
+    if (lane == 0) as[task] = __float2half(scale);
 }
 
 __global__ void q4_projection_kernel(const block_q4_0 *weights,
@@ -1243,6 +1529,52 @@ __global__ void attention_softmax_f16_kernel(
     }
 }
 
+// Softmax that reads the raw int32 QK^T partials and dequantizes on the fly by
+// the per-query and per-key int8 scales (score = raw * qscale * kscale). Fusing
+// the dequant into the softmax avoids a separate full [query x key] pass over
+// the scores buffer, which otherwise dominates the int8 QK^T cost.
+__global__ void attention_softmax_i8_kernel(
+    const int32_t *scores, __half *probabilities, const float *qscale,
+    uint32_t qscale_stride, const float *kscale, uint32_t query_start,
+    uint32_t key_start, uint32_t query_count, uint32_t key_count,
+    uint32_t sequence_tokens, uint32_t window) {
+    __shared__ float partials[kWarpsPerBlock];
+    const uint32_t local_query = blockIdx.x;
+    if (local_query >= query_count) return;
+    const uint32_t query = query_start + local_query;
+    const float qs = qscale[static_cast<size_t>(local_query) * qscale_stride];
+    uint32_t first = 0;
+    uint32_t last = sequence_tokens;
+    if (window != 0) {
+        const uint32_t half_window = window / 2;
+        first = query > half_window ? query - half_window : 0;
+        last = min(sequence_tokens, query + half_window + 1);
+    }
+    const uint32_t local_first = first - key_start;
+    const uint32_t local_last = last - key_start;
+    const size_t row = static_cast<size_t>(local_query) * key_count;
+    float local_max = -__int_as_float(0x7f800000);
+    for (uint32_t key = local_first + threadIdx.x; key < local_last;
+         key += blockDim.x) {
+        local_max = fmaxf(local_max,
+            static_cast<float>(scores[row + key]) * qs * kscale[key]);
+    }
+    const float maximum = block_max(local_max, partials);
+    float local_sum = 0.0f;
+    for (uint32_t key = local_first + threadIdx.x; key < local_last;
+         key += blockDim.x) {
+        local_sum += __expf(
+            static_cast<float>(scores[row + key]) * qs * kscale[key] - maximum);
+    }
+    const float denominator = block_sum(local_sum, partials);
+    for (uint32_t key = threadIdx.x; key < key_count; key += blockDim.x) {
+        const float probability = key >= local_first && key < local_last
+            ? __expf(static_cast<float>(scores[row + key]) * qs * kscale[key] -
+                     maximum) / denominator : 0.0f;
+        probabilities[row + key] = __float2half(probability);
+    }
+}
+
 __global__ void pool_kernel(const float *input, const float *weight,
                             float *output, const uint32_t *offsets,
                             uint32_t batch_size, float eps) {
@@ -1313,6 +1645,11 @@ static void release_token_workspace(cuda_engine *engine) {
     cuda_release(engine->q_half);
     cuda_release(engine->k_half);
     cuda_release(engine->v_half);
+    cuda_release(engine->q8_attn);
+    cuda_release(engine->q8_attn_scale);
+    cuda_release(engine->k8_attn);
+    cuda_release(engine->k8_attn_scale);
+    cuda_release(engine->v8_attn);
     cuda_release(engine->ctx);
     cuda_release(engine->up);
     cuda_release(engine->gate);
@@ -1320,6 +1657,8 @@ static void release_token_workspace(cuda_engine *engine) {
     cuda_release(engine->tmp);
     cuda_release(engine->half_input);
     cuda_release(engine->q8_input);
+    cuda_release(engine->w4a8_aq);
+    cuda_release(engine->w4a8_as);
     cuda_release(engine->flash_query_start);
     cuda_release(engine->flash_sequence_start);
     cuda_release(engine->flash_sequence_stop);
@@ -1355,6 +1694,16 @@ static bool ensure_capacity(cuda_engine *engine, size_t token_count,
                            "allocate CUDA FP16 K", err, err_len) ||
             !cuda_allocate(&engine->v_half, capacity * EI_HEAD_DIM,
                            "allocate CUDA FP16 V", err, err_len) ||
+            !cuda_allocate(&engine->q8_attn, capacity * EI_N_EMBD,
+                           "allocate CUDA int8 Q", err, err_len) ||
+            !cuda_allocate(&engine->q8_attn_scale, capacity * EI_N_HEAD,
+                           "allocate CUDA int8 Q scale", err, err_len) ||
+            !cuda_allocate(&engine->k8_attn, capacity * EI_HEAD_DIM,
+                           "allocate CUDA int8 K", err, err_len) ||
+            !cuda_allocate(&engine->k8_attn_scale, capacity,
+                           "allocate CUDA int8 K scale", err, err_len) ||
+            !cuda_allocate(&engine->v8_attn, capacity * EI_HEAD_DIM,
+                           "allocate CUDA int8 V", err, err_len) ||
             !cuda_allocate(&engine->ctx, capacity * EI_N_EMBD, "allocate CUDA attention", err, err_len) ||
             !cuda_allocate(&engine->up, capacity * EI_N_FF, "allocate CUDA FFN up", err, err_len) ||
             !cuda_allocate(&engine->gate, capacity * EI_N_FF, "allocate CUDA FFN", err, err_len) ||
@@ -1371,6 +1720,14 @@ static bool ensure_capacity(cuda_engine *engine, size_t token_count,
                            "allocate CUDA attention sequence starts", err, err_len) ||
             !cuda_allocate(&engine->flash_sequence_stop, capacity,
                            "allocate CUDA attention sequence stops", err, err_len)) {
+            release_token_workspace(engine);
+            return false;
+        }
+        if (engine->w4a8_gemm &&
+            (!cuda_allocate(&engine->w4a8_aq, capacity * (EI_N_FF / kQK) * 32,
+                            "allocate CUDA W4A8 activations", err, err_len) ||
+             !cuda_allocate(&engine->w4a8_as, capacity * (EI_N_FF / kQK),
+                            "allocate CUDA W4A8 activation scales", err, err_len))) {
             release_token_workspace(engine);
             return false;
         }
@@ -1460,6 +1817,53 @@ static bool initialize_dequantized_weights(cuda_engine *engine,
                       err, err_len);
 }
 
+// Build combined SoA (nibble + fp16 scale) buffers for the W4A8 GEMM path. The
+// q/k/v and up/gate weights are concatenated (matching the cuBLAS combined-row
+// layout) so each projection is one GEMM. This keeps the native Q4_0 nibbles
+// and per-block scales -- it is a memory-layout repack, not a requantization.
+static bool initialize_w4a8_weights(cuda_engine *engine, char *err,
+                                    size_t err_len) {
+    const int bpr_e = EI_N_EMBD / kQK;   // blocks/row at K = n_embd (768)
+    const int bpr_f = EI_N_FF / kQK;     // blocks/row at K = n_ff  (1152)
+    auto repack = [&](const ei_tensor *t, uint8_t *wq, __half *ws,
+                      size_t n_blocks, size_t block_off) {
+        repack_q4_soa_kernel<<<static_cast<unsigned>(
+            (n_blocks + kThreads - 1) / kThreads), kThreads, 0, engine->stream>>>(
+                q4_weights(engine, t), wq + block_off * 16, ws + block_off,
+                n_blocks);
+    };
+    for (int L = 0; L < EI_N_LAYER; L++) {
+        const ei_layer *layer = &engine->model->layers[L];
+        cuda_engine::w4a8_weights &w = engine->w4a8_layers[L];
+        const size_t qkv_blocks =
+            static_cast<size_t>(EI_N_EMBD + 2 * EI_HEAD_DIM) * bpr_e;
+        const size_t ao_blocks = static_cast<size_t>(EI_N_EMBD) * bpr_e;
+        const size_t ug_blocks = static_cast<size_t>(2 * EI_N_FF) * bpr_e;
+        const size_t down_blocks = static_cast<size_t>(EI_N_EMBD) * bpr_f;
+        if (!cuda_allocate(&w.qkv, qkv_blocks * 16, "allocate W4A8 qkv", err, err_len) ||
+            !cuda_allocate(&w.qkv_s, qkv_blocks, "allocate W4A8 qkv scale", err, err_len) ||
+            !cuda_allocate(&w.ao, ao_blocks * 16, "allocate W4A8 attn_out", err, err_len) ||
+            !cuda_allocate(&w.ao_s, ao_blocks, "allocate W4A8 attn_out scale", err, err_len) ||
+            !cuda_allocate(&w.up_gate, ug_blocks * 16, "allocate W4A8 up_gate", err, err_len) ||
+            !cuda_allocate(&w.up_gate_s, ug_blocks, "allocate W4A8 up_gate scale", err, err_len) ||
+            !cuda_allocate(&w.down, down_blocks * 16, "allocate W4A8 ffn_down", err, err_len) ||
+            !cuda_allocate(&w.down_s, down_blocks, "allocate W4A8 ffn_down scale", err, err_len)) {
+            return false;
+        }
+        repack(layer->attn_q, w.qkv, w.qkv_s, static_cast<size_t>(EI_N_EMBD) * bpr_e, 0);
+        repack(layer->attn_k, w.qkv, w.qkv_s, static_cast<size_t>(EI_HEAD_DIM) * bpr_e,
+               static_cast<size_t>(EI_N_EMBD) * bpr_e);
+        repack(layer->attn_v, w.qkv, w.qkv_s, static_cast<size_t>(EI_HEAD_DIM) * bpr_e,
+               static_cast<size_t>(EI_N_EMBD + EI_HEAD_DIM) * bpr_e);
+        repack(layer->attn_output, w.ao, w.ao_s, ao_blocks, 0);
+        repack(layer->ffn_up, w.up_gate, w.up_gate_s, static_cast<size_t>(EI_N_FF) * bpr_e, 0);
+        repack(layer->ffn_gate, w.up_gate, w.up_gate_s, static_cast<size_t>(EI_N_FF) * bpr_e,
+               static_cast<size_t>(EI_N_FF) * bpr_e);
+        repack(layer->ffn_down, w.down, w.down_s, down_blocks, 0);
+    }
+    return cuda_check(cudaGetLastError(), "repack W4A8 weights", err, err_len);
+}
+
 static void convert_to_half(cuda_engine *engine, const float *input,
                             size_t count) {
     f32_to_f16_kernel<<<static_cast<unsigned>((count + kThreads - 1) / kThreads),
@@ -1493,16 +1897,207 @@ static void native_q4_projection(cuda_engine *engine,
         weights, input, output, tokens, rows, cols);
 }
 
+// Run the W4A8 IMMA GEMM from the already-quantized SoA activations
+// (engine->w4a8_aq/as) into `output` (row-major [token][row], stride
+// out_stride). Config is selected by output width N: wide N uses a 64x128 tile
+// (8 warps), narrow N a 64x64 tile (4 warps); both use BK=2 / 4-stage cp.async.
+static void w4a8_gemm_only(cuda_engine *engine, const uint8_t *wq,
+                           const __half *ws, float *output, int rows, int cols,
+                           int tokens, int out_stride) {
+    if (rows > EI_N_EMBD) {
+        constexpr int BM = 64, BN = 128, BK = 2, WM = 1, WN = 8, ST = 4;
+        const int smem = w4a8::smem_bytes<BM, BN, BK, WM, WN, ST>();
+        const dim3 grid(static_cast<unsigned>((rows + BN - 1) / BN),
+                        static_cast<unsigned>((tokens + BM - 1) / BM));
+        w4a8::gemm_kernel<BM, BN, BK, WM, WN, ST>
+            <<<grid, WM * WN * 32, smem, engine->stream>>>(
+                wq, ws, engine->w4a8_aq, engine->w4a8_as, output, tokens, rows,
+                cols, out_stride);
+    } else {
+        constexpr int BM = 64, BN = 64, BK = 2, WM = 1, WN = 4, ST = 4;
+        const int smem = w4a8::smem_bytes<BM, BN, BK, WM, WN, ST>();
+        const dim3 grid(static_cast<unsigned>((rows + BN - 1) / BN),
+                        static_cast<unsigned>((tokens + BM - 1) / BM));
+        w4a8::gemm_kernel<BM, BN, BK, WM, WN, ST>
+            <<<grid, WM * WN * 32, smem, engine->stream>>>(
+                wq, ws, engine->w4a8_aq, engine->w4a8_as, output, tokens, rows,
+                cols, out_stride);
+    }
+}
+
+static unsigned w4a8_quant_blocks(int tokens, int cols) {
+    const size_t tasks = static_cast<size_t>(tokens) * (cols / kQK);
+    return static_cast<unsigned>((tasks + kWarpsPerBlock - 1) / kWarpsPerBlock);
+}
+
+// Quantize engine->half_input (tokens x cols fp16) to int8 SoA, then GEMM.
+static void w4a8_launch_gemm(cuda_engine *engine, const uint8_t *wq,
+                             const __half *ws, float *output, int rows,
+                             int cols, int tokens, int out_stride) {
+    quantize_w4a8_soa_kernel<<<w4a8_quant_blocks(tokens, cols), kThreads, 0,
+        engine->stream>>>(engine->half_input, engine->w4a8_aq, engine->w4a8_as,
+                          tokens, cols);
+    w4a8_gemm_only(engine, wq, ws, output, rows, cols, tokens, out_stride);
+}
+
+// ---------------------------------------------------------------------------
+// int8 attention (EI_CUDA_INT8_ATTN). Stage QK^T and optionally P*V on the
+// int8 IMMA tensor cores via cuBLAS (CUDA_R_8I -> CUDA_R_32I). Q/K/V and P are
+// symmetrically quantized (amax/127); the int32 partials are dequantized in
+// fp32 by the product of the two per-row/per-column scales. Softmax and the
+// online rescale stay in fp32/fp16.
+// ---------------------------------------------------------------------------
+
+// Quantize rows of length EI_HEAD_DIM (256) from fp16 to symmetric int8.
+// One warp per row (8 elements per lane). scale = amax/127.
+__global__ void quantize_attn_rows_kernel(const __half *input, int8_t *output,
+                                          float *scales, uint32_t rows) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const uint32_t row = blockIdx.x * kWarpsPerBlock + warp;
+    if (row >= rows) return;
+    const size_t base = static_cast<size_t>(row) * EI_HEAD_DIM;
+    float vals[EI_HEAD_DIM / 32];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < EI_HEAD_DIM / 32; i++) {
+        const int dim = lane + i * 32;
+        vals[i] = __half2float(input[base + dim]);
+        amax = fmaxf(amax, fabsf(vals[i]));
+    }
+    amax = warp_max(amax);
+    amax = __shfl_sync(kWarpMask, amax, 0);
+    const float scale = amax / 127.0f;
+    const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+#pragma unroll
+    for (int i = 0; i < EI_HEAD_DIM / 32; i++) {
+        const int dim = lane + i * 32;
+        int quant = __float2int_rn(vals[i] * inv);
+        quant = max(-127, min(127, quant));
+        output[base + dim] = static_cast<int8_t>(quant);
+    }
+    if (lane == 0) scales[row] = scale;
+}
+
+// Quantize softmax probabilities P[query][key] (fp16) to symmetric int8 per
+// query row (scale = rowmax/127). Rounds probabilities up to key_pad columns
+// with zeros so the int8 P*V GEMM sees a multiple-of-4 contraction dimension.
+__global__ void quantize_probs_i8_kernel(const __half *probs, int8_t *output,
+                                         float *scales, uint32_t query_count,
+                                         uint32_t key_count, uint32_t key_pad) {
+    __shared__ float partials[kWarpsPerBlock];
+    const uint32_t q = blockIdx.x;
+    if (q >= query_count) return;
+    const size_t src_base = static_cast<size_t>(q) * key_count;
+    const size_t dst_base = static_cast<size_t>(q) * key_pad;
+    float amax = 0.0f;
+    for (uint32_t key = threadIdx.x; key < key_count; key += blockDim.x) {
+        amax = fmaxf(amax, fabsf(__half2float(probs[src_base + key])));
+    }
+    amax = block_max(amax, partials);
+    const float scale = amax / 127.0f;
+    const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+    for (uint32_t key = threadIdx.x; key < key_pad; key += blockDim.x) {
+        int quant = 0;
+        if (key < key_count) {
+            quant = __float2int_rn(__half2float(probs[src_base + key]) * inv);
+            quant = max(-127, min(127, quant));
+        }
+        output[dst_base + key] = static_cast<int8_t>(quant);
+    }
+    if (threadIdx.x == 0) scales[q] = scale;
+}
+
+// Quantize V for one sequence to symmetric int8 with a per-column (per head
+// dimension) scale, so the scale factors cleanly out of the P*V contraction
+// over keys. One block per column; reduce amax over the key rows. Rows beyond
+// key_count (up to key_pad) are zeroed to match the padded probabilities.
+__global__ void quantize_v_cols_i8_kernel(const __half *v, int8_t *output,
+                                          float *scales, uint32_t key_count,
+                                          uint32_t key_pad) {
+    __shared__ float partials[kWarpsPerBlock];
+    const uint32_t dim = blockIdx.x;  // 0..EI_HEAD_DIM-1
+    float amax = 0.0f;
+    for (uint32_t key = threadIdx.x; key < key_count; key += blockDim.x) {
+        amax = fmaxf(amax, fabsf(__half2float(
+            v[static_cast<size_t>(key) * EI_HEAD_DIM + dim])));
+    }
+    amax = block_max(amax, partials);
+    const float scale = amax / 127.0f;
+    const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+    for (uint32_t key = threadIdx.x; key < key_pad; key += blockDim.x) {
+        int quant = 0;
+        if (key < key_count) {
+            quant = __float2int_rn(__half2float(
+                v[static_cast<size_t>(key) * EI_HEAD_DIM + dim]) * inv);
+            quant = max(-127, min(127, quant));
+        }
+        output[static_cast<size_t>(key) * EI_HEAD_DIM + dim] =
+            static_cast<int8_t>(quant);
+    }
+    if (threadIdx.x == 0) scales[dim] = scale;
+}
+
+// Dequantize the int32 P*V context, scaling by the per-query prob scale and the
+// per-column V scale, and write to the fp32 or fp16 attention output. The int32
+// context is [head_dim][query] column-major (ctx_i32[q*EI_HEAD_DIM + dim]).
+template <typename Output>
+__global__ void dequant_context_kernel(const int32_t *ctx_i32, Output *output,
+                                        const float *pscale, const float *vscale,
+                                        uint32_t query_count, size_t out_base,
+                                        uint32_t query_stride) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    const size_t total = static_cast<size_t>(query_count) * EI_HEAD_DIM;
+    if (idx >= total) return;
+    const uint32_t q = static_cast<uint32_t>(idx / EI_HEAD_DIM);
+    const uint32_t dim = static_cast<uint32_t>(idx -
+        static_cast<size_t>(q) * EI_HEAD_DIM);
+    const float value = static_cast<float>(ctx_i32[idx]) * pscale[q] *
+                        vscale[dim];
+    const size_t dst = out_base + static_cast<size_t>(q) * query_stride + dim;
+    store_attention_output(output, dst, value);
+}
+
 static bool tensor_core_attention(
     cuda_engine *engine, const std::vector<uint32_t> &offsets,
     uint32_t minimum_tokens, uint32_t window, bool output_f16,
     char *err, size_t err_len) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
+    const int32_t ialpha = 1;
+    const int32_t ibeta = 0;
+    const int int8_mode = engine->int8_attn;
+    // Symmetrically quantize Q and K once for every token that feeds the
+    // int8 QK^T path. Q keeps its [token][head*256+dim] layout so a single
+    // pass over EI_N_HEAD rows per token matches q_half exactly.
+    if (int8_mode >= 1 && !offsets.empty()) {
+        const uint32_t total = offsets.back();
+        if (total > 0) {
+            const uint32_t q_rows = total * EI_N_HEAD;
+            quantize_attn_rows_kernel<<<(q_rows + kWarpsPerBlock - 1) /
+                kWarpsPerBlock, kThreads, 0, engine->stream>>>(
+                    engine->q_half, engine->q8_attn, engine->q8_attn_scale,
+                    q_rows);
+            quantize_attn_rows_kernel<<<(total + kWarpsPerBlock - 1) /
+                kWarpsPerBlock, kThreads, 0, engine->stream>>>(
+                    engine->k_half, engine->k8_attn, engine->k8_attn_scale,
+                    total);
+        }
+    }
     for (size_t sequence = 0; sequence + 1 < offsets.size(); sequence++) {
         const uint32_t start = offsets[sequence];
         const int tokens = static_cast<int>(offsets[sequence + 1] - start);
         if (tokens < static_cast<int>(minimum_tokens)) continue;
+        // Per-column int8 V for this sequence (mode 2). Shared by all heads.
+        if (int8_mode >= 2) {
+            quantize_v_cols_i8_kernel<<<EI_HEAD_DIM, kThreads, 0,
+                engine->stream>>>(
+                    engine->v_half + static_cast<size_t>(start) * EI_HEAD_DIM,
+                    engine->v8_attn + static_cast<size_t>(start) * EI_HEAD_DIM,
+                    engine->v8_attn_scale, static_cast<uint32_t>(tokens),
+                    static_cast<uint32_t>(tokens));
+        }
         for (int head = 0; head < EI_N_HEAD; head++) {
             const uint32_t query_tile = window != 0 &&
                 static_cast<uint32_t>(tokens) >=
@@ -1533,29 +2128,98 @@ static bool tensor_core_attention(
                     : static_cast<void *>(engine->ctx + output_offset);
                 const cudaDataType_t output_type = output_f16
                     ? CUDA_R_16F : CUDA_R_32F;
-                if (!cublas_check(cublasGemmEx(
-                        engine->blas, CUBLAS_OP_T, CUBLAS_OP_N,
-                        static_cast<int>(key_count),
-                        static_cast<int>(query_count), EI_HEAD_DIM, &alpha,
-                        engine->k_half + static_cast<size_t>(start + key_start) *
-                            EI_HEAD_DIM,
-                        CUDA_R_16F, EI_HEAD_DIM,
-                        engine->q_half +
-                            static_cast<size_t>(start + query_start) * EI_N_EMBD +
-                            head * EI_HEAD_DIM,
-                        CUDA_R_16F, EI_N_EMBD,
-                        &beta, engine->attention_scores, CUDA_R_32F,
-                        static_cast<int>(key_count),
-                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                        "execute CUDA tensor-core QK", err, err_len)) {
-                    return false;
+                // Stage 1: S = Q * K^T, followed by softmax. The int8 path
+                // keeps the raw int32 partials and dequantizes inside the
+                // softmax so no extra [query x key] pass is needed.
+                if (int8_mode >= 1) {
+                    int32_t *scores_i32 = reinterpret_cast<int32_t *>(
+                        engine->attention_scores);
+                    if (!cublas_check(cublasGemmEx(
+                            engine->blas, CUBLAS_OP_T, CUBLAS_OP_N,
+                            static_cast<int>(key_count),
+                            static_cast<int>(query_count), EI_HEAD_DIM, &ialpha,
+                            engine->k8_attn + static_cast<size_t>(start +
+                                key_start) * EI_HEAD_DIM,
+                            CUDA_R_8I, EI_HEAD_DIM,
+                            engine->q8_attn + static_cast<size_t>(start +
+                                query_start) * EI_N_EMBD + head * EI_HEAD_DIM,
+                            CUDA_R_8I, EI_N_EMBD,
+                            &ibeta, scores_i32, CUDA_R_32I,
+                            static_cast<int>(key_count),
+                            CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "execute CUDA int8 tensor-core QK", err, err_len)) {
+                        return false;
+                    }
+                    attention_softmax_i8_kernel<<<query_count, kThreads, 0,
+                        engine->stream>>>(scores_i32, engine->attention_probs,
+                            engine->q8_attn_scale + static_cast<size_t>(start +
+                                query_start) * EI_N_HEAD + head, EI_N_HEAD,
+                            engine->k8_attn_scale + (start + key_start),
+                            query_start, key_start, query_count, key_count,
+                            static_cast<uint32_t>(tokens), window);
+                } else {
+                    if (!cublas_check(cublasGemmEx(
+                            engine->blas, CUBLAS_OP_T, CUBLAS_OP_N,
+                            static_cast<int>(key_count),
+                            static_cast<int>(query_count), EI_HEAD_DIM, &alpha,
+                            engine->k_half + static_cast<size_t>(start +
+                                key_start) * EI_HEAD_DIM,
+                            CUDA_R_16F, EI_HEAD_DIM,
+                            engine->q_half + static_cast<size_t>(start +
+                                query_start) * EI_N_EMBD + head * EI_HEAD_DIM,
+                            CUDA_R_16F, EI_N_EMBD,
+                            &beta, engine->attention_scores, CUDA_R_32F,
+                            static_cast<int>(key_count),
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "execute CUDA tensor-core QK", err, err_len)) {
+                        return false;
+                    }
+                    attention_softmax_f16_kernel<<<query_count, kThreads, 0,
+                        engine->stream>>>(engine->attention_scores,
+                            engine->attention_probs, query_start, key_start,
+                            query_count, key_count,
+                            static_cast<uint32_t>(tokens), window);
                 }
-                attention_softmax_f16_kernel<<<query_count, kThreads, 0,
-                    engine->stream>>>(engine->attention_scores,
-                        engine->attention_probs, query_start, key_start,
-                        query_count, key_count, static_cast<uint32_t>(tokens),
-                        window);
-                if (!cublas_check(cublasGemmEx(
+                // Stage 3: O = P * V. int8 P*V needs a multiple-of-4 key
+                // contraction (cuBLAS IMMA); other tiles keep the fp16 GEMM.
+                const bool int8_pv = int8_mode >= 2 && (key_count % 4 == 0);
+                if (int8_pv) {
+                    quantize_probs_i8_kernel<<<query_count, kThreads, 0,
+                        engine->stream>>>(engine->attention_probs,
+                            engine->p8_attn, engine->p8_attn_scale, query_count,
+                            key_count, key_count);
+                    int32_t *ctx_i32 = reinterpret_cast<int32_t *>(
+                        engine->attention_scores);
+                    if (!cublas_check(cublasGemmEx(
+                            engine->blas, CUBLAS_OP_N, CUBLAS_OP_N,
+                            EI_HEAD_DIM, static_cast<int>(query_count),
+                            static_cast<int>(key_count), &ialpha,
+                            engine->v8_attn + static_cast<size_t>(start +
+                                key_start) * EI_HEAD_DIM,
+                            CUDA_R_8I, EI_HEAD_DIM,
+                            engine->p8_attn, CUDA_R_8I,
+                            static_cast<int>(key_count),
+                            &ibeta, ctx_i32, CUDA_R_32I, EI_HEAD_DIM,
+                            CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "execute CUDA int8 tensor-core PV", err, err_len)) {
+                        return false;
+                    }
+                    const size_t ctx_total = static_cast<size_t>(query_count) *
+                        EI_HEAD_DIM;
+                    const unsigned ctx_blocks = static_cast<unsigned>(
+                        (ctx_total + kThreads - 1) / kThreads);
+                    if (output_f16) {
+                        dequant_context_kernel<__half><<<ctx_blocks, kThreads, 0,
+                            engine->stream>>>(ctx_i32, engine->half_input,
+                                engine->p8_attn_scale, engine->v8_attn_scale,
+                                query_count, output_offset, EI_N_EMBD);
+                    } else {
+                        dequant_context_kernel<float><<<ctx_blocks, kThreads, 0,
+                            engine->stream>>>(ctx_i32, engine->ctx,
+                                engine->p8_attn_scale, engine->v8_attn_scale,
+                                query_count, output_offset, EI_N_EMBD);
+                    }
+                } else if (!cublas_check(cublasGemmEx(
                         engine->blas, CUBLAS_OP_N, CUBLAS_OP_N,
                         EI_HEAD_DIM, static_cast<int>(query_count),
                         static_cast<int>(key_count), &alpha,
@@ -1635,6 +2299,28 @@ static bool launch_forward(cuda_engine *engine, uint32_t tokens,
                 native_q4_projection(engine, q4_weights(engine, layer->attn_v),
                                      engine->half_input, engine->v,
                                      EI_HEAD_DIM, EI_N_EMBD, tokens);
+            } else if (engine->w4a8_gemm) {
+                if (engine->w4a8_big_only) {
+                    if (!tensor_core_projection(engine,
+                            engine->layers[layer_index].attn_q,
+                            engine->half_input, engine->qkv_combined,
+                            EI_N_EMBD + 2 * EI_HEAD_DIM, EI_N_EMBD,
+                            tokens, err, err_len)) return false;
+                } else {
+                    w4a8_launch_gemm(engine, engine->w4a8_layers[layer_index].qkv,
+                                     engine->w4a8_layers[layer_index].qkv_s,
+                                     engine->qkv_combined,
+                                     EI_N_EMBD + 2 * EI_HEAD_DIM, EI_N_EMBD, tokens,
+                                     EI_N_EMBD + 2 * EI_HEAD_DIM);
+                }
+                if (!direct_fp16_qkv) {
+                    const size_t qkv_count = static_cast<size_t>(tokens) *
+                        (EI_N_EMBD + 2 * EI_HEAD_DIM);
+                    split_qkv_kernel<<<static_cast<unsigned>(
+                        (qkv_count + kThreads - 1) / kThreads), kThreads, 0,
+                        engine->stream>>>(engine->qkv_combined, engine->q,
+                                          engine->k, engine->v, tokens);
+                }
             } else {
                 if (!tensor_core_projection(engine,
                         engine->layers[layer_index].attn_q,
@@ -1780,7 +2466,8 @@ static bool launch_forward(cuda_engine *engine, uint32_t tokens,
                 engine->offsets, engine->sequence_ids, tokens, window);
         }
         if (use_gemm) {
-            if (!direct_fp16_context) {
+            const bool w4a8_ao = engine->w4a8_gemm && !engine->native_q4_gemm;
+            if (!direct_fp16_context && !w4a8_ao) {
                 convert_to_half(engine, engine->ctx,
                                 static_cast<size_t>(tokens) * EI_N_EMBD);
             }
@@ -1788,6 +2475,24 @@ static bool launch_forward(cuda_engine *engine, uint32_t tokens,
                 native_q4_projection(engine,
                     q4_weights(engine, layer->attn_output), engine->half_input,
                     engine->tmp, EI_N_EMBD, EI_N_EMBD, tokens);
+            } else if (engine->w4a8_gemm) {
+                // Fused: quantize the attention context straight to int8 SoA
+                // (from fp32 ctx, or fp16 half_input under direct_fp16_context).
+                if (direct_fp16_context) {
+                    quantize_w4a8_soa_kernel<<<w4a8_quant_blocks(tokens,
+                        EI_N_EMBD), kThreads, 0, engine->stream>>>(
+                            engine->half_input, engine->w4a8_aq, engine->w4a8_as,
+                            tokens, EI_N_EMBD);
+                } else {
+                    quantize_w4a8_soa_f32_kernel<<<w4a8_quant_blocks(tokens,
+                        EI_N_EMBD), kThreads, 0, engine->stream>>>(
+                            engine->ctx, engine->w4a8_aq, engine->w4a8_as,
+                            tokens, EI_N_EMBD);
+                }
+                w4a8_gemm_only(engine, engine->w4a8_layers[layer_index].ao,
+                               engine->w4a8_layers[layer_index].ao_s,
+                               engine->tmp, EI_N_EMBD, EI_N_EMBD, tokens,
+                               EI_N_EMBD);
             } else if (!tensor_core_projection(engine,
                            engine->layers[layer_index].attn_output,
                            engine->half_input, engine->tmp, EI_N_EMBD,
@@ -1829,6 +2534,29 @@ static bool launch_forward(cuda_engine *engine, uint32_t tokens,
                 native_q4_projection(engine, q4_weights(engine, layer->ffn_down),
                                      engine->half_input, engine->tmp,
                                      EI_N_EMBD, EI_N_FF, tokens);
+            } else if (engine->w4a8_gemm) {
+                if (engine->w4a8_big_only) {
+                    if (!tensor_core_projection(engine,
+                            engine->layers[layer_index].ffn_up,
+                            engine->half_input, engine->up_gate_combined,
+                            2 * EI_N_FF, EI_N_EMBD, tokens, err, err_len)) {
+                        return false;
+                    }
+                } else {
+                    w4a8_launch_gemm(engine,
+                        engine->w4a8_layers[layer_index].up_gate,
+                        engine->w4a8_layers[layer_index].up_gate_s,
+                        engine->up_gate_combined, 2 * EI_N_FF, EI_N_EMBD, tokens,
+                        2 * EI_N_FF);
+                }
+                // Fused gelu(gate)*up + int8 quantize straight to SoA.
+                up_gate_gelu_quantize_soa_kernel<<<w4a8_quant_blocks(tokens,
+                    EI_N_FF), kThreads, 0, engine->stream>>>(
+                        engine->up_gate_combined, engine->w4a8_aq,
+                        engine->w4a8_as, tokens);
+                w4a8_gemm_only(engine, engine->w4a8_layers[layer_index].down,
+                    engine->w4a8_layers[layer_index].down_s, engine->tmp,
+                    EI_N_EMBD, EI_N_FF, tokens, EI_N_EMBD);
             } else {
                 if (!tensor_core_projection(engine,
                         engine->layers[layer_index].ffn_up,
@@ -2236,6 +2964,36 @@ extern "C" void *ei_cuda_engine_create(const ei_model *model,
         }
         engine->q8_latency = std::strcmp(q8_latency_env, "1") == 0;
     }
+    // 0 = off (default), 1 = all four projections, 2 = attn_output + ffn_down
+    // only (the shapes where the int8 GEMM decisively beats cuBLAS fp16).
+    const char *w4a8_env = std::getenv("EI_CUDA_W4A8_GEMM");
+    if (w4a8_env && *w4a8_env) {
+        if (std::strcmp(w4a8_env, "0") != 0 && std::strcmp(w4a8_env, "1") != 0 &&
+            std::strcmp(w4a8_env, "2") != 0) {
+            set_error(err, err_len, "EI_CUDA_W4A8_GEMM must be 0, 1 or 2");
+            delete engine;
+            return nullptr;
+        }
+        engine->w4a8_gemm = std::strcmp(w4a8_env, "0") != 0;
+        engine->w4a8_big_only = std::strcmp(w4a8_env, "2") == 0;
+    }
+    if (engine->w4a8_gemm && device_properties.major < 8) {
+        set_error(err, err_len,
+                  "EI_CUDA_W4A8_GEMM requires compute capability 8.0 or newer");
+        delete engine;
+        return nullptr;
+    }
+    const char *int8_attn_env = std::getenv("EI_CUDA_INT8_ATTN");
+    if (int8_attn_env && *int8_attn_env) {
+        if (std::strcmp(int8_attn_env, "0") != 0 &&
+            std::strcmp(int8_attn_env, "1") != 0 &&
+            std::strcmp(int8_attn_env, "2") != 0) {
+            set_error(err, err_len, "EI_CUDA_INT8_ATTN must be 0, 1, or 2");
+            delete engine;
+            return nullptr;
+        }
+        engine->int8_attn = std::atoi(int8_attn_env);
+    }
     if (!cuda_check(cudaStreamCreateWithFlags(&engine->stream, cudaStreamNonBlocking),
                     "create CUDA stream", err, err_len)) {
         delete engine;
@@ -2258,7 +3016,9 @@ extern "C" void *ei_cuda_engine_create(const ei_model *model,
                     cudaMemcpyHostToDevice, engine->stream),
                     "copy CUDA model", err, err_len) ||
         (!engine->native_q4_gemm &&
-         !initialize_dequantized_weights(engine, err, err_len))) {
+         !initialize_dequantized_weights(engine, err, err_len)) ||
+        (engine->w4a8_gemm &&
+         !initialize_w4a8_weights(engine, err, err_len))) {
         ei_cuda_engine_free(engine);
         return nullptr;
     }
@@ -2290,6 +3050,13 @@ extern "C" void *ei_cuda_engine_create(const ei_model *model,
         !cuda_allocate(&engine->attention_probs,
                        static_cast<size_t>(EI_N_CTX) * EI_N_CTX,
                        "allocate CUDA attention probabilities", err, err_len) ||
+        !cuda_allocate(&engine->p8_attn,
+                       static_cast<size_t>(EI_N_CTX) * EI_N_CTX,
+                       "allocate CUDA int8 probabilities", err, err_len) ||
+        !cuda_allocate(&engine->p8_attn_scale, EI_N_CTX,
+                       "allocate CUDA int8 prob scale", err, err_len) ||
+        !cuda_allocate(&engine->v8_attn_scale, EI_HEAD_DIM,
+                       "allocate CUDA int8 V column scale", err, err_len) ||
         !cuda_check(cudaMemcpyAsync(engine->rope_full, full.data(),
                     rope_count * sizeof(float2), cudaMemcpyHostToDevice,
                     engine->stream), "copy CUDA full RoPE table", err, err_len) ||
@@ -2316,7 +3083,17 @@ extern "C" void ei_cuda_engine_free(void *handle) {
     cuda_release(engine->rope_full);
     cuda_release(engine->attention_probs);
     cuda_release(engine->attention_scores);
+    cuda_release(engine->p8_attn);
+    cuda_release(engine->p8_attn_scale);
+    cuda_release(engine->v8_attn_scale);
     cuda_release(engine->dequantized_weights);
+    for (int L = 0; L < EI_N_LAYER; L++) {
+        cuda_engine::w4a8_weights &w = engine->w4a8_layers[L];
+        cuda_release(w.qkv); cuda_release(w.qkv_s);
+        cuda_release(w.ao); cuda_release(w.ao_s);
+        cuda_release(w.up_gate); cuda_release(w.up_gate_s);
+        cuda_release(w.down); cuda_release(w.down_s);
+    }
     cuda_release(engine->model_data);
     if (engine->blas) cublasDestroy(engine->blas);
     if (engine->stream) cudaStreamDestroy(engine->stream);

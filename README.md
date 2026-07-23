@@ -119,12 +119,12 @@ runtime is unavailable.
 Pin a release, backend, or installation directory when needed:
 
 ```sh
-./install.sh --version v0.3.0
+./install.sh --version v0.3.1
 ./install.sh --variant cpu
 ./install.sh --install-dir "$HOME/bin"
 ```
 
-Published executables are deliberately small. Release `v0.3.0` contains:
+Published executables are deliberately small. Release `v0.3.1` contains:
 
 | platform | backend | executable size |
 |---|---|---:|

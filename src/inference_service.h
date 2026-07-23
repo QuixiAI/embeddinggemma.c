@@ -48,6 +48,10 @@ bool ei_inference_service_embed_batch(ei_inference_service *service,
                                       const size_t *text_lengths,
                                       size_t batch_size, float *out,
                                       char *err, size_t err_len);
+bool ei_inference_service_embed_batch_with_usage(
+    ei_inference_service *service, const char *const *texts,
+    const size_t *text_lengths, size_t batch_size, float *out,
+    size_t *prompt_tokens, char *err, size_t err_len);
 bool ei_inference_service_embed_tokens(ei_inference_service *service,
                                        const int32_t *ids, size_t n_tokens,
                                        float out[EI_N_EMBD],

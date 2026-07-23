@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end checks for the /api/embed Matryoshka dimensions contract."""
+"""End-to-end checks for native and OpenAI-compatible embedding routes."""
 
 import argparse
 import base64
@@ -125,7 +125,11 @@ def check_discovery(base_url):
     }
     if any(root.get(key) != value for key, value in expected.items()):
         raise AssertionError(f"unexpected root discovery response: {root!r}")
-    if root.get("routes") != ["GET /api/tags", "POST /api/embed"]:
+    if root.get("routes") != [
+        "GET /api/tags",
+        "POST /api/embed",
+        "POST /v1/embeddings",
+    ]:
         raise AssertionError(f"unexpected advertised routes: {root.get('routes')!r}")
 
     content_type, body = get(base_url + "/healthz")
@@ -136,7 +140,13 @@ def check_discovery(base_url):
     if content_type != "text/html":
         raise AssertionError(f"docs returned {content_type!r}")
     html = body.decode("utf-8")
-    for marker in ("embeddinggemma API", "/healthz", "/api/tags", "/api/embed"):
+    for marker in (
+        "embeddinggemma API",
+        "/healthz",
+        "/api/tags",
+        "/api/embed",
+        "/v1/embeddings",
+    ):
         if marker not in html:
             raise AssertionError(f"docs are missing {marker!r}")
 
@@ -146,7 +156,15 @@ def check_discovery(base_url):
     openapi = json.loads(body)
     if openapi.get("openapi") != "3.1.0":
         raise AssertionError("OpenAPI document does not declare version 3.1.0")
-    expected_paths = {"/", "/docs", "/openapi.json", "/healthz", "/api/tags", "/api/embed"}
+    expected_paths = {
+        "/",
+        "/docs",
+        "/openapi.json",
+        "/healthz",
+        "/api/tags",
+        "/api/embed",
+        "/v1/embeddings",
+    }
     if set(openapi.get("paths", {})) != expected_paths:
         raise AssertionError(f"unexpected OpenAPI paths: {openapi.get('paths')!r}")
 
@@ -160,6 +178,8 @@ def check_dimensions(base_url):
     url = base_url + "/api/embed"
     text = "search_query: Matryoshka dimensions regression test"
     default = post(url, {"model": "embeddinggemma-300m", "input": [text]})
+    if set(default) != {"embeddings"}:
+        raise AssertionError(f"native response envelope changed: {default.keys()!r}")
     full = default["embeddings"][0]
     explicit = post(url, {"input": [text], "dimensions": 768})
     if full != explicit["embeddings"][0]:
@@ -261,6 +281,80 @@ def check_dimensions(base_url):
             raise AssertionError(f"unexpected error for encoding_format={encoding!r}")
 
 
+def check_openai_compatibility(base_url):
+    native_url = base_url + "/api/embed"
+    openai_url = base_url + "/v1/embeddings"
+    model = "sovereign-embedding"
+    text = "task: search result | query: OpenAI compatibility regression test"
+    payload = {"model": model, "input": [text], "dimensions": 128}
+
+    # Use the identical serialized request body on both routes. This catches
+    # cross-route response-cache collisions while proving the native envelope
+    # remains unchanged.
+    native = post(native_url, payload)
+    result = post(openai_url, payload)
+    if set(native) != {"embeddings"}:
+        raise AssertionError("OpenAI route changed the native response envelope")
+    if result.get("object") != "list" or result.get("model") != model:
+        raise AssertionError(f"unexpected OpenAI response envelope: {result!r}")
+    data = result.get("data")
+    if not isinstance(data, list) or len(data) != 1:
+        raise AssertionError("OpenAI response did not return one data item")
+    item = data[0]
+    if item.get("object") != "embedding" or item.get("index") != 0:
+        raise AssertionError(f"unexpected OpenAI embedding item: {item!r}")
+    if item.get("embedding") != native["embeddings"][0]:
+        raise AssertionError("OpenAI and native routes returned different embeddings")
+    usage = result.get("usage")
+    if not isinstance(usage, dict) or usage.get("prompt_tokens", 0) <= 0:
+        raise AssertionError(f"OpenAI response has invalid usage: {usage!r}")
+    if usage["total_tokens"] != usage["prompt_tokens"]:
+        raise AssertionError("embedding total_tokens must equal prompt_tokens")
+
+    batch = post(
+        openai_url,
+        {"model": model, "input": [text, text], "dimensions": 128},
+    )
+    if [item.get("index") for item in batch.get("data", [])] != [0, 1]:
+        raise AssertionError("OpenAI batch indexes are not order-preserving")
+    if batch["usage"]["prompt_tokens"] != usage["prompt_tokens"] * 2:
+        raise AssertionError("OpenAI batch usage did not sum tokenizer counts")
+
+    encoded = post(
+        openai_url,
+        {
+            "model": model,
+            "input": text,
+            "dimensions": 256,
+            "encoding_format": "base64",
+        },
+    )["data"][0]["embedding"]
+    if len(base64.b64decode(encoded, validate=True)) != 256 * 4:
+        raise AssertionError("OpenAI base64 embedding has the wrong byte length")
+
+    for payload, parameter in (
+        ({"input": text}, "model"),
+        ({"model": model, "input": text, "dimensions": 42}, "dimensions"),
+        ({"model": model, "input": 42}, "input"),
+    ):
+        error = post(openai_url, payload, expected_status=400).get("error")
+        if not isinstance(error, dict):
+            raise AssertionError(f"OpenAI error is not an object: {error!r}")
+        if error.get("type") != "invalid_request_error":
+            raise AssertionError(f"unexpected OpenAI error type: {error!r}")
+        if parameter not in error.get("message", ""):
+            raise AssertionError(f"OpenAI error did not identify {parameter}: {error!r}")
+        if "param" not in error or "code" not in error:
+            raise AssertionError(f"OpenAI error fields are incomplete: {error!r}")
+
+    native_again = post(
+        native_url,
+        payload={"model": model, "input": [text], "dimensions": 128},
+    )
+    if set(native_again) != {"embeddings"}:
+        raise AssertionError("OpenAI cache entry leaked into the native route")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
@@ -295,6 +389,7 @@ def main():
         check_discovery(base_url)
         check_keep_alive(base_url)
         check_dimensions(base_url)
+        check_openai_compatibility(base_url)
     finally:
         process.terminate()
         try:

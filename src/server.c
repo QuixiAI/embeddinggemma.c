@@ -57,6 +57,11 @@ typedef enum {
     EMBEDDING_ENCODING_BASE64,
 } embedding_encoding;
 
+typedef enum {
+    EMBEDDING_API_NATIVE,
+    EMBEDDING_API_OPENAI,
+} embedding_api;
+
 typedef struct {
     char *data;
     size_t n;
@@ -416,6 +421,26 @@ static bool parse_embed_request(const char *body, string_list *inputs,
     return true;
 }
 
+static bool parse_required_model(const char *body, sv_string *model,
+                                 char *err, size_t err_len) {
+    const char *p = find_json_field(body, "model");
+    if (!p) {
+        snprintf(err, err_len, "request JSON must contain a model field");
+        return false;
+    }
+    if (!parse_json_string(&p, model, err, err_len)) {
+        snprintf(err, err_len, "model must be a string");
+        return false;
+    }
+    if (model->len == 0) {
+        free(model->s);
+        *model = (sv_string){0};
+        snprintf(err, err_len, "model must not be empty");
+        return false;
+    }
+    return true;
+}
+
 static void send_header_and_body(int fd, const char *hdr, size_t hdr_len,
                                  const char *body, size_t body_len) {
     struct iovec iov[2] = {
@@ -481,6 +506,38 @@ static void http_error(int fd, int status, const char *reason, const char *msg,
                   b.data ? b.data : "{\"error\":\"unknown\"}\n",
                   keep_alive);
     free(b.data);
+}
+
+static void openai_http_error(int fd, int status, const char *reason,
+                              const char *msg, const char *param,
+                              bool keep_alive) {
+    sbuf b = {0};
+    sbuf_append_z(&b, "{\"error\":{\"message\":");
+    sbuf_append_json_string(&b, msg, strlen(msg));
+    sbuf_append_z(&b, ",\"type\":\"");
+    sbuf_append_z(&b, status >= 500 ? "server_error" : "invalid_request_error");
+    sbuf_append_z(&b, "\",\"param\":");
+    if (param) sbuf_append_json_string(&b, param, strlen(param));
+    else sbuf_append_z(&b, "null");
+    sbuf_append_z(&b, ",\"code\":null}}\n");
+    http_response(fd, status, reason, b.data, keep_alive);
+    free(b.data);
+}
+
+static void embedding_http_error(int fd, embedding_api api, int status,
+                                 const char *reason, const char *msg,
+                                 const char *param, bool keep_alive) {
+    if (api == EMBEDDING_API_OPENAI) {
+        openai_http_error(fd, status, reason, msg, param, keep_alive);
+    } else {
+        http_error(fd, status, reason, msg, keep_alive);
+    }
+}
+
+static const char *embed_request_error_param(const char *message) {
+    if (strstr(message, "dimensions")) return "dimensions";
+    if (strstr(message, "encoding_format")) return "encoding_format";
+    return "input";
 }
 
 static bool ascii_equal_ci(const char *a, const char *b, size_t n) {
@@ -668,33 +725,57 @@ static void handle_tags(int fd, const server_opts *opts, bool keep_alive) {
 static void handle_embed(int fd, ei_inference_service *service,
                          const server_opts *opts, const char *body,
                          size_t body_len, bool keep_alive,
-                         ei_response_cache *response_cache) {
+                         ei_response_cache *response_cache,
+                         embedding_api api) {
     char err[256];
     string_list inputs = {0};
+    sv_string model = {0};
     int32_t dimensions;
     embedding_encoding encoding;
+    if (api == EMBEDDING_API_OPENAI &&
+        !parse_required_model(body, &model, err, sizeof err)) {
+        openai_http_error(fd, 400, "Bad Request", err, "model", keep_alive);
+        return;
+    }
     if (!parse_embed_request(body, &inputs, &dimensions, &encoding,
                              err, sizeof err)) {
         free_inputs(&inputs);
-        http_error(fd, 400, "Bad Request", err, keep_alive);
+        free(model.s);
+        embedding_http_error(fd, api, 400, "Bad Request", err,
+                             embed_request_error_param(err), keep_alive);
         return;
     }
     if (inputs.n > opts->max_client_batch_size) {
         snprintf(err, sizeof err, "batch size %zu exceeds maximum %zu",
                  inputs.n, opts->max_client_batch_size);
         free_inputs(&inputs);
-        http_error(fd, 400, "Bad Request", err, keep_alive);
+        free(model.s);
+        embedding_http_error(fd, api, 400, "Bad Request", err, "input",
+                             keep_alive);
         return;
+    }
+
+    const char *cache_key = body;
+    size_t cache_key_len = body_len;
+    char *owned_cache_key = NULL;
+    if (api == EMBEDDING_API_OPENAI) {
+        owned_cache_key = ei_xmalloc(body_len + 1u);
+        owned_cache_key[0] = '\1';
+        memcpy(owned_cache_key + 1u, body, body_len);
+        cache_key = owned_cache_key;
+        cache_key_len++;
     }
     if (encoding == EMBEDDING_ENCODING_FLOAT) {
         ei_response_cache_value cached;
         if (ei_response_cache_acquire(
-                response_cache, body, body_len, &cached)) {
+                response_cache, cache_key, cache_key_len, &cached)) {
             http_response_raw(fd, 200, "OK",
                               "application/json; charset=utf-8",
                               cached.data, cached.len, keep_alive);
             ei_response_cache_release(response_cache, &cached);
+            free(owned_cache_key);
             free_inputs(&inputs);
+            free(model.s);
             return;
         }
     }
@@ -706,32 +787,46 @@ static void handle_embed(int fd, ei_inference_service *service,
         texts[i] = inputs.items[i].s;
         lengths[i] = inputs.items[i].len;
     }
-    if (!ei_inference_service_embed_batch(
-            service, texts, lengths, inputs.n, embeddings, err, sizeof err)) {
+    size_t prompt_tokens = 0;
+    if (!ei_inference_service_embed_batch_with_usage(
+            service, texts, lengths, inputs.n, embeddings, &prompt_tokens,
+            err, sizeof err)) {
         free(embeddings);
         free(lengths);
         free(texts);
+        free(owned_cache_key);
         free_inputs(&inputs);
-        http_error(fd, 400, "Bad Request", err, keep_alive);
+        free(model.s);
+        embedding_http_error(fd, api, 400, "Bad Request", err, "input",
+                             keep_alive);
         return;
     }
 
     sbuf out = {0};
     sbuf_reserve(&out, inputs.n * ((size_t)dimensions * 16u + 3u) + 32u);
-    sbuf_append_z(&out, "{\"embeddings\":[");
+    sbuf_append_z(&out, api == EMBEDDING_API_OPENAI
+        ? "{\"object\":\"list\",\"data\":["
+        : "{\"embeddings\":[");
     for (size_t i = 0; i < inputs.n; i++) {
         float *emb = embeddings + i * EI_N_EMBD;
         if (!ei_embedding_normalize_prefix(emb, dimensions)) {
             free_inputs(&inputs);
+            free(model.s);
+            free(owned_cache_key);
             free(embeddings);
             free(lengths);
             free(texts);
             free(out.data);
-            http_error(fd, 500, "Internal Server Error",
-                       "unsupported embedding dimensions", keep_alive);
+            embedding_http_error(fd, api, 500, "Internal Server Error",
+                                 "unsupported embedding dimensions",
+                                 "dimensions", keep_alive);
             return;
         }
         if (i) sbuf_append_z(&out, ",");
+        if (api == EMBEDDING_API_OPENAI) {
+            sbuf_append_z(&out,
+                          "{\"object\":\"embedding\",\"embedding\":");
+        }
         if (encoding == EMBEDDING_ENCODING_BASE64) {
             sbuf_append_z(&out, "\"");
             sbuf_append_base64_f32(&out, emb, (size_t)dimensions);
@@ -744,12 +839,16 @@ static void handle_embed(int fd, ei_inference_service *service,
                 const size_t n = ei_f32_to_chars(out.data + out.n, emb[d]);
                 if (n == 0) {
                     free_inputs(&inputs);
+                    free(model.s);
+                    free(owned_cache_key);
                     free(embeddings);
                     free(lengths);
                     free(texts);
                     free(out.data);
-                    http_error(fd, 500, "Internal Server Error",
-                               "failed to format embedding", keep_alive);
+                    embedding_http_error(fd, api, 500,
+                                         "Internal Server Error",
+                                         "failed to format embedding", NULL,
+                                         keep_alive);
                     return;
                 }
                 out.n += n;
@@ -757,11 +856,26 @@ static void handle_embed(int fd, ei_inference_service *service,
             }
             sbuf_append_z(&out, "]");
         }
+        if (api == EMBEDDING_API_OPENAI) {
+            char index[64];
+            snprintf(index, sizeof index, ",\"index\":%zu}", i);
+            sbuf_append_z(&out, index);
+        }
     }
-    sbuf_append_z(&out, "]}");
+    if (api == EMBEDDING_API_OPENAI) {
+        sbuf_append_z(&out, "],\"model\":");
+        sbuf_append_json_string(&out, model.s, model.len);
+        char usage[160];
+        snprintf(usage, sizeof usage,
+                 ",\"usage\":{\"prompt_tokens\":%zu,\"total_tokens\":%zu}}",
+                 prompt_tokens, prompt_tokens);
+        sbuf_append_z(&out, usage);
+    } else {
+        sbuf_append_z(&out, "]}");
+    }
     if (encoding == EMBEDDING_ENCODING_FLOAT) {
         ei_response_cache_insert(
-            response_cache, body, body_len, out.data, out.n);
+            response_cache, cache_key, cache_key_len, out.data, out.n);
     }
     http_response_raw(fd, 200, "OK", "application/json; charset=utf-8",
                       out.data, out.n, keep_alive);
@@ -769,7 +883,9 @@ static void handle_embed(int fd, ei_inference_service *service,
     free(embeddings);
     free(lengths);
     free(texts);
+    free(owned_cache_key);
     free_inputs(&inputs);
+    free(model.s);
 }
 
 static bool request_keep_alive(const char *headers, const char *version) {
@@ -825,7 +941,11 @@ static bool handle_client(http_connection *connection,
         handle_tags(connection->fd, opts, keep_alive);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/embed") == 0) {
         handle_embed(connection->fd, service, opts, body, body_len,
-                     keep_alive, response_cache);
+                     keep_alive, response_cache, EMBEDDING_API_NATIVE);
+    } else if (strcmp(method, "POST") == 0 &&
+               strcmp(path, "/v1/embeddings") == 0) {
+        handle_embed(connection->fd, service, opts, body, body_len,
+                     keep_alive, response_cache, EMBEDDING_API_OPENAI);
     } else {
         http_error(connection->fd, 404, "Not Found",
                    "route not found; see GET /docs or GET /openapi.json",

@@ -349,9 +349,12 @@ GPU generation.
 
 ## Runtime And Serving
 
-The canonical HTTP port is `42666`. `--bind`, `--port`, and `--model` override
-the listener and model path. The default model path is documented above;
-resolution order is `--model`, `EI_MODEL_PATH`, then that cache path.
+The canonical HTTP port is `42666`. The original `/api/embed` route and the
+additive OpenAI-compatible `/v1/embeddings` route share one inference service;
+their response-cache keys are format-namespaced. `--bind`, `--port`, and
+`--model` override the listener and model path. The default model path is
+documented above; resolution order is `--model`, `EI_MODEL_PATH`, then that
+cache path.
 
 Important production controls:
 

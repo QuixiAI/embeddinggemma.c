@@ -3,8 +3,9 @@
 A minimal inference engine for exactly one model:
 `ggml-org/embeddinggemma-300M-qat-q4_0-GGUF`. Hand-ported from the llama.cpp
 reference with no ggml dependency. CPU ARM64/x64, Metal, CUDA, ROCm/HIP, and
-XPU SYCL are implemented. The server exposes the
-`/api/embed` HTTP contract that `db/03` `get_embedding()` already speaks.
+XPU SYCL are implemented. The server exposes the original `/api/embed` HTTP
+contract that `db/03` `get_embedding()` already speaks plus an additive
+OpenAI-compatible `/v1/embeddings` route.
 
 **Parity target**: llama.cpp CPU inference of the file below is ground truth.
 `testdata/goldens-llamacpp.json` holds raw and L2-normalized mean-pooled
@@ -104,6 +105,12 @@ llama.cpp deep-read) before implementing.
   `float` is the default array-of-numbers contract. `base64` returns one string
   per embedding containing `dimensions * 4` little-endian IEEE-754 float32
   bytes. Unsupported values return HTTP 400.
+- `POST /v1/embeddings` accepts the same string inputs, dimensions, and
+  encoding formats. `model` is required and echoed without restricting gateway
+  aliases. The response uses the OpenAI `object: "list"` envelope, indexed
+  `data` entries, and exact `prompt_tokens` / `total_tokens` usage. Errors use
+  the OpenAI error object. `/api/embed` response and error envelopes remain
+  unchanged.
 - The engine and exact-result cache always produce one canonical 768-vector.
   Lower-dimensional responses take its leading Matryoshka prefix and L2
   normalize that prefix. Dimensions therefore do not fragment the cache.
@@ -120,8 +127,10 @@ llama.cpp deep-read) before implementing.
   and idle timeout. At least half the default worker pool remains available for
   newly accepted connections.
 - Successful float-JSON responses may be cached by exact request-body bytes in
-  a byte-bounded server LRU. Base64 and error responses are not stored. This is
-  separate from canonical token-ID embedding caching and duplicate singleflight.
+  a byte-bounded server LRU. Cache keys are namespaced by API format so an
+  identical request body cannot cross-contaminate the native and OpenAI
+  envelopes. Base64 and error responses are not stored. This is separate from
+  canonical token-ID embedding caching and duplicate singleflight.
 
 ## Backend Status
 

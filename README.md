@@ -73,6 +73,23 @@ The response is:
 {"embeddings":[[0.0123,-0.0456]]}
 ```
 
+An additive OpenAI-compatible endpoint is available for gateways and existing
+SDKs. The original `/api/embed` contract remains supported:
+
+```sh
+curl -sS http://127.0.0.1:42666/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "embeddinggemma-300m",
+    "input": ["task: search result | query: what powers the cell"],
+    "dimensions": 256
+  }'
+```
+
+The OpenAI response contains the standard `object`, `data`, `model`, and
+`usage` fields. The requested model name is echoed so a gateway can use a
+stable alias, and `usage` reports the exact number of tokens processed.
+
 `input` accepts one string or an array of strings. Text is embedded exactly as
 provided, so include the [EmbeddingGemma prompt prefix](https://ai.google.dev/gemma/docs/embeddinggemma/model_card#prompt_instructions)
 for your task: `task: search result | query: {text}` for search queries and

@@ -840,6 +840,14 @@ bool ei_inference_service_embed_batch(ei_inference_service *service,
                                       const size_t *text_lengths,
                                       size_t batch_size, float *out,
                                       char *err, size_t err_len) {
+    return ei_inference_service_embed_batch_with_usage(
+        service, texts, text_lengths, batch_size, out, NULL, err, err_len);
+}
+
+bool ei_inference_service_embed_batch_with_usage(
+    ei_inference_service *service, const char *const *texts,
+    const size_t *text_lengths, size_t batch_size, float *out,
+    size_t *prompt_tokens, char *err, size_t err_len) {
     if (!service || !service->tokenizer || !texts || !text_lengths ||
         batch_size == 0) {
         set_error(err, err_len, "embedding batch must contain at least one input");
@@ -888,6 +896,12 @@ bool ei_inference_service_embed_batch(ei_inference_service *service,
             free(tokens);
             set_error(err, err_len, "input token count must be 1..2048");
             return false;
+        }
+    }
+    if (prompt_tokens) {
+        *prompt_tokens = 0;
+        for (size_t i = 0; i < batch_size; i++) {
+            *prompt_tokens += tokens[i].n;
         }
     }
 

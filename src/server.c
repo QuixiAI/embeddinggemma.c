@@ -277,7 +277,9 @@ static bool media_audio_submit(void *ctx, const float *mel, int frames, float **
 #define MAX_BODY_BYTES (16u * 1024u * 1024u)
 #define MAX_HEADER_BYTES (64u * 1024u)
 
+#ifndef _WIN32
 extern char **environ;
+#endif
 
 #if defined(EI_ENABLE_ROCM)
 #define DEFAULT_INFERENCE_BACKEND "rocm"

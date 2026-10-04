@@ -22,7 +22,7 @@ jobs:
             platform: linux-x86_64
           - os: ubuntu-24.04-arm
             platform: linux-arm64
-          - os: macos-14
+          - os: macos-15
             platform: darwin-arm64
           - os: windows-2022
             platform: windows-x86_64
@@ -57,6 +57,26 @@ jobs:
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: make test
+      - name: Verify actual executable format and architecture
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          suffix=''
+          if [ "$RUNNER_OS" = Windows ]; then suffix='.exe'; fi
+          python scripts/check-binary-platform.py "$PLATFORM" "build/embeddinggemma${suffix}"
+      - name: Inspect Windows runtime dependencies
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          objdump -f build/embeddinggemma.exe
+          objdump -p build/embeddinggemma.exe | grep 'DLL Name'
+          if objdump -p build/embeddinggemma.exe | grep -Ei 'DLL Name:.*(msys-|cygwin|libwinpthread|libgcc|libstdc)'; then
+            echo 'unexpected non-system runtime DLL dependency' >&2
+            exit 1
+          fi
+      - name: Inspect Unix executable
+        if: runner.os != 'Windows'
+        run: uname -m && file build/embeddinggemma && cc --version
       - name: Strip Windows executable
         if: runner.os == 'Windows'
         shell: msys2 {0}

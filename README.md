@@ -302,7 +302,7 @@ and Metal release targets remain available through the upstream build process.
 
 CPU builds use the compiler's baseline architecture, without `-march=native`:
 x86_64 uses SSE2 and ARM64 uses NEON. Linux artifacts are built on Ubuntu 24.04
-and require a compatible glibc (2.39 or later); macOS ARM64 targets macOS 14 or
+and require a compatible glibc (2.39 or later); macOS ARM64 is tested on the macOS 15 runner and targets macOS 14 or
 later. Windows uses a native MinGW UCRT64 executable with statically linked
 winpthreads and compiler runtime, tested on Windows Server 2022. It requires
 Windows' Universal C Runtime; older Windows versions are not CI-tested.

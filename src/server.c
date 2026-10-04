@@ -1426,8 +1426,18 @@ static void mkdir_p(const char *path) {
         free(tmp);
         return;
     }
-    for (size_t i = 1; i < n; i++) {
-        if (tmp[i] == '/' && !(i == 2 && tmp[1] == ':')) {
+    size_t start = 1;
+#ifdef _WIN32
+    start = ei_windows_directory_start(tmp);
+    if (start == SIZE_MAX) ei_die("invalid UNC directory: %s", path);
+    if (tmp[0] == '/' && tmp[1] == '/' && start >= n) {
+        /* Existing share roots are managed by SMB, never created here. */
+        free(tmp);
+        return;
+    }
+#endif
+    for (size_t i = start; i < n; i++) {
+        if (tmp[i] == '/') {
             tmp[i] = '\0';
             ensure_dir(tmp);
             tmp[i] = '/';

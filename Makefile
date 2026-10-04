@@ -745,5 +745,9 @@ $(BUILD)/test_downloader_fixture: src/test_downloader_fixture.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
 .PHONY: test-windows-download
-test-windows-download: $(BUILD)/embeddinggemma $(BUILD)/test_downloader_fixture
+$(BUILD)/test_windows_paths: src/test_windows_paths.c src/windows_compat.h src/common.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+test-windows-download: $(BUILD)/embeddinggemma $(BUILD)/test_downloader_fixture $(BUILD)/test_windows_paths
+	./$(BUILD)/test_windows_paths
 	python3 testdata/test_windows_download.py --binary ./$(BUILD)/embeddinggemma.exe --downloader ./$(BUILD)/test_downloader_fixture.exe

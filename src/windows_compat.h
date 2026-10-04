@@ -15,6 +15,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* A network server is not a directory: preserve the complete UNC share root
+ * before mkdir_p visits any separator. Input separators are already '/'. */
+static inline size_t ei_windows_directory_start(const char *path) {
+    if (path[0] == '/' && path[1] == '/') {
+        const char *server_end = strchr(path + 2, '/');
+        if (!server_end || server_end == path + 2 || !server_end[1]) return SIZE_MAX;
+        const char *share_end = strchr(server_end + 1, '/');
+        if (share_end == server_end + 1) return SIZE_MAX;
+        return share_end ? (size_t)(share_end - path) + 1 : strlen(path) + 1;
+    }
+    return strlen(path) >= 3 && path[1] == ':' && path[2] == '/' ? 3 : 1;
+}
+
 /* Exclusive creation preserves mkstemp's security and binary file semantics. */
 static inline int ei_mkstemp(char *pattern) {
     size_t n = strlen(pattern);

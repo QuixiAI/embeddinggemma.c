@@ -84,6 +84,25 @@ jobs:
       - name: Strip Unix executable
         if: runner.os != 'Windows'
         run: strip build/embeddinggemma
+      - name: Preserve Windows runtime notices and toolchain provenance
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist/licenses
+          packages=(mingw-w64-ucrt-x86_64-crt mingw-w64-ucrt-x86_64-winpthreads mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgcc)
+          pacman -Q "${packages[@]}" > dist/toolchain.txt
+          gcc --version >> dist/toolchain.txt
+          while IFS= read -r notice; do
+            if [ -f "$notice" ]; then
+              relative="${notice#*/share/licenses/}"
+              mkdir -p "dist/licenses/$(dirname "$relative")"
+              cp "$notice" "dist/licenses/$relative"
+            fi
+          done < <(pacman -Qql "${packages[@]}" | grep '/share/licenses/')
+          test -n "$(find dist/licenses -type f -print -quit)"
+      - name: Preserve Unix toolchain provenance
+        if: runner.os != 'Windows'
+        run: mkdir -p dist && cc --version > dist/toolchain.txt
       - name: Stage executable and checksum
         env:
           PLATFORM: ${{ matrix.platform }}
@@ -95,6 +114,7 @@ jobs:
           cp "build/embeddinggemma${suffix}" "dist/$name"
           python -c 'import hashlib,pathlib; p=next(pathlib.Path("dist").glob("embeddinggemma-*")); p.with_name(p.name+".sha256").write_text(hashlib.sha256(p.read_bytes()).hexdigest()+"  "+p.name+"\n")'
           cp LICENSE dist/LICENSE
+          git rev-parse HEAD > dist/SOURCE_REVISION
       - name: Upload verified executable
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

@@ -4,21 +4,73 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   portable:
-    name: Portable checks (${{ matrix.os }})
+    name: CPU binary (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x86_64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: macos-14
+            platform: darwin-arm64
+          - os: windows-2022
+            platform: windows-x86_64
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - name: Run model-free checks
-        run: make check
-      - name: Build CPU server
-        run: make
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up native Windows compiler
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-python
+      - name: Run model-free checks and build
+        if: runner.os != 'Windows'
+        run: make check && make
+      - name: Run native Windows checks and build
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make check && make
+      - name: Download public upstream test model
+        run: |
+          mkdir -p model
+          curl -fL --retry 3 -o model/embeddinggemma-300M-qat-Q4_0.gguf 'https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/embeddinggemma-300M-qat-Q4_0.gguf'
+      - name: Run embedding and HTTP conformance checks
+        if: runner.os != 'Windows'
+        run: make test
+      - name: Run native Windows embedding and HTTP checks
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make test
+      - name: Stage executable and checksum
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p dist
+          suffix=''
+          if [ "$RUNNER_OS" = Windows ]; then suffix='.exe'; fi
+          name="embeddinggemma-${PLATFORM}-cpu${suffix}"
+          cp "build/embeddinggemma${suffix}" "dist/$name"
+          python -c 'import hashlib,pathlib; p=next(pathlib.Path("dist").glob("embeddinggemma-*")); p.with_name(p.name+".sha256").write_text(hashlib.sha256(p.read_bytes()).hexdigest()+"  "+p.name+"\n")'
+          cp LICENSE dist/LICENSE
+      - name: Upload verified executable
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: embeddinggemma-${{ matrix.platform }}-cpu
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30

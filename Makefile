@@ -3,6 +3,10 @@ CC      ?= cc
 CXX     ?= c++
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Werror -g
 LDLIBS  ?= -lm -pthread
+ifneq ($(findstring MINGW,$(shell uname -s)),)
+CFLAGS += -D_WIN32_WINNT=0x0601 -D_CRT_RAND_S -D__USE_MINGW_ANSI_STDIO=1
+LDLIBS += -lws2_32 -static
+endif
 NVCC    ?= nvcc
 CUDA_HOME ?= /usr/local/cuda
 NVCCFLAGS ?= -std=c++17 -O3 --use_fast_math -lineinfo

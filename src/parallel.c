@@ -11,6 +11,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include "windows_compat.h"
 
 typedef struct {
     struct ei_thread_pool *pool;
@@ -139,7 +140,13 @@ static void *worker_main(void *opaque) {
 }
 
 int32_t ei_cpu_count(void) {
+#ifdef _WIN32
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    long available = (long)info.dwNumberOfProcessors;
+#else
     long available = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     return available < 1 ? 1 : available > 4096 ? 4096 : (int32_t)available;
 }
 

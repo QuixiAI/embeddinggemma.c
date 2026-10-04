@@ -44,11 +44,12 @@ jobs:
       - name: Run native Windows checks and build
         if: runner.os == 'Windows'
         shell: msys2 {0}
-        run: make check && make
+        run: make check && make && make test-windows-download
       - name: Download public upstream test model
         run: |
           mkdir -p model
-          curl -fL --retry 3 -o model/embeddinggemma-300M-qat-Q4_0.gguf 'https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/embeddinggemma-300M-qat-Q4_0.gguf'
+          curl -fL --retry 3 -o model/embeddinggemma-300M-qat-Q4_0.gguf 'https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/8dd0ca2a66a8f14470acb0e2a71f801afbc5fb73/embeddinggemma-300M-qat-Q4_0.gguf'
+          python -c 'import hashlib,pathlib; p=pathlib.Path("model/embeddinggemma-300M-qat-Q4_0.gguf"); assert hashlib.sha256(p.read_bytes()).hexdigest()=="50d28e22432a148f6f8a86eab3700f92add5d1f54baf7790675a2a4dadbccf26"'
       - name: Run embedding and HTTP conformance checks
         if: runner.os != 'Windows'
         run: make test
@@ -56,6 +57,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: make test
+      - name: Strip Windows executable
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: strip build/embeddinggemma.exe
+      - name: Strip Unix executable
+        if: runner.os != 'Windows'
+        run: strip build/embeddinggemma
       - name: Stage executable and checksum
         env:
           PLATFORM: ${{ matrix.platform }}

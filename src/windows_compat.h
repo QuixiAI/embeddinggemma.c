@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>

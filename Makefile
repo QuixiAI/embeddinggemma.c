@@ -740,3 +740,10 @@ ROUTE ?= TENSOR=1,FLASH=1
 .PHONY: bench-gemma2-metal
 bench-gemma2-metal: $(BUILD)/bench_gemma2_metal
 	./$(BUILD)/bench_gemma2_metal $(GEMMA2_MODEL) "$(ROUTE)" $(CASES)
+# Process fixture contains fictional bytes, never a model or network request.
+$(BUILD)/test_downloader_fixture: src/test_downloader_fixture.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+.PHONY: test-windows-download
+test-windows-download: $(BUILD)/embeddinggemma $(BUILD)/test_downloader_fixture
+	python3 testdata/test_windows_download.py --binary ./$(BUILD)/embeddinggemma.exe --downloader ./$(BUILD)/test_downloader_fixture.exe

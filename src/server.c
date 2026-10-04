@@ -1444,8 +1444,34 @@ typedef enum {
 static downloader_result run_downloader(const char *program,
                                         char *const arguments[]) {
 #ifdef _WIN32
-    /* _spawnvp handles argument quoting; never invoke a command shell. */
-    intptr_t status = _spawnvp(_P_WAIT, program, (const char *const *)arguments);
+    /* The Windows CRT joins argv without quoting. Quote each argument using
+     * its command-line rules, preserving spaces and trailing backslashes. */
+    size_t count = 0;
+    while (arguments[count]) count++;
+    char **quoted = ei_xcalloc(count + 1, sizeof(*quoted));
+    for (size_t i = 0; i < count; i++) {
+        const char *arg = arguments[i];
+        char *out = quoted[i] = ei_xmalloc(strlen(arg) * 2 + 3);
+        *out++ = '"';
+        size_t slashes = 0;
+        for (;;) {
+            char ch = *arg++;
+            if (ch == '\\') { slashes++; continue; }
+            size_t emit = (ch == '"' || ch == '\0') ? slashes * 2 : slashes;
+            while (emit--) *out++ = '\\';
+            slashes = 0;
+            if (ch == '\0') break;
+            if (ch == '"') *out++ = '\\';
+            *out++ = ch;
+        }
+        *out++ = '"';
+        *out = '\0';
+    }
+    intptr_t status = _spawnvp(_P_WAIT, program, (const char *const *)quoted);
+    int spawn_errno = errno;
+    for (size_t i = 0; i < count; i++) free(quoted[i]);
+    free(quoted);
+    errno = spawn_errno;
     if (status == -1 && errno == ENOENT) return DOWNLOADER_UNAVAILABLE;
     if (status == 0) return DOWNLOADER_SUCCEEDED;
     fprintf(stderr, "%s failed (status %lld)\n", program, (long long)status);
@@ -1619,7 +1645,11 @@ static void usage(const char *argv0) {
             "          [--cuda-devices all|I,J,...]  (embeddinggemma-2 on several GPUs)\n"
             "default listen: 0.0.0.0:%d\n"
             "default model: $XDG_CACHE_HOME/embeddinggemma.c/%s\n"
+#ifdef _WIN32
+            "               or $LOCALAPPDATA/embeddinggemma.c/%s\n",
+#else
             "               or $HOME/.cache/embeddinggemma.c/%s\n",
+#endif
             argv0, EMBEDDINGGEMMA_DEFAULT_PORT, ei_profiles[0].file, ei_profiles[0].file);
 }
 
@@ -2203,6 +2233,18 @@ int main(int argc, char **argv) {
 #endif
     }
     while (!g_stop_requested) {
+#ifdef _WIN32
+        /* CRT signal handlers do not interrupt Winsock accept. Polling keeps
+         * graceful cache publication reachable after a stop signal. */
+        fd_set ready;
+        FD_ZERO(&ready);
+        FD_SET(s, &ready);
+        struct timeval timeout = {0, 250000};
+        int selected = select(0, &ready, NULL, NULL, &timeout);
+        if (g_stop_requested) break;
+        if (selected == 0) continue;
+        if (selected == SOCKET_ERROR) ei_die("select failed: %d", WSAGetLastError());
+#endif
         ei_socket c = accept(s, NULL, NULL);
         if (c != EI_INVALID_SOCKET) {
             int nodelay = 1;

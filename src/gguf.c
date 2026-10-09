@@ -1,7 +1,11 @@
 #include "gguf.h"
 
 #include <fcntl.h>
+#ifdef _WIN32
+#include "windows_compat.h"
+#else
 #include <sys/mman.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -118,6 +122,21 @@ static uint64_t tensor_bytes(const ei_tensor *t, const char *namebuf) {
 void ei_gguf_open(ei_gguf *g, const char *path) {
     memset(g, 0, sizeof *g);
 
+#ifdef _WIN32
+    HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) ei_die("%s: cannot open", path);
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+        (uint64_t)size.QuadPart > SIZE_MAX) ei_die("%s: cannot stat", path);
+    g->map_len = (size_t)size.QuadPart;
+    HANDLE mapping = CreateFileMappingA(file, NULL, PAGE_READONLY, 0, 0, NULL);
+    CloseHandle(file);
+    if (!mapping) ei_die("%s: cannot create mapping", path);
+    g->map = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(mapping);
+    if (!g->map) ei_die("%s: cannot map file", path);
+#else
     int fd = open(path, O_RDONLY);
     if (fd < 0) ei_die("%s: cannot open", path);
     struct stat st;
@@ -126,6 +145,8 @@ void ei_gguf_open(ei_gguf *g, const char *path) {
     g->map = mmap(NULL, g->map_len, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (g->map == MAP_FAILED) ei_die("%s: mmap failed", path);
+
+#endif
 
     cur c = { g->map, g->map + g->map_len, path };
 
@@ -202,7 +223,11 @@ void ei_gguf_close(ei_gguf *g) {
     }
     free(g->kv);
     free(g->tensors);
+#ifdef _WIN32
+    if (g->map) UnmapViewOfFile(g->map);
+#else
     if (g->map) munmap((void *)g->map, g->map_len);
+#endif
     memset(g, 0, sizeof *g);
 }
 

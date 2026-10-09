@@ -1,4 +1,5 @@
 #include "kernels.h"
+#include "kernels_avx2.h"
 #include "quants.h"
 
 #include <math.h>
@@ -254,12 +255,59 @@ static void test_matryoshka_dimensions(void) {
     }
 }
 
+/* Runs the quantized kernels under the forced SSE2 baseline and under AVX2 on
+ * the same inputs. Integer dot products are exact, so only the float
+ * accumulation order (and FMA) separates the two routes. */
+static void test_isa_parity(void) {
+    enum { K = EI_N_FF, ROWS = 64, INPUTS = 6, BLOCKS = K / EI_QK };
+    static ei_block_q4_0 weights[ROWS * BLOCKS];
+    static float x[INPUTS * K];
+    static ei_block_q8_0 xq[2][INPUTS * BLOCKS];
+    static float rows[2][ROWS], dual[2][2 * ROWS], batch[2][INPUTS * ROWS];
+    static float dequant[2][K];
+    for (int i = 0; i < ROWS * BLOCKS; i++) {
+        weights[i].d = ei_fp32_to_fp16(0.002f + 0.0001f * (float)(i % 97));
+        for (int j = 0; j < 16; j++) weights[i].qs[j] = (uint8_t)(next_f32() * 127.0f + 128.0f);
+    }
+    fill(x, INPUTS * K);
+    ei_tensor w = { .type = EI_T_Q4_0, .ne = { K, ROWS, 1, 1 }, .data = weights };
+    ei_tensor xt = { .type = EI_T_Q8_0, .ne = { K, INPUTS, 1, 1 } };
+    const char *isas[2] = { "baseline", "avx2" };
+    for (int r = 0; r < 2; r++) {
+        if (!ei_cpu_set_isa(isas[r])) ei_die("cannot select %s", isas[r]);
+        for (int t = 0; t < INPUTS; t++) {
+            ei_quantize_row_q8_0(x + t * K, xq[r] + t * BLOCKS, K);
+        }
+        ei_matmul_q4_0_q8_0_rows3(&w, xq[0], rows[r], 0, ROWS);
+        ei_matmul_q4_0_q8_0_dual_rows(&w, &w, xq[0], dual[r], dual[r] + ROWS, 0, ROWS);
+        ei_matmul_q4_0_q8_0_batch_rows(&w, xq[0], INPUTS, batch[r], 0, ROWS);
+        xt.data = xq[0];
+        ei_dequantize_row_q8_0_scaled(&xt, 1, 0.5f, dequant[r]);
+    }
+    if (!ei_cpu_set_isa("auto")) ei_die("cannot restore auto ISA");
+    if (memcmp(xq[0], xq[1], sizeof xq[0]) != 0) ei_die("q8_0 quantization differs by ISA");
+    printf("q8 quantize ISA parity: identical\n");
+    require_close("q4 rows ISA parity", rows[1], rows[0], ROWS, 2e-5f);
+    require_close("q4 dual ISA parity", dual[1], dual[0], 2 * ROWS, 2e-5f);
+    require_close("q4 batch ISA parity", batch[1], batch[0], INPUTS * ROWS, 2e-5f);
+    require_close("q8 dequant ISA parity", dequant[1], dequant[0], K, 0.0f);
+}
+
 int main(void) {
-    test_q4_triple();
-    test_attention();
-    test_norm_residual();
-    test_qk_norm_rope();
-    test_mean_pool();
-    test_matryoshka_dimensions();
+    const char *isas[] = { "baseline", "avx2" };
+    for (int i = 0; i < 2; i++) {
+        if (!ei_cpu_set_isa(isas[i])) {
+            printf("CPU kernels: %s route unavailable on this host\n", isas[i]);
+            continue;
+        }
+        printf("CPU kernels: %s / %s\n", ei_cpu_kernel_variant(), ei_quants_kernel_variant());
+        test_q4_triple();
+        test_attention();
+        test_norm_residual();
+        test_qk_norm_rope();
+        test_mean_pool();
+        test_matryoshka_dimensions();
+    }
+    if (ei_cpu_avx2_supported()) test_isa_parity();
     return 0;
 }

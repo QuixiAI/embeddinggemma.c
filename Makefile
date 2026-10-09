@@ -3,6 +3,13 @@ CC      ?= cc
 CXX     ?= c++
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Werror -g
 LDLIBS  ?= -lm -pthread
+ifneq ($(findstring MINGW,$(shell uname -s)),)
+CFLAGS += -D_WIN32_WINNT=0x0601 -D_CRT_RAND_S -D__USE_MINGW_ANSI_STDIO=1
+# Win64 GCC does not realign the stack for 32-byte AVX spills (GCC bug 54412);
+# assembling aligned vector moves as unaligned keeps the AVX2 kernels safe.
+CFLAGS += -Wa,-muse-unaligned-vector-move
+LDLIBS += -lws2_32 -static
+endif
 NVCC    ?= nvcc
 CUDA_HOME ?= /usr/local/cuda
 NVCCFLAGS ?= -std=c++17 -O3 --use_fast_math -lineinfo
@@ -91,7 +98,8 @@ METAL_FRAMEWORKS := -framework Foundation -framework Metal
 SRCS_CORE := src/gguf.c
 SRCS_MODEL := $(SRCS_CORE) src/model.c
 SRCS_TOKENIZER := $(SRCS_MODEL) src/tokenizer.c
-SRCS_ENGINE := $(SRCS_TOKENIZER) src/quants.c src/kernels.c src/parallel.c src/engine.c
+SRCS_KERNELS := src/quants.c src/kernels.c src/kernels_avx2.c
+SRCS_ENGINE := $(SRCS_TOKENIZER) $(SRCS_KERNELS) src/parallel.c src/engine.c
 SRCS_SERVICE := src/inference_service.c
 SRCS_SERVER := src/server.c src/response_cache.c src/float_format.c
 
@@ -176,8 +184,11 @@ $(BUILD)/test_embed: src/test_embed.c $(SRCS_ENGINE) src/*.h | $(BUILD)
 $(BUILD)/test_batch: src/test_batch.c $(SRCS_ENGINE) src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_batch.c $(SRCS_ENGINE) $(LDLIBS)
 
-$(BUILD)/test_kernels: src/test_kernels.c src/quants.c src/kernels.c src/gguf.c src/*.h | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ src/test_kernels.c src/quants.c src/kernels.c src/gguf.c $(LDLIBS)
+$(BUILD)/test_cpu_dispatch: src/test_cpu_dispatch.c $(SRCS_ENGINE) src/*.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/test_cpu_dispatch.c $(SRCS_ENGINE) $(LDLIBS)
+
+$(BUILD)/test_kernels: src/test_kernels.c $(SRCS_KERNELS) src/gguf.c src/*.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/test_kernels.c $(SRCS_KERNELS) src/gguf.c $(LDLIBS)
 
 $(BUILD)/embeddinggemma: $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(LDLIBS)
@@ -363,8 +374,8 @@ $(BUILD)/test_batch_metal: src/test_batch.c $(SRCS_ENGINE) $(BUILD)/engine_metal
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/test_batch.c $(SRCS_ENGINE) \
 		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
-$(BUILD)/perf_kernels: perf/harness/bench_kernels.c src/quants.c src/kernels.c src/gguf.c src/*.h | $(BUILD)
-	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_kernels.c src/quants.c src/kernels.c src/gguf.c $(LDLIBS)
+$(BUILD)/perf_kernels: perf/harness/bench_kernels.c $(SRCS_KERNELS) src/gguf.c src/*.h | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_kernels.c $(SRCS_KERNELS) src/gguf.c $(LDLIBS)
 
 $(BUILD)/perf_engine: perf/harness/bench_engine.c $(SRCS_ENGINE) src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_engine.c $(SRCS_ENGINE) $(LDLIBS)
@@ -422,13 +433,15 @@ $(BUILD)/xpu:
 	mkdir -p $(BUILD)/xpu
 
 .PHONY: test test-unit test-defaults check test-http test-http-metal test-http-cuda test-http-rocm test-http-xpu test-metal test-cuda test-rocm test-xpu perf perf-engine perf-engine-metal perf-engine-cuda perf-engine-rocm perf-engine-xpu perf-concurrency perf-concurrency-cuda perf-concurrency-rocm perf-concurrency-xpu perf-dimensions perf-batch perf-tokenization perf-servers perf-compare-llamacpp metal metal-kernels cuda rocm xpu check-scripts clean clean-cpu clean-metal clean-cuda clean-rocm clean-xpu release-darwin release-linux-cpu release-linux-cuda release-linux-rocm release-linux-xpu release-checksums release-verify release-ready release-info help
-test: $(BUILD)/embeddinggemma $(BUILD)/test_gguf $(BUILD)/test_tokenizer $(BUILD)/test_kernels $(BUILD)/test_embed $(BUILD)/test_batch $(BUILD)/test_inference_service $(BUILD)/test_response_cache $(BUILD)/test_float_format
+test: $(BUILD)/embeddinggemma $(BUILD)/test_gguf $(BUILD)/test_tokenizer $(BUILD)/test_kernels $(BUILD)/test_embed $(BUILD)/test_batch $(BUILD)/test_cpu_dispatch $(BUILD)/test_inference_service $(BUILD)/test_response_cache $(BUILD)/test_float_format
 	python3 testdata/test_model_manifest.py --binary ./$(BUILD)/test_gguf \
 		--model $(MODEL) --manifest testdata/model-manifest.json
 	./$(BUILD)/test_tokenizer $(MODEL) testdata/goldens-tokens.json
 	./$(BUILD)/test_kernels
 	./$(BUILD)/test_embed $(MODEL) testdata/goldens-llamacpp.json
+	EI_CPU_ISA=baseline ./$(BUILD)/test_embed $(MODEL) testdata/goldens-llamacpp.json
 	./$(BUILD)/test_batch $(MODEL) cpu
+	./$(BUILD)/test_cpu_dispatch $(MODEL) testdata/test-strings.json
 	./$(BUILD)/test_inference_service
 	./$(BUILD)/test_response_cache
 	./$(BUILD)/test_float_format
@@ -659,3 +672,15 @@ help:
 
 clean:
 	rm -rf $(BUILD) $(DIST)
+
+# Process fixture contains fictional bytes, never a model or network request.
+$(BUILD)/test_downloader_fixture: src/test_downloader_fixture.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+.PHONY: test-windows-download
+$(BUILD)/test_windows_paths: src/test_windows_paths.c src/windows_compat.h src/common.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+test-windows-download: $(BUILD)/embeddinggemma $(BUILD)/test_downloader_fixture $(BUILD)/test_windows_paths
+	./$(BUILD)/test_windows_paths
+	python3 testdata/test_windows_download.py --binary ./$(BUILD)/embeddinggemma.exe --downloader ./$(BUILD)/test_downloader_fixture.exe

@@ -1,4 +1,5 @@
 #include "quants.h"
+#include "kernels_avx2.h"
 
 #include <math.h>
 
@@ -6,9 +7,12 @@
 #include <arm_neon.h>
 #endif
 
-#if defined(__AVX2__) || defined(__SSSE3__)
-#include <immintrin.h>
+#if defined(__SSSE3__)
+#include <tmmintrin.h>
 #endif
+
+/* On x86-64, EI_DISPATCH_AVX2 hands off to kernels_avx2.c at runtime; the
+ * inline paths below are the NEON, SSSE3, and scalar routes. */
 
 ei_fp16 ei_fp32_to_fp16(float f) {
     uint32_t x;
@@ -37,14 +41,15 @@ ei_fp16 ei_fp32_to_fp16(float f) {
 }
 
 const char *ei_quants_kernel_variant(void) {
+#if defined(EI_X86_DISPATCH)
+    if (ei_cpu_avx2_active()) return "cpu-avx2";
+#endif
 #if defined(__ARM_NEON) && defined(__aarch64__)
 #if defined(__ARM_FEATURE_DOTPROD)
     return "cpu-neon-dotprod";
 #else
     return "cpu-neon";
 #endif
-#elif defined(__AVX2__)
-    return "cpu-avx2";
 #elif defined(__SSSE3__)
     return "cpu-ssse3";
 #else
@@ -63,6 +68,7 @@ void ei_dequantize_row_q8_0_scaled(const ei_tensor *t, int32_t row, float scale,
     uint64_t row_blocks = t->ne[0] / EI_QK;
     const ei_block_q8_0 *blocks =
         (const ei_block_q8_0 *)((const uint8_t *)t->data + (uint64_t)row * ei_tensor_row_bytes(t));
+    EI_DISPATCH_AVX2(ei_avx2_dequantize_row_q8_0(blocks, row_blocks, scale, out); return);
     for (uint64_t b = 0; b < row_blocks; b++) {
         float d = ei_fp16_to_fp32(blocks[b].d) * scale;
 #if defined(__ARM_NEON) && defined(__aarch64__)
@@ -73,14 +79,6 @@ void ei_dequantize_row_q8_0_scaled(const ei_tensor *t, int32_t row, float scale,
             const float32x4_t q1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16)));
             vst1q_f32(out + b * EI_QK + (uint64_t)j, vmulq_f32(q0, d4));
             vst1q_f32(out + b * EI_QK + (uint64_t)j + 4, vmulq_f32(q1, d4));
-        }
-#elif defined(__AVX2__)
-        const __m256 d8 = _mm256_set1_ps(d);
-        for (int j = 0; j < EI_QK; j += 8) {
-            const __m128i q8 = _mm_loadl_epi64((const __m128i *)(blocks[b].qs + j));
-            const __m256i q32 = _mm256_cvtepi8_epi32(q8);
-            _mm256_storeu_ps(out + b * EI_QK + (uint64_t)j,
-                             _mm256_mul_ps(_mm256_cvtepi32_ps(q32), d8));
         }
 #else
         for (int j = 0; j < EI_QK; j++) {
@@ -98,6 +96,7 @@ void ei_quantize_row_q8_0(const float *x, ei_block_q8_0 *out, int32_t n) {
     if (n % EI_QK != 0) ei_die("q8_0 quantize length %d is not a multiple of 32", n);
 
     int32_t nb = n / EI_QK;
+    EI_DISPATCH_AVX2(ei_avx2_quantize_row_q8_0(x, out, nb); return);
     for (int32_t b = 0; b < nb; b++) {
         const float *xb = x + b * EI_QK;
 #if defined(__ARM_NEON) && defined(__aarch64__)
@@ -108,16 +107,6 @@ void ei_quantize_row_q8_0(const float *x, ei_block_q8_0 *out, int32_t n) {
             max1 = vmaxq_f32(max1, vabsq_f32(vld1q_f32(xb + j + 4)));
         }
         float amax = vmaxvq_f32(vmaxq_f32(max0, max1));
-#elif defined(__AVX2__)
-        const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
-        __m256 maxv = _mm256_setzero_ps();
-        for (int j = 0; j < EI_QK; j += 8) {
-            maxv = _mm256_max_ps(maxv, _mm256_and_ps(_mm256_loadu_ps(xb + j), abs_mask));
-        }
-        __m128 max4 = _mm_max_ps(_mm256_castps256_ps128(maxv), _mm256_extractf128_ps(maxv, 1));
-        max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
-        max4 = _mm_max_ss(max4, _mm_shuffle_ps(max4, max4, 1));
-        float amax = _mm_cvtss_f32(max4);
 #else
         float amax = 0.0f;
         for (int j = 0; j < EI_QK; j++) {
@@ -148,23 +137,6 @@ void ei_quantize_row_q8_0(const float *x, ei_block_q8_0 *out, int32_t n) {
         const int16x8_t q67 = vcombine_s16(vqmovn_s32(q6), vqmovn_s32(q7));
         vst1q_s8(out[b].qs, vcombine_s8(vqmovn_s16(q01), vqmovn_s16(q23)));
         vst1q_s8(out[b].qs + 16, vcombine_s8(vqmovn_s16(q45), vqmovn_s16(q67)));
-#elif defined(__AVX2__)
-        const __m256 scale = _mm256_set1_ps(id);
-        const __m256 half = _mm256_set1_ps(0.5f);
-        const __m256 sign = _mm256_set1_ps(-0.0f);
-        __m256 values[4];
-        __m256i quants[4];
-        for (int j = 0; j < 4; j++) {
-            values[j] = _mm256_mul_ps(_mm256_loadu_ps(xb + j * 8), scale);
-            __m256 signed_half = _mm256_or_ps(_mm256_and_ps(values[j], sign), half);
-            quants[j] = _mm256_cvttps_epi32(_mm256_add_ps(values[j], signed_half));
-        }
-        __m256i q01 = _mm256_packs_epi32(quants[0], quants[1]);
-        __m256i q23 = _mm256_packs_epi32(quants[2], quants[3]);
-        __m256i q8 = _mm256_packs_epi16(q01, q23);
-        const __m256i order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-        _mm256_storeu_si256((__m256i *)out[b].qs,
-                            _mm256_permutevar8x32_epi32(q8, order));
 #else
         for (int j = 0; j < EI_QK; j++) {
             int q = (int)roundf(xb[j] * id);
@@ -210,56 +182,20 @@ static float ei_vec_dot_q4_0_q8_0_neon(const ei_block_q4_0 *x,
 }
 #endif
 
-#if defined(__AVX2__) || defined(__SSSE3__)
+#if defined(__SSSE3__)
 static inline float ei_hsum_f32x4(__m128 v) {
     v = _mm_add_ps(v, _mm_movehl_ps(v, v));
     v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
     return _mm_cvtss_f32(v);
 }
 
-#if !defined(__AVX2__)
 static inline __m128i ei_mul_sum_i8_pairs_sse(__m128i x, __m128i y) {
     const __m128i ax = _mm_sign_epi8(x, x);
     const __m128i sy = _mm_sign_epi8(y, x);
     const __m128i dot16 = _mm_maddubs_epi16(ax, sy);
     return _mm_madd_epi16(dot16, _mm_set1_epi16(1));
 }
-#endif
 
-#if defined(__AVX2__)
-static inline float ei_hsum_f32x8(__m256 v) {
-    return ei_hsum_f32x4(_mm_add_ps(_mm256_castps256_ps128(v),
-                                    _mm256_extractf128_ps(v, 1)));
-}
-
-static float ei_vec_dot_q4_0_q8_0_avx2(const ei_block_q4_0 *x,
-                                       const ei_block_q8_0 *y,
-                                       int32_t nb) {
-    const __m256i low_mask = _mm256_set1_epi8(0x0F);
-    const __m256i off = _mm256_set1_epi8(8);
-    const __m256i ones = _mm256_set1_epi16(1);
-    __m256 sum = _mm256_setzero_ps();
-
-    for (int32_t b = 0; b < nb; b++) {
-        const __m128i q4_128 = _mm_loadu_si128((const __m128i *)x[b].qs);
-        const __m256i q4 = _mm256_inserti128_si256(
-            _mm256_castsi128_si256(q4_128), _mm_srli_epi16(q4_128, 4), 1);
-        const __m256i xq = _mm256_sub_epi8(_mm256_and_si256(q4, low_mask), off);
-        const __m256i yq = _mm256_loadu_si256((const __m256i *)y[b].qs);
-        const __m256i ax = _mm256_sign_epi8(xq, xq);
-        const __m256i sy = _mm256_sign_epi8(yq, xq);
-        const __m256i dot16 = _mm256_maddubs_epi16(ax, sy);
-        const __m256 dot = _mm256_cvtepi32_ps(_mm256_madd_epi16(dot16, ones));
-        const __m256 scale = _mm256_set1_ps(ei_fp16_to_fp32(x[b].d) *
-                                             ei_fp16_to_fp32(y[b].d));
-        sum = _mm256_add_ps(sum, _mm256_mul_ps(dot, scale));
-    }
-
-    return ei_hsum_f32x8(sum);
-}
-#endif
-
-#if !defined(__AVX2__)
 static float ei_vec_dot_q4_0_q8_0_ssse3(const ei_block_q4_0 *x,
                                         const ei_block_q8_0 *y,
                                         int32_t nb) {
@@ -283,15 +219,13 @@ static float ei_vec_dot_q4_0_q8_0_ssse3(const ei_block_q4_0 *x,
     return ei_hsum_f32x4(sum);
 }
 #endif
-#endif
 
 float ei_vec_dot_q4_0_q8_0(const ei_block_q4_0 *x, const ei_block_q8_0 *y, int32_t n) {
     if (n % EI_QK != 0) ei_die("q4_0 dot length %d is not a multiple of 32", n);
     int32_t nb = n / EI_QK;
+    EI_DISPATCH_AVX2(return ei_avx2_vec_dot_q4_0_q8_0(x, y, nb));
 #if defined(__ARM_NEON) && defined(__aarch64__)
     return ei_vec_dot_q4_0_q8_0_neon(x, y, nb);
-#elif defined(__AVX2__)
-    return ei_vec_dot_q4_0_q8_0_avx2(x, y, nb);
 #elif defined(__SSSE3__)
     return ei_vec_dot_q4_0_q8_0_ssse3(x, y, nb);
 #else
@@ -314,6 +248,8 @@ static void ei_vec_dot_q4_0_q8_0_batch4(const ei_block_q4_0 *weights,
                                         const ei_block_q8_0 *inputs,
                                         int32_t input_stride, int32_t count,
                                         int32_t n, float out[4]) {
+    EI_DISPATCH_AVX2(ei_avx2_vec_dot_q4_0_q8_0_batch4(weights, inputs, input_stride,
+                                                      count, n / EI_QK, out); return);
 #if defined(__ARM_NEON) && defined(__aarch64__)
     int32_t nb = n / EI_QK;
     const uint8x16_t low_mask = vdupq_n_u8(0x0Fu);
@@ -340,37 +276,6 @@ static void ei_vec_dot_q4_0_q8_0_batch4(const ei_block_q4_0 *weights,
         }
     }
     for (int32_t input = 0; input < count; input++) out[input] = vaddvq_f32(sums[input]);
-#elif defined(__AVX2__)
-    int32_t nb = n / EI_QK;
-    const __m256i low_mask = _mm256_set1_epi8(0x0F);
-    const __m256i off = _mm256_set1_epi8(8);
-    const __m256i ones = _mm256_set1_epi16(1);
-    __m256 sums[4] = {
-        _mm256_setzero_ps(), _mm256_setzero_ps(),
-        _mm256_setzero_ps(), _mm256_setzero_ps(),
-    };
-    for (int32_t block = 0; block < nb; block++) {
-        const __m128i packed = _mm_loadu_si128((const __m128i *)weights[block].qs);
-        const __m256i q4 = _mm256_inserti128_si256(
-            _mm256_castsi128_si256(packed), _mm_srli_epi16(packed, 4), 1);
-        const __m256i weight_values = _mm256_sub_epi8(
-            _mm256_and_si256(q4, low_mask), off);
-        const float weight_scale = ei_fp16_to_fp32(weights[block].d);
-        for (int32_t input = 0; input < count; input++) {
-            const ei_block_q8_0 *activation = inputs + input * input_stride + block;
-            const __m256i values = _mm256_loadu_si256(
-                (const __m256i *)activation->qs);
-            const __m256i dot16 = _mm256_maddubs_epi16(
-                _mm256_sign_epi8(weight_values, weight_values),
-                _mm256_sign_epi8(values, weight_values));
-            const __m256 dot = _mm256_cvtepi32_ps(
-                _mm256_madd_epi16(dot16, ones));
-            const __m256 scale = _mm256_set1_ps(
-                weight_scale * ei_fp16_to_fp32(activation->d));
-            sums[input] = _mm256_add_ps(sums[input], _mm256_mul_ps(dot, scale));
-        }
-    }
-    for (int32_t input = 0; input < count; input++) out[input] = ei_hsum_f32x8(sums[input]);
 #else
     for (int32_t input = 0; input < count; input++) {
         out[input] = ei_vec_dot_q4_0_q8_0(
@@ -383,6 +288,7 @@ void ei_vec_dot_q4_0_q8_0_dual(const ei_block_q4_0 *x0, const ei_block_q4_0 *x1,
                                const ei_block_q8_0 *y, int32_t n,
                                float *out0, float *out1) {
     if (n % EI_QK != 0) ei_die("dual q4_0 dot length %d is not a multiple of 32", n);
+    EI_DISPATCH_AVX2(ei_avx2_vec_dot_q4_0_q8_0_dual(x0, x1, y, n / EI_QK, out0, out1); return);
 #if defined(__ARM_NEON) && defined(__aarch64__)
     int32_t nb = n / EI_QK;
     const uint8x16_t low_mask = vdupq_n_u8(0x0Fu);
@@ -414,33 +320,6 @@ void ei_vec_dot_q4_0_q8_0_dual(const ei_block_q4_0 *x0, const ei_block_q4_0 *x1,
     }
     *out0 = vaddvq_f32(sum0);
     *out1 = vaddvq_f32(sum1);
-#elif defined(__AVX2__)
-    int32_t nb = n / EI_QK;
-    const __m256i low_mask = _mm256_set1_epi8(0x0F);
-    const __m256i off = _mm256_set1_epi8(8);
-    const __m256i ones = _mm256_set1_epi16(1);
-    __m256 sum0 = _mm256_setzero_ps();
-    __m256 sum1 = _mm256_setzero_ps();
-    for (int32_t b = 0; b < nb; b++) {
-        const __m256i yq = _mm256_loadu_si256((const __m256i *)y[b].qs);
-        const float y_scale = ei_fp16_to_fp32(y[b].d);
-        const ei_block_q4_0 *blocks[2] = { x0 + b, x1 + b };
-        __m256 *sums[2] = { &sum0, &sum1 };
-        for (int i = 0; i < 2; i++) {
-            const __m128i packed = _mm_loadu_si128((const __m128i *)blocks[i]->qs);
-            const __m256i q4 = _mm256_inserti128_si256(
-                _mm256_castsi128_si256(packed), _mm_srli_epi16(packed, 4), 1);
-            const __m256i xq = _mm256_sub_epi8(_mm256_and_si256(q4, low_mask), off);
-            const __m256i dot16 = _mm256_maddubs_epi16(
-                _mm256_sign_epi8(xq, xq), _mm256_sign_epi8(yq, xq));
-            const __m256 dot = _mm256_cvtepi32_ps(_mm256_madd_epi16(dot16, ones));
-            const __m256 scale = _mm256_set1_ps(
-                ei_fp16_to_fp32(blocks[i]->d) * y_scale);
-            *sums[i] = _mm256_add_ps(*sums[i], _mm256_mul_ps(dot, scale));
-        }
-    }
-    *out0 = ei_hsum_f32x8(sum0);
-    *out1 = ei_hsum_f32x8(sum1);
 #else
     *out0 = ei_vec_dot_q4_0_q8_0(x0, y, n);
     *out1 = ei_vec_dot_q4_0_q8_0(x1, y, n);
@@ -451,6 +330,8 @@ void ei_vec_dot_q4_0_q8_0_triple(const ei_block_q4_0 *x0, const ei_block_q4_0 *x
                                  const ei_block_q4_0 *x2, const ei_block_q8_0 *y,
                                  int32_t n, float *out0, float *out1, float *out2) {
     if (n % EI_QK != 0) ei_die("triple q4_0 dot length %d is not a multiple of 32", n);
+    EI_DISPATCH_AVX2(ei_avx2_vec_dot_q4_0_q8_0_triple(x0, x1, x2, y, n / EI_QK,
+                                                      out0, out1, out2); return);
 #if defined(__ARM_NEON) && defined(__aarch64__)
     int32_t nb = n / EI_QK;
     const uint8x16_t low_mask = vdupq_n_u8(0x0Fu);
@@ -478,34 +359,6 @@ void ei_vec_dot_q4_0_q8_0_triple(const ei_block_q4_0 *x0, const ei_block_q4_0 *x
     *out0 = vaddvq_f32(sums[0]);
     *out1 = vaddvq_f32(sums[1]);
     *out2 = vaddvq_f32(sums[2]);
-#elif defined(__AVX2__)
-    int32_t nb = n / EI_QK;
-    const __m256i low_mask = _mm256_set1_epi8(0x0F);
-    const __m256i off = _mm256_set1_epi8(8);
-    const __m256i ones = _mm256_set1_epi16(1);
-    __m256 sums[3] = {
-        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
-    };
-    for (int32_t b = 0; b < nb; b++) {
-        const __m256i yq = _mm256_loadu_si256((const __m256i *)y[b].qs);
-        const float y_scale = ei_fp16_to_fp32(y[b].d);
-        const ei_block_q4_0 *blocks[3] = { x0 + b, x1 + b, x2 + b };
-        for (int i = 0; i < 3; i++) {
-            const __m128i packed = _mm_loadu_si128((const __m128i *)blocks[i]->qs);
-            const __m256i q4 = _mm256_inserti128_si256(
-                _mm256_castsi128_si256(packed), _mm_srli_epi16(packed, 4), 1);
-            const __m256i xq = _mm256_sub_epi8(_mm256_and_si256(q4, low_mask), off);
-            const __m256i dot16 = _mm256_maddubs_epi16(
-                _mm256_sign_epi8(xq, xq), _mm256_sign_epi8(yq, xq));
-            const __m256 dot = _mm256_cvtepi32_ps(_mm256_madd_epi16(dot16, ones));
-            const __m256 scale = _mm256_set1_ps(
-                ei_fp16_to_fp32(blocks[i]->d) * y_scale);
-            sums[i] = _mm256_add_ps(sums[i], _mm256_mul_ps(dot, scale));
-        }
-    }
-    *out0 = ei_hsum_f32x8(sums[0]);
-    *out1 = ei_hsum_f32x8(sums[1]);
-    *out2 = ei_hsum_f32x8(sums[2]);
 #else
     *out0 = ei_vec_dot_q4_0_q8_0(x0, y, n);
     *out1 = ei_vec_dot_q4_0_q8_0(x1, y, n);

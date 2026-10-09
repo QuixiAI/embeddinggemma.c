@@ -9,6 +9,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include "windows_compat.h"
+#include "windows_compat.h"
 
 typedef enum {
     EI_ENTRY_PENDING,
@@ -589,7 +591,7 @@ static void write_persistent_cache_locked(ei_inference_service *service) {
              fwrite(&count, sizeof count, 1, file) == 1;
     }
     if (fclose(file) != 0) ok = false;
-    if (ok && rename(tmp, path) == 0) {
+    if (ok && ei_replace_file(tmp, path) == 0) {
         fprintf(stderr, "persisted %llu cached embeddings to %s\n",
                 (unsigned long long)count, path);
     } else {

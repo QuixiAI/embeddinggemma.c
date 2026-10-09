@@ -135,6 +135,33 @@ Published executables are deliberately small. Release `v0.3.1` contains:
 | Linux x86_64 | ROCm | 1.2 MiB |
 | Linux x86_64 | XPU SYCL | 2.1 MiB |
 
+### Fork CI binaries
+
+This fork's `CI` workflow uploads checksummed CPU executable artifacts for
+Linux x86_64, Linux ARM64, macOS ARM64, and Windows x86_64 after unit, model,
+and HTTP conformance checks pass. Download artifacts from the workflow run;
+these are CI builds, not upstream release assets. Existing CUDA, ROCm, XPU
+and Metal release targets remain available through the upstream build process.
+
+CPU builds use the compiler's baseline architecture, without `-march=native`:
+x86_64 uses SSE2 and ARM64 uses NEON. On x86_64 the same executable switches to
+AVX2/FMA/F16C kernels at startup when the CPU supports them (Haswell, Zen, and
+newer); set `EI_CPU_ISA=baseline` to force the SSE2 route. Linux artifacts are built on Ubuntu 24.04
+and require a compatible glibc (2.39 or later); macOS ARM64 is tested on the macOS 15 runner and targets macOS 14 or
+later. Windows uses a native MinGW UCRT64 executable with statically linked
+winpthreads and compiler runtime, tested on Windows Server 2022. It requires
+Windows' Universal C Runtime; older Windows versions are not CI-tested.
+No Windows GPU backend or PowerShell installer is provided by this change.
+
+On Windows, run `embeddinggemma-windows-x86_64-cpu.exe`. The default model
+cache is `%LOCALAPPDATA%/embeddinggemma.c/`, falling back to
+`%USERPROFILE%/.cache/embeddinggemma.c/`; `XDG_CACHE_HOME`, `EI_MODEL_PATH`, and
+`--model` retain their existing precedence. Automatic download uses native
+`curl.exe` or `wget.exe` on PATH and supports paths containing spaces.
+Build locally from an MSYS2 UCRT64 shell with `make check`,
+`make test-windows-download`, and `make test` after supplying the public model.
+The model's Gemma license is separate from this repository's MIT license.
+
 The 278 MB Q4_0 model is downloaded separately from Hugging Face and is not
 distributed by this project.
 

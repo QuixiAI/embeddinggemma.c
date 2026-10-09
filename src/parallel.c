@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#include "windows_compat.h"
 
 typedef struct {
     struct ei_thread_pool *pool;
@@ -69,7 +70,13 @@ static int32_t default_thread_count(void) {
         }
         return (int32_t)parsed;
     }
+#ifdef _WIN32
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    long available = (long)info.dwNumberOfProcessors;
+#else
     long available = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     if (available < 1) available = 1;
     if (available > 32) available = 32;
     return (int32_t)available;

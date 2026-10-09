@@ -2717,3 +2717,52 @@ repeat/re-index/eval workloads.
 
 - CUDA and ROCm SwiGLU->quant fusion (neutral / -45%), ROCm default graph
   capture (neutral / -1.5% mixed). Kept opt-in-off or not landed.
+
+## 2026-10-08: x86-64 Runtime AVX2 Dispatch
+
+Status: candidate (fork PR; upstream proposal pending).
+
+Current implementation: portable x86-64 CPU binaries are built at the compiler
+baseline (SSE2), so the existing compile-time `__AVX2__` kernels never ran in
+release or CI artifacts. Worse, the Q4_0 x Q8_0 dot products had no SSE2 path
+at all, so shipped binaries ran the projections in scalar C
+(`ei_quants_kernel_variant() == "cpu-scalar"`).
+
+Current public route: `src/kernels_avx2.c` holds the AVX2 kernels behind
+per-function `target("avx2,fma,f16c")` attributes. `kernels.c` and `quants.c`
+call them through `EI_DISPATCH_AVX2` after a one-time CPUID + XGETBV check
+(AVX2, FMA, F16C, OS YMM state). `EI_CPU_ISA=auto|baseline|avx2` overrides it.
+`scripts/check-avx2-isolation.py` fails CI if VEX code appears outside the
+`ei_avx2_*` functions. ARM64 NEON object code is byte-identical to before.
+
+Correctness: `test_cpu_dispatch` embeds the test strings plus 150- and
+600-token inputs and a packed batch under both routes in one process, gated at
+cosine >= 0.999 and max abs diff <= 1e-2 at D=768/512/256/128 (the golden
+gate; a last-bit summation difference can flip a Q8_0 activation rounding and
+cascade, so the routes are not bit-identical on the real model). Against the
+llama.cpp goldens on the real model, AVX2 min cosine is 0.999861 and SSE2 is
+0.999871.
+`test_kernels` runs every kernel test under both routes and checks that Q8_0
+quantization is bit-identical and Q4_0 rows/dual/batch agree within 3e-7.
+
+Experiments (sandbox Intel Xeon @ 2.80 GHz, 4 vCPU, GCC 13.3, synthetic
+random-weight GGUF with the production shapes, 150-token chunk, best of 3):
+
+- Moving the existing AVX2 kernels behind dispatch: SSE2 1,326 ms vs AVX2
+  535 ms (2.5x).
+- Callgrind on the AVX2 route showed 56% of instructions in the software
+  `ei_fp16_to_fp32` block-scale conversion. Hardware F16C (`_cvtsh_ss`, exact)
+  in the AVX2 kernels: 387 ms (3.3x vs SSE2), output bit-identical.
+- FMA accumulation in the Q4_0 dots: q4gemv 25-27 vs 20-24 GFLOPS with
+  separate mul+add. Retained.
+- `EI_CPU_MULTIROW_MIN_TOKENS=1` or `64` (four-token batch kernel) at 150
+  tokens: 461-465 ms vs 387 ms. Rejected; the 512 boundary stays.
+
+Decision: retain runtime dispatch, F16C, and FMA.
+
+Open questions: the remaining gap to llama.cpp at 150 tokens is structural,
+not ISA width. The CPU engine still runs per-token GEMV below 512 tokens and
+re-streams all ~57 MB of layer weights for every token. llama.cpp's x86
+prefill uses tiled/repacked Q4_0 GEMM. A register-blocked Q4_0 x Q8_0 GEMM
+(several rows x several tokens per tile) is the next CPU lever; AVX-VNNI would
+come after that.

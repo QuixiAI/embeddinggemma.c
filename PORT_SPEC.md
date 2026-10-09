@@ -137,7 +137,7 @@ llama.cpp deep-read) before implementing.
 | target | status | implementation/build |
 |---|---|---|
 | macOS ARM64 CPU | implemented, parity tested | C11 + NEON dot-product path |
-| x86 CPU | implemented, parity tested | scalar, SSSE3, and AVX2 paths |
+| x86 CPU | implemented, parity tested | scalar, SSSE3, and runtime-dispatched AVX2 paths |
 | macOS Metal | implemented, parity tested | Objective-C host + standalone metallib; short-shape residual/next-norm fusion; FP16 K/V at long sequence lengths with FP32 accumulation |
 | NVIDIA CUDA | implemented, parity tested | Q4 x Q8 DP4A latency path; direct-FP16 combined-QKV epilogue; Flash, online, banded-SWA, and tensor-core attention; native packed-Q4 MMA diagnostics; CUDA graph replay |
 | ROCm/HIP | implemented, parity tested | portable CDNA fat binary; paired packed-Q4 wave and MFMA projection kernels; exact singleton V-only attention; batched hipBLAS GQA; FP16/FP32 score routing; fused residual/RMS and pooling epilogues |

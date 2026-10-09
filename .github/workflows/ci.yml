@@ -64,6 +64,13 @@ jobs:
           suffix=''
           if [ "$RUNNER_OS" = Windows ]; then suffix='.exe'; fi
           python scripts/check-binary-platform.py "$PLATFORM" "build/embeddinggemma${suffix}"
+      - name: Verify AVX2 code stays in runtime-dispatched kernels
+        if: matrix.platform == 'linux-x86_64'
+        run: python3 scripts/check-avx2-isolation.py build/embeddinggemma
+      - name: Verify Windows AVX2 code stays in runtime-dispatched kernels
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: python scripts/check-avx2-isolation.py build/embeddinggemma.exe
       - name: Inspect Windows runtime dependencies
         if: runner.os == 'Windows'
         shell: msys2 {0}

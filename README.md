@@ -301,7 +301,9 @@ these are CI builds, not upstream release assets. Existing CUDA, ROCm, XPU
 and Metal release targets remain available through the upstream build process.
 
 CPU builds use the compiler's baseline architecture, without `-march=native`:
-x86_64 uses SSE2 and ARM64 uses NEON. Linux artifacts are built on Ubuntu 24.04
+x86_64 uses SSE2 and ARM64 uses NEON. On x86_64 the same executable switches to
+AVX2/FMA/F16C kernels at startup when the CPU supports them (Haswell, Zen, and
+newer); set `EI_CPU_ISA=baseline` to force the SSE2 route. Linux artifacts are built on Ubuntu 24.04
 and require a compatible glibc (2.39 or later); macOS ARM64 is tested on the macOS 15 runner and targets macOS 14 or
 later. Windows uses a native MinGW UCRT64 executable with statically linked
 winpthreads and compiler runtime, tested on Windows Server 2022. It requires

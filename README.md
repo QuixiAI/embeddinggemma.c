@@ -110,11 +110,26 @@ The OpenAI response contains the standard `object`, `data`, `model`, and
 stable alias, and `usage` reports the exact number of tokens processed.
 
 `input` accepts one string or an array of strings. Text is embedded exactly as
-provided, so include the [EmbeddingGemma prompt prefix](https://ai.google.dev/gemma/docs/embeddinggemma/model_card#prompt_instructions)
-for your task: `task: search result | query: {text}` for search queries and
-`title: none | text: {text}` for documents. `dimensions` is optional and
+provided, so include the model's task prefix yourself (prefixes apply to text
+only; pass images, audio, and video without one):
+
+| Use case | Query | Document |
+|---|---|---|
+| Search | `task: search result \| query: {query}` | `title: {title} \| text: {content}` |
+| Question answering | `task: question answering \| query: {question}` | `title: {title} \| text: {passage}` |
+| Fact checking | `task: fact checking \| query: {claim}` | `title: {title} \| text: {evidence}` |
+| Code search | `task: code retrieval \| query: {query}` | `title: {title or filename} \| text: {code}` |
+| Classification | `task: classification \| query: {content}` | — |
+| Clustering | `task: clustering \| query: {content}` | — |
+| Similarity | `task: sentence similarity \| query: {content}` | — |
+
+Use `title: none` when a document has no title. `dimensions` is optional and
 may be `768`, `512`, `256`, or `128`; the default is `768`. Reduced Matryoshka
-embeddings are normalized again before being returned. Set
+embeddings are normalized again before being returned (the model card reports
+near-lossless quality down to 256; 128 loses noticeably on multimodal input).
+Input longer than the context (8,192 tokens for `embeddinggemma-2`, 2,048 for
+`embeddinggemma-300m`) is truncated, keeping the final end-of-sequence token;
+`usage` reports the tokens actually embedded. Set
 `"encoding_format":"base64"` to receive packed little-endian float32 data
 instead of JSON float arrays.
 
@@ -126,7 +141,7 @@ API reference. `GET /healthz` reports readiness, and `--bind`, `--port`, and
 
 | Profile | Weights | Modalities | Backend |
 |---|---|---|---|
-| `embeddinggemma-2` (default) | `embeddinggemma-2-Q8_0.gguf` + `mmproj-embeddinggemma-2-Q8_0.gguf` | text, image, audio, video frames, mixed | CPU, Metal |
+| `embeddinggemma-2` (default) | `embeddinggemma-2-Q8_0.gguf` + `mmproj-embeddinggemma-2-Q8_0.gguf` | text, image, audio, video frames, mixed | CPU, Metal, CUDA |
 | `embeddinggemma-300m` | `embeddinggemma-300M-qat-Q4_0.gguf` | text | CPU, Metal, CUDA, ROCm, XPU |
 
 ```sh
@@ -142,8 +157,9 @@ make
 `--profile` selects a startup profile, not a per-request model router. An explicit
 existing `--model` or `EI_MODEL_PATH` is identified by GGUF architecture for
 compatibility with older scripts. An explicit conflicting `--profile` fails.
-New-profile accelerator requests fail clearly; use `--backend cpu`. Profile 2
-has an 8,192-token combined input limit; the original retains 2,048 tokens.
+Profile 2 runs on CPU, Metal, and CUDA (ROCm/XPU requests fail clearly). It has
+an 8,192-token context shared by every part of an input; the original retains
+2,048 tokens.
 Switching profiles changes embedding coordinates: rebuild existing indexes.
 
 Both embedding endpoints accept a content object as one input, or an array
@@ -167,27 +183,74 @@ one shared embedding per input object:
 
 - Images: PNG, JPEG, BMP, or PNM, encoded as base64 or a base64 data URL.
   Images are resized with bicubic filtering and encoded at up to 280 soft tokens;
-  video frames use a 140-token budget. Small inputs are enlarged to the model's
-  minimum vision budget. Decoded images are limited to 16 megapixels.
-- Audio: mono 16 kHz PCM16 or float32 WAV, 21 ms to 300 seconds. The native
-  frontend computes the model's log-mel features and encodes 30-second chunks.
+  video frames use a 140-token budget. Set `"vision_tokens"` (70–1120) on an
+  image or video part to trade latency for detail. Small inputs are enlarged to
+  the model's minimum vision budget. Decoded images are limited to 16 megapixels.
+- Audio: mono 16 kHz PCM16 or float32 WAV, at least 21 ms, at 25 tokens per
+  second. The native frontend computes the model's log-mel features and encodes
+  30-second chunks.
 - Video: provide sampled frames in temporal order, normally at one frame per
   second. `fps` describes the supplied frame sampling rate (default 1); timestamp
   text is inserted before each frame. Container decoding (MP4/WebM) and frame
-  extraction happen in the client. At most 114 frames are accepted, subject to
-  the combined token limit.
+  extraction happen in the client. Frames past the 114th are ignored (114
+  frames at the 70-token minimum fill the context).
+- Context: text, media soft tokens, media delimiters, and the begin/end tokens
+  share 8,192 tokens. When an input runs out of room, text is cut off, an image
+  or frame is encoded at the largest budget that still fits (or dropped below
+  70 tokens), and audio is trimmed to the remaining seconds. Requests are never
+  rejected for length.
 - The HTTP body limit is 16 MiB. Content accepts at most 256 parts. Media URLs
   and local filesystem paths are not fetched by the server.
 
 Text-only requests keep the batching/singleflight/persistent-cache path. Media
-requests serialize access to the native inference engine and use the bounded
-HTTP response cache; token-ID caching cannot represent their media content.
-The original profile rejects structured media input.
+requests use the bounded HTTP response cache; token-ID caching cannot represent
+their media content. The original profile rejects structured media input.
 
 Validation: `make test` covers the original profile; `make test-gemma2` checks
 exact new-tokenizer IDs, text/vision/audio reference parity, and HTTP modalities,
-combined inputs, dimensions, concurrency, and context limits. The new profile's
-benchmark performance and accelerator ports are not established yet.
+combined inputs, dimensions, concurrency, and truncation at the context limit.
+
+The model card says not to run EmbeddingGemma 2 in float16 because its
+activations exceed float16's range. This server keeps the residual stream,
+norms, softmax, and every accumulation in float32; float16 appears only as
+matrix and attention operands on Metal and CUDA. Measured operand magnitudes
+stay below 740 across text, vision, and audio (float16 overflows at 65,504),
+and the GPU paths match the float32 CPU reference (cosine ≥ 0.999).
+
+## Using every core and GPU
+
+`embeddinggemma-2` runs each batch ("wave") on an executor: a GPU pipeline slot
+or a CPU worker with its own thread pool. Waves on different executors run at
+the same time; the scheduler sends each new wave to an idle device first.
+
+```sh
+# CPU-only server with 128 cores: several independent workers beat one big pool
+./build/embeddinggemma --threads 128 --cpu-workers 8
+# Every CUDA GPU in the box, two waves in flight on each
+./build/embeddinggemma-cuda --cuda-devices all --pipeline-slots 2
+# GPUs plus the spare CPU cores as overflow capacity
+./build/embeddinggemma-cuda --cuda-devices all --cpu-workers 2 --threads 64
+```
+
+- `--threads N` sets the CPU inference threads (default: every core up to 32
+  for a single pool, every core with `--cpu-workers`); it overrides `EI_THREADS`.
+- `--cpu-workers N` splits those threads into N workers. One wave stops
+  scaling at around 64 threads and slows down past that, so give each worker
+  16–32 threads. On 256 EPYC cores, 16 workers of 16 threads served 3.75× the
+  short requests of the best single pool. On Linux each worker is pinned to its
+  own cores, grouped by shared L3 cache (`--cpu-pin off` disables this). `--cpu-max-batch-tokens` (default
+  1024) caps a CPU wave so the queue spreads across workers.
+- `--cuda-devices all|0,1,...` loads the weights on each listed GPU.
+  `--pipeline-slots` applies to every GPU.
+- Beside a GPU, CPU workers are overflow capacity. They start a wave only when
+  every GPU slot is busy and more work is queued than the GPUs' next waves can
+  absorb. They take only requests up to `--cpu-max-sequence-tokens` (default
+  512) from that backlog. A CPU wave takes 10–100× longer than a GPU wave, so
+  overflow trades tail latency for throughput. It adds little beside a fast GPU:
+  a 16-core host added nothing to an RTX 5090. CPU and GPU embeddings of the
+  same text agree to cosine ≥ 0.9996.
+- The HTTP worker count caps the number of requests in flight. Unless
+  `--workers` is given, it grows to 32 per executor.
 
 ## Install
 

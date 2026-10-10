@@ -1,6 +1,6 @@
 // Minimal keep-alive HTTP load generator for embedding servers (no wrk/hey/ab needed).
 // build: cc -O2 -pthread -o loadgen perf/loadgen.c
-// usage: loadgen PORT WORDS CONCURRENCY SECONDS   (~4.6 tokens per generated word)
+// usage: loadgen PORT WORDS CONCURRENCY SECONDS   (one token per filler word, plus ~12: 8170 words is ~8182 tokens)
 // Prints requests/s and latency p50/p90/p99 (ms).
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -34,8 +34,10 @@ static void *worker(void *arg) {
     int fd = conn();
     double end = now() + secs;
     while (now() < end) {
-        int p = sprintf(body, "{\"model\":\"embeddinggemma-2\",\"input\":\"");
-        for (int w = 0; w < words; w++) p += sprintf(body + p, "w%ld%ld ", id, n * 31 + w);
+        /* Unique short prefix, then a fixed filler: token counts stay constant
+         * across a run (numbered words grew tokens as counters grew). */
+        int p = sprintf(body, "{\"model\":\"embeddinggemma-2\",\"input\":\"r%ld n%ld", id, n);
+        for (int w = 0; w < words; w++) p += sprintf(body + p, " the");
         p += sprintf(body + p, "\"}");
         int r = sprintf(req, "POST /api/embed HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", p, body);
         double t_start = now();
@@ -74,7 +76,8 @@ int cmp(const void *a, const void *b) {
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     port = atoi(argv[1]), words = atoi(argv[2]); int c = atoi(argv[3]); secs = atoi(argv[4]);
-    pthread_t t[256];
+    if (c < 1 || c > 4096) { fprintf(stderr, "concurrency must be 1..4096\n"); return 2; }
+    pthread_t *t = malloc((size_t)c * sizeof *t);
     for (long i = 0; i < c; i++) pthread_create(&t[i], NULL, worker, (void *)i);
     for (int i = 0; i < c; i++) pthread_join(t[i], NULL);
     int cmp(const void *a, const void *b);

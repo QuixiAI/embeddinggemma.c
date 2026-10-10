@@ -8,7 +8,12 @@ extern "C" {
 #endif
 #include "gguf.h"
 /* EmbeddingGemma 2 text tower on CUDA (packed multi-sequence waves). */
+/* On EI_CUDA_DEVICE (default 0), or on an explicit device index. Each device
+ * holds its own copy of the weights. */
 void *ei_gemma2_cuda_create(const ei_gguf *g, char *err, size_t len);
+void *ei_gemma2_cuda_create_on(const ei_gguf *g, int device, char *err, size_t len);
+int ei_gemma2_cuda_device_count(void);
+int ei_gemma2_cuda_device(void *ctx);
 void ei_gemma2_cuda_free(void *ctx);
 /* A pipeline slot: shares ctx's weights, with its own stream (high_priority:
  * the device's greatest stream priority), cuBLAS handle and workspace so waves

@@ -34,6 +34,17 @@ typedef struct {
      * so short requests bypass long waves; waves never mix the two classes.
      * 0 disables (the historical collection). Needs pipeline_slots > 1. */
     size_t short_bypass_tokens;
+    /* Executors (optional, pipeline_slots entries each). slot_group[i] names
+     * the device of slot i: waves go to an idle device first, then to the
+     * least-loaded one (NULL: every slot on one device). slot_max_batch_tokens
+     * caps a slot's waves (0: max_batch_tokens), so slow executors such as CPU
+     * workers take waves they finish promptly. Overflow slots (CPU workers
+     * beside a GPU) start a wave only when no GPU slot can, and take only
+     * requests of at most overflow_max_sequence_tokens. */
+    const uint8_t *slot_group;
+    const bool *slot_overflow;
+    const size_t *slot_max_batch_tokens;
+    size_t overflow_max_sequence_tokens;
 } ei_inference_service_config;
 
 typedef struct {

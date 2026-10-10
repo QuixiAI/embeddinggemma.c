@@ -180,18 +180,41 @@ void ei_engine_load(ei_engine *e, const char *model_path) {
     ei_engine_load_backend(e, model_path, backend ? backend : "auto");
 }
 
+/* Reverse order: a device's pipeline clones go before the context owning
+ * the weights they share. */
+static void free_executors(ei_engine *e) {
+    for (size_t i = e->executor_count; i-- > 0;) {
+        ei_executor *x = &e->executors[i];
+        if (!x->owned) continue;
+#if defined(EI_ENABLE_METAL)
+        if (x->kind == EI_EXECUTOR_METAL) ei_gemma2_metal_free(x->ctx);
+#endif
+#if defined(EI_ENABLE_CUDA)
+        if (x->kind == EI_EXECUTOR_CUDA) ei_gemma2_cuda_free(x->ctx);
+#endif
+        if (x->kind == EI_EXECUTOR_CPU) {
+            ei_gemma2_fast_free(x->ctx);
+            ei_thread_pool_destroy(x->pool);
+        }
+    }
+    e->executor_count = 0;
+}
+
 void ei_engine_free(ei_engine *e) {
+#if defined(EI_ENABLE_CUDA)
+    ei_gemma2_cuda_free(e->gemma2_cuda_media);
+    e->gemma2_cuda_media = NULL;
+#endif
+#if defined(EI_ENABLE_METAL)
+    ei_gemma2_metal_free(e->gemma2_media);
+    e->gemma2_media = NULL;
+#endif
+    free_executors(e);
 #if defined(EI_ENABLE_METAL)
     ei_metal_engine_free(e->metal);
-    for (size_t i = 1; i < e->gemma2_slot_count; i++)
-        ei_gemma2_metal_free(e->gemma2_slots[i]);
-    ei_gemma2_metal_free(e->gemma2_media);
     ei_gemma2_metal_free(e->gemma2_metal);
 #endif
 #if defined(EI_ENABLE_CUDA)
-    for (size_t i = 1; i < e->gemma2_slot_count && e->gemma2_cuda; i++)
-        ei_gemma2_cuda_free(e->gemma2_cuda_slots[i]);
-    ei_gemma2_cuda_free(e->gemma2_cuda_media);
     ei_gemma2_cuda_free(e->gemma2_cuda);
     ei_cuda_engine_free(e->cuda);
 #endif
@@ -1094,74 +1117,156 @@ bool ei_engine_embed(ei_engine *e, const char *text, size_t len, float out[EI_N_
     return ok;
 }
 
+static ei_executor *add_executor(ei_engine *e, ei_executor_kind kind, size_t group, void *ctx,
+                                 bool owned, char *err, size_t err_len) {
+    if (e->executor_count == EI_MAX_EXECUTORS) {
+        set_err(err, err_len, "at most 32 executors (GPU slots plus CPU workers)");
+        return NULL;
+    }
+    ei_executor *x = &e->executors[e->executor_count++];
+    *x = (ei_executor){.kind = kind, .group = (uint8_t)group, .owned = owned, .ctx = ctx};
+    return x;
+}
+
+bool ei_engine_configure_executors(ei_engine *e, const ei_executor_config *c, char *err,
+                                   size_t err_len) {
+    size_t slots = c->pipeline_slots ? c->pipeline_slots : 1;
+    if (slots > EI_MAX_PIPELINE_SLOTS) {
+        set_err(err, err_len, "pipeline slots must be 1..8");
+        return false;
+    }
+    if (!e->model.embeddinggemma2) {
+        if (slots == 1 && !c->cpu_workers && c->cuda_device_count <= 1) return true;
+        set_err(err, err_len, "pipeline slots, CPU workers and multiple GPUs require EmbeddingGemma 2");
+        return false;
+    }
+    if (e->executor_count) {
+        set_err(err, err_len, "executors are already configured");
+        return false;
+    }
+    size_t group = 0;
+    bool ok = true;
+#if defined(EI_ENABLE_METAL)
+    if (e->gemma2_metal) {
+        if (c->cuda_device_count) {
+            set_err(err, err_len, "CUDA devices were requested but the backend is Metal");
+            return false;
+        }
+        ok = add_executor(e, EI_EXECUTOR_METAL, group, e->gemma2_metal, false, err, err_len);
+        for (size_t i = 1; ok && i < slots; i++) {
+            void *clone = ei_gemma2_metal_clone(e->gemma2_metal, err, err_len);
+            ok = clone && add_executor(e, EI_EXECUTOR_METAL, group, clone, true, err, err_len);
+        }
+        group++;
+    }
+#endif
+#if defined(EI_ENABLE_CUDA)
+    if (ok && e->gemma2_cuda) {
+        int self = ei_gemma2_cuda_device(e->gemma2_cuda);
+        size_t devices = c->cuda_device_count ? c->cuda_device_count : 1;
+        for (size_t d = 0; ok && d < devices; d++) {
+            int device = c->cuda_device_count ? c->cuda_devices[d] : self;
+            // The engine's own context serves its device first; every other
+            // device (or a repeat) loads its own copy of the weights.
+            void *primary = d == 0 && device == self
+                                ? e->gemma2_cuda
+                                : ei_gemma2_cuda_create_on(&e->model.gguf, device, err, err_len);
+            ok = primary && add_executor(e, EI_EXECUTOR_CUDA, group, primary,
+                                         primary != e->gemma2_cuda, err, err_len);
+            // Long waves start only on an idle device, so they hold its first
+            // slot; bypass waves run on slots 1.. at the highest stream priority.
+            for (size_t i = 1; ok && i < slots; i++) {
+                void *clone = ei_gemma2_cuda_clone(primary, true, err, err_len);
+                ok = clone && add_executor(e, EI_EXECUTOR_CUDA, group, clone, true, err, err_len);
+            }
+            group++;
+        }
+    }
+#endif
+    if (ok && c->cuda_device_count && !e->gemma2_cuda) {
+        set_err(err, err_len, "CUDA devices were requested but the backend is not CUDA");
+        ok = false;
+    }
+    if (ok && slots > 1 && !e->executor_count) {
+        set_err(err, err_len, "pipeline slots > 1 require EmbeddingGemma 2 on Metal or CUDA");
+        ok = false;
+    }
+    bool gpu = e->executor_count > 0;
+    if (ok && c->cpu_workers) {
+        int32_t total = c->cpu_threads > 0 ? c->cpu_threads : ei_cpu_count();
+        if ((size_t)total < c->cpu_workers) {
+            set_err(err, err_len, "each CPU worker needs at least one thread");
+            ok = false;
+        }
+        // Each worker gets a contiguous run of the placement order (cores
+        // grouped by L3, SMT siblings last), pinned when it fits the machine.
+        int32_t *order = ei_xmalloc((size_t)ei_cpu_count() * sizeof *order);
+        int32_t cpus = ei_cpu_placement(order, ei_cpu_count()), next = 0;
+        bool pin = c->cpu_pin && total <= cpus;
+        for (size_t w = 0; ok && w < c->cpu_workers; w++) {
+            int32_t threads = total / (int32_t)c->cpu_workers +
+                              ((int32_t)w < total % (int32_t)c->cpu_workers);
+            ei_executor *x = add_executor(e, EI_EXECUTOR_CPU, group++, NULL, true, err, err_len);
+            if (!(ok = x != NULL)) break;
+            x->overflow = gpu;
+            x->ctx = ei_gemma2_fast_create();
+            // Short CPU waves are wake-up bound; worker pools spin 50 us.
+            x->pool = pin ? ei_thread_pool_create_pinned(threads, 50, order + next)
+                          : ei_thread_pool_create_spin(threads, 50);
+            next += threads;
+        }
+        free(order);
+    }
+    // Media gets its own context so it never waits on a text slot.
+#if defined(EI_ENABLE_METAL)
+    if (ok && e->gemma2_metal && e->executor_count > 1)
+        ok = (e->gemma2_media = ei_gemma2_metal_clone(e->gemma2_metal, err, err_len)) != NULL;
+#endif
+#if defined(EI_ENABLE_CUDA)
+    if (ok && e->gemma2_cuda && e->executor_count > 1)
+        ok = (e->gemma2_cuda_media = ei_gemma2_cuda_clone(e->gemma2_cuda, false, err, err_len)) !=
+             NULL;
+#endif
+    if (!ok) free_executors(e);
+    return ok;
+}
+
 bool ei_engine_set_pipeline_slots(ei_engine *e, size_t slots, char *err, size_t err_len) {
     if (slots == 0 || slots > EI_MAX_PIPELINE_SLOTS) {
         set_err(err, err_len, "pipeline slots must be 1..8");
         return false;
     }
     if (slots == 1) return true;
-#if defined(EI_ENABLE_METAL)
-    if (e->gemma2_metal) {
-        e->gemma2_slots[0] = e->gemma2_metal;
-        for (size_t i = 1; i < slots; i++)
-            if (!(e->gemma2_slots[i] = ei_gemma2_metal_clone(e->gemma2_metal, err, err_len)))
-                return false;
-        e->gemma2_slot_count = slots;
-        e->gemma2_media = ei_gemma2_metal_clone(e->gemma2_metal, err, err_len);
-        return e->gemma2_media != NULL;
-    }
-#endif
-#if defined(EI_ENABLE_CUDA)
-    if (e->gemma2_cuda) {
-        e->gemma2_cuda_slots[0] = e->gemma2_cuda;
-        for (size_t i = 1; i < slots; i++)
-            // Long waves start only on an idle backend, so they hold slot 0;
-            // bypass waves run on slots 1.. at the GPU's highest priority.
-            if (!(e->gemma2_cuda_slots[i] = ei_gemma2_cuda_clone(e->gemma2_cuda, true, err, err_len)))
-                return false;
-        e->gemma2_slot_count = slots;
-        e->gemma2_cuda_media = ei_gemma2_cuda_clone(e->gemma2_cuda, false, err, err_len);
-        return e->gemma2_cuda_media != NULL;
-    }
-#endif
-    (void)e;
-    set_err(err, err_len, "pipeline slots > 1 require EmbeddingGemma 2 on Metal or CUDA");
-    return false;
+    return ei_engine_configure_executors(e, &(ei_executor_config){.pipeline_slots = slots}, err,
+                                         err_len);
 }
 
 bool ei_engine_embed_tokens_batch_slot(ei_engine *e, size_t slot, const int32_t *ids,
                                        const size_t *offsets, size_t batch_size,
                                        float *out, char *err, size_t err_len) {
-#if defined(EI_ENABLE_METAL)
-    if (slot > 0 && slot < e->gemma2_slot_count) {
-        if (!offsets || batch_size == 0 || offsets[0] != 0) {
-            set_err(err, err_len, "batch offsets must start at zero");
-            return false;
-        }
-        for (size_t s = 0; s < batch_size; s++)
-            if (offsets[s + 1] < offsets[s] ||
-                !token_ids_valid(ids + offsets[s], offsets[s + 1] - offsets[s], 8192, err,
-                                 err_len))
-                return false;
-        return ei_gemma2_metal_batch(e->gemma2_slots[slot], ids, offsets, batch_size, out, err,
-                                     err_len);
+    if (slot >= e->executor_count)
+        return ei_engine_embed_tokens_batch(e, ids, offsets, batch_size, out, err, err_len);
+    if (!offsets || batch_size == 0 || offsets[0] != 0) {
+        set_err(err, err_len, "batch offsets must start at zero");
+        return false;
     }
+    for (size_t s = 0; s < batch_size; s++)
+        if (offsets[s + 1] < offsets[s] ||
+            !token_ids_valid(ids + offsets[s], offsets[s + 1] - offsets[s], 8192, err, err_len))
+            return false;
+    ei_executor *x = &e->executors[slot];
+#if defined(EI_ENABLE_METAL)
+    if (x->kind == EI_EXECUTOR_METAL)
+        return ei_gemma2_metal_batch(x->ctx, ids, offsets, batch_size, out, err, err_len);
 #endif
 #if defined(EI_ENABLE_CUDA)
-    if (slot > 0 && slot < e->gemma2_slot_count && e->gemma2_cuda) {
-        if (!offsets || batch_size == 0 || offsets[0] != 0) {
-            set_err(err, err_len, "batch offsets must start at zero");
-            return false;
-        }
-        for (size_t s = 0; s < batch_size; s++)
-            if (offsets[s + 1] < offsets[s] ||
-                !token_ids_valid(ids + offsets[s], offsets[s + 1] - offsets[s], 8192, err,
-                                 err_len))
-                return false;
-        return ei_gemma2_cuda_batch(e->gemma2_cuda_slots[slot], ids, offsets, batch_size, out,
-                                    err, err_len);
-    }
+    if (x->kind == EI_EXECUTOR_CUDA)
+        return ei_gemma2_cuda_batch(x->ctx, ids, offsets, batch_size, out, err, err_len);
 #endif
-    (void)slot;
-    return ei_engine_embed_tokens_batch(e, ids, offsets, batch_size, out, err, err_len);
+    ei_cpu_binding binding;
+    ei_thread_pool_bind_caller(x->pool, &binding);
+    bool ok = ei_gemma2_embed_batch_fast_ctx(x->ctx, &e->model.gguf, x->pool, ids, NULL, offsets,
+                                             batch_size, out, err, err_len);
+    ei_thread_pool_unbind_caller(&binding);
+    return ok;
 }

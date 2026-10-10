@@ -20,6 +20,7 @@ static bool media_part(const char **p, ei_media_input *m, char *err, size_t len)
     string_list frames = {0};
     bool ok = false;
     double fps = 1;
+    long vision_tokens = 0;
     unsigned fields = 0;
     for (;;) {
         sv_string key = {0};
@@ -40,6 +41,8 @@ static bool media_part(const char **p, ei_media_input *m, char *err, size_t len)
             bit = 8;
         else if (string_is(&key, "fps"))
             bit = 16;
+        else if (string_is(&key, "vision_tokens"))
+            bit = 32;
         free(key.s);
         if (!bit || (fields & bit)) {
             snprintf(err, len, "unknown or duplicate content-part field");
@@ -57,11 +60,12 @@ static bool media_part(const char **p, ei_media_input *m, char *err, size_t len)
                 sv_string frame = {0};
                 if (!parse_json_string(p, &frame, err, len))
                     goto done;
-                append_input(&frames, frame);
-                if (frames.n > 114) {
-                    snprintf(err, len, "video accepts at most 114 sampled frames");
-                    goto done;
-                }
+                /* 114 frames at the 70-token minimum fill the context; later
+                 * frames could only be truncated away. */
+                if (frames.n < 114)
+                    append_input(&frames, frame);
+                else
+                    free(frame.s);
                 skip_ws(p);
                 if (**p == ']') {
                     ++*p;
@@ -70,6 +74,16 @@ static bool media_part(const char **p, ei_media_input *m, char *err, size_t len)
                 if (!json_expect(p, ',', err, len))
                     goto done;
             }
+        } else if (bit == 32) {
+            skip_ws(p);
+            char *end;
+            errno = 0;
+            vision_tokens = strtol(*p, &end, 10);
+            if (errno || end == *p || vision_tokens < 70 || vision_tokens > 1120) {
+                snprintf(err, len, "vision_tokens must be an integer from 70 through 1120");
+                goto done;
+            }
+            *p = end;
         } else {
             skip_ws(p);
             char *end;
@@ -89,13 +103,17 @@ static bool media_part(const char **p, ei_media_input *m, char *err, size_t len)
         if (!json_expect(p, ',', err, len))
             goto done;
     }
+    /* Soft tokens per image or frame: the model card defaults, 70..1120 when set. */
+    int image_tokens = vision_tokens ? (int)vision_tokens : 280;
+    int frame_tokens = vision_tokens ? (int)vision_tokens : 140;
+    unsigned media_fields = fields & ~32u;
     if (string_is(&type, "text") && fields == 3)
         ok = ei_media_text(m, text.s, text.len, err, len);
-    else if (string_is(&type, "image") && fields == 5)
-        ok = ei_media_image(m, data.s, data.len, 280, err, len);
+    else if (string_is(&type, "image") && media_fields == 5)
+        ok = ei_media_image(m, data.s, data.len, image_tokens, err, len);
     else if (string_is(&type, "audio") && fields == 5)
         ok = ei_media_audio(m, data.s, data.len, err, len);
-    else if (string_is(&type, "video") && (fields == 9 || fields == 25)) {
+    else if (string_is(&type, "video") && (media_fields == 9 || media_fields == 25)) {
         ok = frames.n > 0;
         for (size_t i = 0; ok && i < frames.n; ++i) {
             unsigned seconds = (unsigned)(i / fps);
@@ -103,12 +121,12 @@ static bool media_part(const char **p, ei_media_input *m, char *err, size_t len)
             int n = snprintf(stamp, sizeof stamp, "%s%02u:%02u ", i ? " " : "", seconds / 60,
                              seconds % 60);
             ok = ei_media_text(m, stamp, (size_t)n, err, len) &&
-                 ei_media_image(m, frames.items[i].s, frames.items[i].len, 140, err, len);
+                 ei_media_image(m, frames.items[i].s, frames.items[i].len, frame_tokens, err, len);
         }
     } else
         snprintf(err, len,
                  "content requires text/text, image/data, audio/data, or video/frames with "
-                 "optional fps");
+                 "optional fps; images and video accept optional vision_tokens");
 done:
     free(type.s);
     free(text.s);

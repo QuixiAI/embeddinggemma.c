@@ -7,6 +7,9 @@
 #include "http_docs.h"
 #include "inference_service.h"
 #include "response_cache.h"
+#if defined(EI_ENABLE_CUDA)
+#include "gemma2_cuda.h"
+#endif
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -82,6 +85,8 @@ typedef struct {
     ei_gguf *projector;
     bool profile_explicit;
     bool batch_tokens_explicit;
+    bool workers_explicit;
+    bool keepalive_explicit;
     size_t workers;
     size_t max_queue;
     size_t cache_entries;
@@ -90,6 +95,14 @@ typedef struct {
     size_t max_batch_sequence_tokens;
     size_t pipeline_slots;
     size_t short_bypass_tokens;
+    size_t threads;              /* 0: EI_THREADS or the default */
+    size_t cpu_workers;          /* 0: none beside a GPU, the engine itself on CPU */
+    size_t cpu_max_batch_tokens;
+    size_t cpu_max_sequence_tokens;
+    bool cpu_pin;
+    int cuda_devices[EI_MAX_EXECUTORS];
+    size_t cuda_device_count;
+    bool cuda_all_devices;
     size_t max_client_batch_size;
     size_t tokenizer_workers;
     uint32_t batch_wait_us;
@@ -1290,6 +1303,12 @@ static void usage(const char *argv0) {
             "          [--response-cache-mb N] [--persistent-cache-path PATH]\n"
             "          [--pipeline-slots N]  (embeddinggemma-2 GPU waves in flight, 1..8)\n"
             "          [--short-bypass-tokens N]  (short requests bypass long waves; implies 2 slots)\n"
+            "          [--threads N]  (CPU inference threads; split across --cpu-workers)\n"
+            "          [--cpu-workers N]  (independent CPU executors; beside a GPU they take overflow)\n"
+            "          [--cpu-max-batch-tokens N]  (CPU-worker wave size, default 1024)\n"
+            "          [--cpu-max-sequence-tokens N]  (largest request a CPU worker beside a GPU takes)\n"
+            "          [--cpu-pin on|off]  (pin CPU-worker threads to cores, Linux; default on)\n"
+            "          [--cuda-devices all|I,J,...]  (embeddinggemma-2 on several GPUs)\n"
             "default listen: 0.0.0.0:%d\n"
             "default model: $XDG_CACHE_HOME/embeddinggemma.c/%s\n"
             "               or $HOME/.cache/embeddinggemma.c/%s\n",
@@ -1319,6 +1338,7 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
     opts->projector = NULL;
     opts->profile_explicit = false;
     opts->batch_tokens_explicit = false;
+    opts->workers_explicit = false;
     opts->workers = 64;
     opts->max_queue = 256;
     opts->cache_entries = 4096;
@@ -1326,6 +1346,13 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
     opts->max_batch_requests = 64;
     opts->max_batch_sequence_tokens = 1024;
     opts->pipeline_slots = 1;
+    opts->threads = 0;
+    opts->cpu_workers = 0;
+    opts->cpu_max_batch_tokens = 1024;
+    opts->cpu_max_sequence_tokens = 512;
+    opts->cpu_pin = true;
+    opts->cuda_device_count = 0;
+    opts->cuda_all_devices = false;
     opts->max_client_batch_size = 32;
     opts->tokenizer_workers = 8;
     opts->batch_wait_us = 200;
@@ -1358,7 +1385,8 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
         } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             opts->model_path = argv[++i];
         } else if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
-            if (!parse_size_arg(argv[++i], 1, 256, &opts->workers)) return false;
+            if (!parse_size_arg(argv[++i], 1, 1024, &opts->workers)) return false;
+            opts->workers_explicit = true;
         } else if (strcmp(argv[i], "--max-queue") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 1, 4096, &opts->max_queue)) return false;
         } else if (strcmp(argv[i], "--cache-entries") == 0 && i + 1 < argc) {
@@ -1375,6 +1403,34 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
         } else if (strcmp(argv[i], "--pipeline-slots") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 1, EI_MAX_PIPELINE_SLOTS, &opts->pipeline_slots))
                 return false;
+        } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 1024, &opts->threads)) return false;
+        } else if (strcmp(argv[i], "--cpu-workers") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 0, 16, &opts->cpu_workers)) return false;
+        } else if (strcmp(argv[i], "--cpu-pin") == 0 && i + 1 < argc) {
+            const char *value = argv[++i];
+            if (strcmp(value, "on") && strcmp(value, "off")) return false;
+            opts->cpu_pin = !strcmp(value, "on");
+        } else if (strcmp(argv[i], "--cpu-max-batch-tokens") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 8192, &opts->cpu_max_batch_tokens)) return false;
+        } else if (strcmp(argv[i], "--cpu-max-sequence-tokens") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 8192, &opts->cpu_max_sequence_tokens)) return false;
+        } else if (strcmp(argv[i], "--cuda-devices") == 0 && i + 1 < argc) {
+            const char *list = argv[++i];
+            if (!strcmp(list, "all")) {
+                opts->cuda_all_devices = true;
+            } else {
+                for (const char *at = list; *at;) {
+                    char *end = NULL;
+                    long device = strtol(at, &end, 10);
+                    if (end == at || device < 0 || device > 255 ||
+                        opts->cuda_device_count == EI_MAX_EXECUTORS || (*end && *end != ','))
+                        return false;
+                    opts->cuda_devices[opts->cuda_device_count++] = (int)device;
+                    at = *end ? end + 1 : end;
+                }
+                if (!opts->cuda_device_count) return false;
+            }
         } else if (strcmp(argv[i], "--max-batch-sequence-tokens") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 1, 8192, &opts->max_batch_sequence_tokens)) return false;
         } else if (strcmp(argv[i], "--max-client-batch-size") == 0 && i + 1 < argc) {
@@ -1411,6 +1467,7 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
             return false;
         }
     }
+    opts->keepalive_explicit = keepalive_connections_set;
     if (!keepalive_connections_set) {
         opts->keepalive_connections = opts->workers / 2u;
     }
@@ -1576,6 +1633,31 @@ int main(int argc, char **argv) {
 
     if (!second && opts.projector_path) ei_die("--mmproj requires embeddinggemma-2");
 
+    // --threads sizes the engine's own pool (EI_THREADS semantics); CPU
+    // workers split it among themselves.
+    if (opts.threads) {
+        char value[32];
+        snprintf(value, sizeof value, "%zu", opts.threads);
+        setenv("EI_THREADS", value, 1);
+    }
+#if defined(EI_ENABLE_CUDA)
+    if (opts.cuda_all_devices) {
+        int count = ei_gemma2_cuda_device_count();
+        if (count < 1) ei_die("--cuda-devices all: no CUDA device");
+        for (int d = 0; d < count && d < EI_MAX_EXECUTORS; d++)
+            opts.cuda_devices[opts.cuda_device_count++] = d;
+    }
+    // The engine loads on the first listed device.
+    if (opts.cuda_device_count) {
+        char value[32];
+        snprintf(value, sizeof value, "%d", opts.cuda_devices[0]);
+        setenv("EI_CUDA_DEVICE", value, 1);
+    }
+#else
+    if (opts.cuda_all_devices || opts.cuda_device_count)
+        ei_die("--cuda-devices requires a CUDA build");
+#endif
+
     fprintf(stderr, "loading model: %s\n", model_path);
     ei_engine engine;
     ei_engine_load_backend(&engine, model_path, opts.backend);
@@ -1603,12 +1685,60 @@ int main(int argc, char **argv) {
     }
     bool implied_slots = opts.short_bypass_tokens && opts.pipeline_slots < 2;
     if (implied_slots) opts.pipeline_slots = 2;
-    if (!ei_engine_set_pipeline_slots(&engine, opts.pipeline_slots, reserve_error,
-                                      sizeof reserve_error)) {
-        if (!implied_slots) ei_die("cannot create pipeline slots: %s", reserve_error);
-        fprintf(stderr, "short-request bypass disabled: %s\n", reserve_error);
-        opts.pipeline_slots = 1;
+    bool cpu_backend = !strcmp(ei_engine_backend(&engine), "cpu");
+    ei_executor_config executors = {
+        .pipeline_slots = cpu_backend ? 1 : opts.pipeline_slots,
+        .cuda_devices = opts.cuda_device_count ? opts.cuda_devices : NULL,
+        .cuda_device_count = opts.cuda_device_count,
+        // On the CPU backend one worker is the engine itself.
+        .cpu_workers = cpu_backend && opts.cpu_workers < 2 ? 0 : opts.cpu_workers,
+        .cpu_threads = (int32_t)opts.threads,
+        .cpu_pin = opts.cpu_pin,
+    };
+    if (cpu_backend && implied_slots && !executors.cpu_workers) {
+        fprintf(stderr, "short-request bypass disabled: needs a GPU or --cpu-workers >= 2\n");
         opts.short_bypass_tokens = 0;
+    } else if (cpu_backend && opts.pipeline_slots > 1 && !implied_slots) {
+        ei_die("cannot create pipeline slots: pipeline slots > 1 require EmbeddingGemma 2 on "
+               "Metal or CUDA");
+    }
+    if (!ei_engine_configure_executors(&engine, &executors, reserve_error, sizeof reserve_error)) {
+        if (!implied_slots) ei_die("cannot create executors: %s", reserve_error);
+        fprintf(stderr, "short-request bypass disabled: %s\n", reserve_error);
+        opts.short_bypass_tokens = 0;
+        executors.pipeline_slots = 1;
+        if (!ei_engine_configure_executors(&engine, &executors, reserve_error,
+                                           sizeof reserve_error))
+            ei_die("cannot create executors: %s", reserve_error);
+    }
+    opts.pipeline_slots = engine.executor_count > 1 ? engine.executor_count : 1;
+    // Each keep-alive connection holds an HTTP worker, so workers cap the
+    // requests in flight; give every executor enough to fill its waves.
+    if (!opts.workers_explicit && opts.workers < 32 * engine.executor_count) {
+        opts.workers = 32 * engine.executor_count;
+        const char *keepalive = getenv("EI_HTTP_KEEPALIVE");
+        if (!opts.keepalive_explicit && !(keepalive && !strcmp(keepalive, "0")))
+            opts.keepalive_connections = opts.workers / 2u;
+    }
+    uint8_t slot_group[EI_MAX_EXECUTORS];
+    bool slot_overflow[EI_MAX_EXECUTORS];
+    size_t slot_budget[EI_MAX_EXECUTORS];
+    for (size_t i = 0; i < engine.executor_count; i++) {
+        slot_group[i] = engine.executors[i].group;
+        slot_overflow[i] = engine.executors[i].overflow;
+        // CPU workers take waves they finish promptly, spreading the queue.
+        slot_budget[i] = engine.executors[i].kind == EI_EXECUTOR_CPU ? opts.cpu_max_batch_tokens : 0;
+        const ei_executor *x = &engine.executors[i];
+        fprintf(stderr, "executor %zu (group %u): ", i, x->group);
+        if (x->kind == EI_EXECUTOR_CPU)
+            fprintf(stderr, "cpu worker, %d threads%s\n", ei_thread_pool_threads(x->pool),
+                    x->overflow ? ", overflow" : "");
+#if defined(EI_ENABLE_CUDA)
+        else if (x->kind == EI_EXECUTOR_CUDA)
+            fprintf(stderr, "cuda:%d\n", ei_gemma2_cuda_device(x->ctx));
+#endif
+        else
+            fprintf(stderr, "metal\n");
     }
     ei_inference_service_config service_config = {
         .cache_entries = opts.cache_entries,
@@ -1622,6 +1752,10 @@ int main(int argc, char **argv) {
         .pipeline_slots = opts.pipeline_slots,
         .short_bypass_tokens = opts.short_bypass_tokens,
         .execute_slot = opts.pipeline_slots > 1 ? execute_engine_batch_slot : NULL,
+        .slot_group = engine.executor_count > 1 ? slot_group : NULL,
+        .slot_overflow = engine.executor_count > 1 ? slot_overflow : NULL,
+        .overflow_max_sequence_tokens = opts.cpu_max_sequence_tokens,
+        .slot_max_batch_tokens = engine.executor_count > 1 ? slot_budget : NULL,
     };
     ei_inference_service *service = ei_inference_service_create(
         &engine.tokenizer, execute_engine_batch, &engine, &service_config);

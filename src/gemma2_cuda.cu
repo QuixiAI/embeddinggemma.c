@@ -1313,16 +1313,33 @@ bool use_projector(engine *e, const ei_gguf *g, char *err, size_t len) {
 
 } // namespace
 
-extern "C" void *ei_gemma2_cuda_create(const ei_gguf *g, char *err, size_t len) {
+extern "C" int ei_gemma2_cuda_device_count(void) {
     int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
+    return cudaGetDeviceCount(&count) == cudaSuccess ? count : 0;
+}
+
+extern "C" int ei_gemma2_cuda_device(void *ctx) {
+    return ((engine *)ctx)->device;
+}
+
+extern "C" void *ei_gemma2_cuda_create(const ei_gguf *g, char *err, size_t len) {
+    const char *dev = getenv("EI_CUDA_DEVICE");
+    return ei_gemma2_cuda_create_on(g, dev ? atoi(dev) : 0, err, len);
+}
+
+extern "C" void *ei_gemma2_cuda_create_on(const ei_gguf *g, int device, char *err, size_t len) {
+    int count = ei_gemma2_cuda_device_count();
+    if (count == 0) {
         snprintf(err, len, "no CUDA device");
+        return nullptr;
+    }
+    if (device < 0 || device >= count) {
+        snprintf(err, len, "CUDA device %d does not exist (%d visible)", device, count);
         return nullptr;
     }
     engine *e = new engine();
     e->g = g;
-    const char *dev = getenv("EI_CUDA_DEVICE");
-    e->device = dev ? atoi(dev) : 0;
+    e->device = device;
     const char *graphs = getenv("EI_GEMMA2_CUDA_GRAPHS");
     e->use_graphs = !graphs || strcmp(graphs, "0");
     const char *mma = getenv("EI_GEMMA2_CUDA_MMA_ATTN");

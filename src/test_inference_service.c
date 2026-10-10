@@ -57,6 +57,35 @@ static bool fake_execute(void *opaque, const int32_t *ids,
     return true;
 }
 
+/* Executors: per-slot call counts and the largest wave each slot ran. */
+typedef struct {
+    _Atomic int calls[4];
+    _Atomic int max_tokens[4];
+    long delay_ns[4];
+    long first_delay_ns; /* slot 0's first wave, to hold the device busy */
+} fake_executors;
+
+static bool fake_execute_slot(void *opaque, size_t slot, const int32_t *ids,
+                              const size_t *offsets, size_t batch_size, float *out,
+                              char *err, size_t err_len) {
+    fake_executors *x = opaque;
+    atomic_fetch_add(&x->calls[slot], 1);
+    int tokens = (int)offsets[batch_size], observed = atomic_load(&x->max_tokens[slot]);
+    while (observed < tokens &&
+           !atomic_compare_exchange_weak(&x->max_tokens[slot], &observed, tokens)) {}
+    long delay_ns = slot == 0 && atomic_load(&x->calls[0]) == 1 && x->first_delay_ns
+                        ? x->first_delay_ns : x->delay_ns[slot];
+    struct timespec delay = { .tv_sec = delay_ns / 1000000000l, .tv_nsec = delay_ns % 1000000000l };
+    nanosleep(&delay, NULL);
+    for (size_t sequence = 0; sequence < batch_size; sequence++) {
+        float value = expected_first(ids + offsets[sequence],
+                                     offsets[sequence + 1] - offsets[sequence]);
+        for (int32_t d = 0; d < EI_N_EMBD; d++) out[sequence * EI_N_EMBD + d] = value;
+    }
+    if (err && err_len) err[0] = '\0';
+    return true;
+}
+
 static void gate_wait(start_gate *gate) {
     pthread_mutex_lock(&gate->mutex);
     gate->ready++;
@@ -241,5 +270,100 @@ int main(void) {
                atomic_load(&long_backend.max_batch));
     }
     ei_inference_service_free(long_service);
+
+    // A fast device slot and a slow CPU overflow slot under a deep backlog:
+    // every request completes (the queue drains through every backlog
+    // boundary) and overflow waves respect their token budget.
+    enum { BACKLOG = 400 };
+    request_context *backlog = ei_xcalloc(BACKLOG, sizeof *backlog);
+    for (size_t i = 0; i < BACKLOG; i++) {
+        backlog[i].n_tokens = 8;
+        for (size_t token = 0; token < 8; token++)
+            backlog[i].ids[token] = 10000 * (int32_t)(i + 1) + (int32_t)token;
+    }
+    const uint8_t overflow_groups[2] = {0, 1};
+    const bool overflow_flags[2] = {false, true};
+    const size_t overflow_budgets[2] = {0, 64};
+    fake_executors overflow_x = { .delay_ns = {5000000l, 30000000l} };
+    ei_inference_service_config overflow_config = mixed_config;
+    overflow_config.max_batch_sequence_tokens = 8;
+    overflow_config.pipeline_slots = 2;
+    overflow_config.execute_slot = fake_execute_slot;
+    overflow_config.slot_group = overflow_groups;
+    overflow_config.slot_overflow = overflow_flags;
+    overflow_config.slot_max_batch_tokens = overflow_budgets;
+    overflow_config.overflow_max_sequence_tokens = 8;
+    ei_inference_service *overflow_service = ei_inference_service_create(
+        NULL, fake_execute, &overflow_x, &overflow_config);
+    if (!overflow_service) ei_die("failed to create overflow service");
+    run_prepared_group(overflow_service, backlog, BACKLOG);
+    ei_inference_service_free(overflow_service);
+    if (atomic_load(&overflow_x.calls[1]) == 0 || atomic_load(&overflow_x.max_tokens[1]) > 64)
+        ei_die("overflow slot got calls=%d max_tokens=%d, expected >0 and <=64",
+               atomic_load(&overflow_x.calls[1]), atomic_load(&overflow_x.max_tokens[1]));
+
+    // The backlog boundary: while one request holds the device, 293 requests
+    // of 7 tokens queue (2,051 tokens) and only the last crosses the 2,048
+    // tokens the device's next wave absorbs, so it belongs to that wave and
+    // the overflow slot must stay idle. (An inconsistent backlog test once
+    // started an empty overflow wave here and spun holding the lock.)
+    enum { STRADDLE = 293 };
+    fake_executors straddle_x = { .delay_ns = {1000000l, 1000000l}, .first_delay_ns = 300000000l };
+    ei_inference_service_config straddle_config = overflow_config;
+    straddle_config.max_batch_requests = 256;
+    straddle_config.batch_wait_us = 0;
+    ei_inference_service *straddle_service = ei_inference_service_create(
+        NULL, fake_execute, &straddle_x, &straddle_config);
+    if (!straddle_service) ei_die("failed to create straddle service");
+    request_context holder = { .n_tokens = 1, .ids = {7} };
+    start_gate holder_gate = { .target = 1 };
+    pthread_mutex_init(&holder_gate.mutex, NULL);
+    pthread_cond_init(&holder_gate.cond, NULL);
+    holder.service = straddle_service;
+    holder.gate = &holder_gate;
+    pthread_t holder_thread;
+    if (pthread_create(&holder_thread, NULL, request_main, &holder) != 0)
+        ei_die("failed to create straddle holder");
+    gate_release(&holder_gate);
+    while (atomic_load(&straddle_x.calls[0]) == 0) {
+        struct timespec poll = { .tv_nsec = 1000000l };
+        nanosleep(&poll, NULL);
+    }
+    for (size_t i = 0; i < STRADDLE; i++) {
+        backlog[i].n_tokens = 7;
+        for (size_t token = 0; token < 7; token++)
+            backlog[i].ids[token] = 20000 * (int32_t)(i + 1) + (int32_t)token;
+    }
+    run_prepared_group(straddle_service, backlog, STRADDLE);
+    pthread_join(holder_thread, NULL);
+    if (!holder.ok) ei_die("straddle holder failed: %s", holder.error);
+    ei_inference_service_free(straddle_service);
+    if (atomic_load(&straddle_x.calls[1]) != 0)
+        ei_die("overflow took %d waves without a backlog", atomic_load(&straddle_x.calls[1]));
+
+    // Two devices with two pipeline slots each: an idle device is preferred,
+    // so both devices run waves.
+    const uint8_t device_groups[4] = {0, 0, 1, 1};
+    fake_executors devices_x = { .delay_ns = {5000000l, 5000000l, 5000000l, 5000000l} };
+    ei_inference_service_config devices_config = overflow_config;
+    devices_config.pipeline_slots = 4;
+    devices_config.slot_group = device_groups;
+    devices_config.slot_overflow = NULL;
+    devices_config.slot_max_batch_tokens = NULL;
+    ei_inference_service *devices_service = ei_inference_service_create(
+        NULL, fake_execute, &devices_x, &devices_config);
+    if (!devices_service) ei_die("failed to create multi-device service");
+    run_prepared_group(devices_service, backlog, BACKLOG);
+    ei_inference_service_free(devices_service);
+    if (atomic_load(&devices_x.calls[0]) + atomic_load(&devices_x.calls[1]) == 0 ||
+        atomic_load(&devices_x.calls[2]) + atomic_load(&devices_x.calls[3]) == 0)
+        ei_die("multi-device waves were not spread: %d %d %d %d",
+               atomic_load(&devices_x.calls[0]), atomic_load(&devices_x.calls[1]),
+               atomic_load(&devices_x.calls[2]), atomic_load(&devices_x.calls[3]));
+    printf("executors: overflow waves=%d (max %d tokens) device waves=%d/%d/%d/%d\n",
+           atomic_load(&overflow_x.calls[1]), atomic_load(&overflow_x.max_tokens[1]),
+           atomic_load(&devices_x.calls[0]), atomic_load(&devices_x.calls[1]),
+           atomic_load(&devices_x.calls[2]), atomic_load(&devices_x.calls[3]));
+    free(backlog);
     return 0;
 }

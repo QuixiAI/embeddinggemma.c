@@ -71,6 +71,9 @@ struct ei_inference_service {
     size_t busy_slots;
     uint32_t slot_mask;
     uint32_t long_mask; /* busy slots running long waves (bypass mode) */
+    uint32_t group_mask[32]; /* slots of each device */
+    uint32_t overflow_mask;  /* CPU-worker slots beside a GPU */
+    size_t groups;
     uint64_t batch_hot_until_ns;
     uint64_t batch_hot_window_ns;
     uint64_t batch_wait_cap_ns;
@@ -98,12 +101,20 @@ static size_t context_limit(const ei_tokenizer *tokenizer) {
     return tokenizer && tokenizer->model && tokenizer->model->embeddinggemma2 ? 8192 : EI_N_CTX;
 }
 
-static void set_error(char *err, size_t err_len, const char *message) {
-    if (err && err_len) snprintf(err, err_len, "%s", message);
+/* Over-long text is truncated to the profile context, like the reference
+ * tokenizer: keep the leading tokens and the trailing EOS when one was added. */
+static void truncate_tokens(const ei_inference_service *service, ei_tokens *tokens) {
+    size_t limit = context_limit(service->tokenizer);
+    if (tokens->n <= limit) return;
+    const ei_model *model = service->tokenizer->model;
+    if (model->add_eos && tokens->ids[tokens->n - 1] == model->eos_id) {
+        tokens->ids[limit - 1] = model->eos_id;
+    }
+    tokens->n = limit;
 }
 
-static bool backend_full(const ei_inference_service *service) {
-    return service->busy_slots >= service->slots;
+static void set_error(char *err, size_t err_len, const char *message) {
+    if (err && err_len) snprintf(err, err_len, "%s", message);
 }
 
 static bool bypass_mode(const ei_inference_service *service) {
@@ -117,30 +128,107 @@ static bool queue_has_short(const ei_inference_service *service) {
         if (is_short(service, e)) return true;
     return false;
 }
-/* Bypass mode: an idle backend starts any wave; with waves in flight a new
- * one may start only if every in-flight wave is long and a short request is
- * queued (the new wave is then short-only). */
+static bool overflow_eligible(const ei_inference_service *service, const cache_entry *entry) {
+    return entry->n_tokens <= service->config.overflow_max_sequence_tokens;
+}
+/* Overflow waves serve real backlog only: requests queued behind the work
+ * the next wave of every device absorbs (otherwise the GPUs clear them sooner
+ * than a CPU wave would), and only requests small enough for a CPU worker.
+ * `ahead` is the queued work before an entry; take_class_locked uses the same
+ * rule. */
+static bool in_backlog(const ei_inference_service *service, size_t ahead) {
+    return ahead >= service->config.max_batch_tokens * service->groups;
+}
+static bool queue_has_overflow(const ei_inference_service *service) {
+    size_t ahead = 0;
+    for (const cache_entry *e = service->queue_head; e; e = e->queue_next) {
+        if (in_backlog(service, ahead) && overflow_eligible(service, e)) return true;
+        ahead += e->n_tokens;
+    }
+    return false;
+}
+static size_t popcount32(uint32_t v) {
+    size_t n = 0;
+    for (; v; v &= v - 1) n++;
+    return n;
+}
+static size_t lowest_bit(uint32_t v) {
+    size_t i = 0;
+    while (!(v & (1u << i))) i++;
+    return i;
+}
+
+enum { WAVE_NONE, WAVE_ANY, WAVE_SHORT, WAVE_OVERFLOW };
+/* Choose the slot for the next wave, or WAVE_NONE. An idle device starts any
+ * wave, the first idle device winning. Otherwise, without bypass, the
+ * least-loaded device with a free pipeline slot does; with bypass, a device
+ * whose in-flight waves are all long may start a short-only wave. Overflow
+ * (CPU) slots start a wave of small requests only when no device can. */
+static int pick_slot_locked(const ei_inference_service *service, size_t *slot) {
+    if (!service->queue_head) return WAVE_NONE;
+    size_t best = SIZE_MAX, best_busy = SIZE_MAX;
+    bool shorts = bypass_mode(service) && queue_has_short(service);
+    int mode = WAVE_NONE;
+    for (size_t g = 0; g < service->groups; g++) {
+        uint32_t free = service->group_mask[g] & ~service->slot_mask;
+        uint32_t busy = service->group_mask[g] & service->slot_mask;
+        if (!free) continue;
+        if (!busy) {
+            *slot = lowest_bit(free);
+            return WAVE_ANY;
+        }
+        if (!bypass_mode(service)) {
+            if (popcount32(busy) < best_busy) {
+                best_busy = popcount32(busy);
+                best = lowest_bit(free);
+                mode = WAVE_ANY;
+            }
+        } else if (shorts && (busy & ~service->long_mask) == 0 && mode == WAVE_NONE) {
+            best = lowest_bit(free);
+            mode = WAVE_SHORT;
+        }
+    }
+    if (mode != WAVE_NONE) {
+        *slot = best;
+        return mode;
+    }
+    uint32_t overflow = service->overflow_mask & ~service->slot_mask;
+    if (overflow && queue_has_overflow(service)) {
+        *slot = lowest_bit(overflow);
+        return WAVE_OVERFLOW;
+    }
+    return WAVE_NONE;
+}
 static bool can_start_wave(const ei_inference_service *service) {
-    if (!bypass_mode(service)) return !backend_full(service);
-    if (backend_full(service)) return false;
-    if (service->busy_slots == 0) return true;
-    return service->long_mask == service->slot_mask && queue_has_short(service);
+    size_t slot;
+    return pick_slot_locked(service, &slot) != WAVE_NONE;
+}
+static size_t wave_budget(const ei_inference_service *service, size_t slot) {
+    const size_t *caps = service->config.slot_max_batch_tokens;
+    return caps && caps[slot] ? caps[slot] : service->config.max_batch_tokens;
 }
 /* Unlink queued entries of one class (short or long) into a wave, in queue
  * order, within the token/request budgets; others stay queued. */
-static size_t take_class_locked(ei_inference_service *service, bool want_short,
+static size_t take_class_locked(ei_inference_service *service, int wave_class, size_t budget,
                                 cache_entry **batch, size_t *offsets, size_t max_requests,
                                 size_t *total_tokens) {
     size_t batch_size = 0, total = 0;
     cache_entry *previous = NULL, *entry = service->queue_head;
+    bool overflow = wave_class == WAVE_OVERFLOW;
     const size_t seq_limit = service->config.max_batch_sequence_tokens;
+    // Overflow waves leave the head of the queue (the devices' next waves)
+    // alone and take from the backlog behind it.
+    size_t ahead = 0;
     offsets[0] = 0;
     while (entry && batch_size < max_requests) {
         cache_entry *next = entry->queue_next;
-        bool fits = is_short(service, entry) == want_short &&
+        bool member = overflow ? in_backlog(service, ahead) && overflow_eligible(service, entry)
+                               : is_short(service, entry) == (wave_class == WAVE_SHORT);
+        ahead += entry->n_tokens;
+        bool fits = member &&
             (batch_size == 0 ||
              (batch[0]->n_tokens <= seq_limit && entry->n_tokens <= seq_limit &&
-              total + entry->n_tokens <= service->config.max_batch_tokens));
+              total + entry->n_tokens <= budget));
         if (fits) {
             if (previous) previous->queue_next = next;
             else service->queue_head = next;
@@ -160,14 +248,11 @@ static size_t take_class_locked(ei_inference_service *service, bool want_short,
     return batch_size;
 }
 
-static size_t claim_slot_locked(ei_inference_service *service) {
-    size_t slot = 0;
-    while (service->slot_mask & (1u << slot)) slot++;
-    if (slot >= service->slots) ei_die("inference service claimed slot %zu of %zu", slot,
-                                       service->slots);
+static void claim_slot_locked(ei_inference_service *service, size_t slot) {
+    if (slot >= service->slots || (service->slot_mask & (1u << slot)))
+        ei_die("inference service claimed busy slot %zu of %zu", slot, service->slots);
     service->slot_mask |= 1u << slot;
     service->busy_slots++;
-    return slot;
 }
 
 static void release_slot_locked(ei_inference_service *service, size_t slot) {
@@ -331,9 +416,15 @@ static void note_active_request_locked(ei_inference_service *service,
     }
 }
 
-static bool batch_collection_ready(const ei_inference_service *service) {
+static bool batch_collection_ready(const ei_inference_service *service, size_t budget) {
     const cache_entry *entry = service->queue_head;
     if (!entry) return false;
+    // A capped slot's wave is ready once the queue fills its budget.
+    if (budget < service->config.max_batch_tokens) {
+        size_t tokens = 0;
+        for (const cache_entry *e = entry; e; e = e->queue_next)
+            if ((tokens += e->n_tokens) >= budget) return true;
+    }
     if (entry->n_tokens > service->config.max_batch_sequence_tokens) return true;
     if (service->batch_wave) {
         size_t wave = expected_wave(service);
@@ -350,11 +441,11 @@ static bool batch_collection_ready(const ei_inference_service *service) {
         while (entry && scanned < max_scan) {
             scanned++;
             if (entry->n_tokens <= service->config.max_batch_sequence_tokens &&
-                tokens + entry->n_tokens <= service->config.max_batch_tokens) {
+                tokens + entry->n_tokens <= budget) {
                 requests++;
                 tokens += entry->n_tokens;
                 if (requests == service->config.max_batch_requests ||
-                    tokens == service->config.max_batch_tokens) {
+                    tokens == budget) {
                     return true;
                 }
             }
@@ -368,13 +459,13 @@ static bool batch_collection_ready(const ei_inference_service *service) {
     while (entry) {
         if (requests > 0 &&
             (entry->n_tokens > service->config.max_batch_sequence_tokens ||
-             tokens + entry->n_tokens > service->config.max_batch_tokens)) {
+             tokens + entry->n_tokens > budget)) {
             return true;
         }
         requests++;
         tokens += entry->n_tokens;
         if (requests == service->config.max_batch_requests ||
-            tokens == service->config.max_batch_tokens) {
+            tokens == budget) {
             return true;
         }
         entry = entry->queue_next;
@@ -433,17 +524,20 @@ static void *backend_main(void *opaque) {
             pthread_cond_wait(&service->queue_ready, &service->mutex);
         }
         if (!service->queue_head) break;
-        // A bypass wave starts at once with the short requests already queued.
-        bool bypassing = bypass_mode(service) && service->busy_slots > 0;
+        // Short-only bypass and overflow waves start at once with the requests
+        // already queued; a wave on a device collects as before.
+        size_t slot = 0;
+        int wave = pick_slot_locked(service, &slot);
 
-        if (!bypassing && should_collect_batch(service)) {
+        if (wave == WAVE_ANY && should_collect_batch(service)) {
             const uint64_t wait_ns =
                 (uint64_t)service->config.batch_wait_us * 1000ull;
             const uint64_t start_ns = monotonic_ns();
             const uint64_t cap_ns = start_ns + service->batch_wait_cap_ns;
             uint64_t deadline_ns = start_ns + wait_ns;
             size_t seen_queued = service->queued_requests;
-            while (!service->stopping && !batch_collection_ready(service)) {
+            while (!service->stopping &&
+                   !batch_collection_ready(service, wave_budget(service, slot))) {
                 uint64_t now = monotonic_ns();
                 if (service->queued_requests > seen_queued) {
                     seen_queued = service->queued_requests;
@@ -465,22 +559,34 @@ static void *backend_main(void *opaque) {
 
         // With several backend threads, others (and solo inline runs) may have
         // taken the queue or every slot while this one waited for the wave.
-        if (!service->queue_head || !can_start_wave(service)) continue;
+        wave = pick_slot_locked(service, &slot);
+        if (wave == WAVE_NONE) continue;
+        const size_t budget = wave_budget(service, slot);
         size_t batch_size = 0;
         size_t total_tokens = 0;
         offsets[0] = 0;
         bool wave_long = false;
-        if (bypass_mode(service)) {
+        bool taken = wave == WAVE_OVERFLOW || bypass_mode(service);
+        if (taken) {
             // Homogeneous waves: short-only while bypassing, otherwise the
-            // class of the queue head.
-            bypassing = service->busy_slots > 0;
-            bool want_short = bypassing || is_short(service, service->queue_head);
-            batch_size = take_class_locked(service, want_short, batch, offsets, max_requests,
-                                           &total_tokens);
-            wave_long = !want_short;
-            if (batch_size == 0) continue;
+            // class of the queue head; overflow waves take small requests.
+            int wave_class = wave;
+            if (wave == WAVE_ANY)
+                wave_class = bypass_mode(service) && !is_short(service, service->queue_head)
+                                 ? WAVE_ANY : WAVE_SHORT;
+            batch_size = take_class_locked(service, wave_class, budget, batch, offsets,
+                                           max_requests, &total_tokens);
+            wave_long = wave_class == WAVE_ANY;
+            if (batch_size == 0) {
+                // pick_slot_locked promised a member. Never retry while
+                // holding the mutex: finishing waves need it to release slots.
+                struct timespec deadline;
+                collection_deadline(1000, &deadline);
+                pthread_cond_timedwait(&service->queue_ready, &service->mutex, &deadline);
+                continue;
+            }
         }
-        while (!bypass_mode(service) && !service->batch_lookahead && service->queue_head &&
+        while (!taken && !service->batch_lookahead && service->queue_head &&
                batch_size < max_requests) {
             cache_entry *entry = service->queue_head;
             if (batch_size > 0) {
@@ -488,8 +594,7 @@ static void *backend_main(void *opaque) {
                         service->config.max_batch_sequence_tokens ||
                     entry->n_tokens >
                         service->config.max_batch_sequence_tokens ||
-                    total_tokens + entry->n_tokens >
-                        service->config.max_batch_tokens) {
+                    total_tokens + entry->n_tokens > budget) {
                     break;
                 }
             }
@@ -501,7 +606,7 @@ static void *backend_main(void *opaque) {
             total_tokens += entry->n_tokens;
             offsets[batch_size] = total_tokens;
         }
-        if (!bypass_mode(service) && service->batch_lookahead) {
+        if (!taken && service->batch_lookahead) {
             cache_entry *entry = service->queue_head;
             service->queue_head = entry->queue_next;
             if (!service->queue_head) service->queue_tail = NULL;
@@ -520,8 +625,7 @@ static void *backend_main(void *opaque) {
                     cache_entry *next = entry->queue_next;
                     scanned++;
                     if (entry->n_tokens <= service->config.max_batch_sequence_tokens &&
-                        total_tokens + entry->n_tokens <=
-                            service->config.max_batch_tokens) {
+                        total_tokens + entry->n_tokens <= budget) {
                         if (previous) previous->queue_next = next;
                         else service->queue_head = next;
                         if (service->queue_tail == entry) {
@@ -545,7 +649,7 @@ static void *backend_main(void *opaque) {
             memcpy(ids + offsets[i], batch[i]->ids,
                    batch[i]->n_tokens * sizeof(*ids));
         }
-        size_t slot = claim_slot_locked(service);
+        claim_slot_locked(service, slot);
         if (wave_long) service->long_mask |= 1u << slot;
         pthread_mutex_unlock(&service->mutex);
 
@@ -742,6 +846,14 @@ ei_inference_service *ei_inference_service_create(
         config->pipeline_slots > 32 || (config->pipeline_slots > 1 && !config->execute_slot)) {
         return NULL;
     }
+    // Every executor layout needs a device slot: long requests never overflow.
+    size_t slot_count = config->pipeline_slots > 1 ? config->pipeline_slots : 1;
+    bool device_slot = false;
+    for (size_t i = 0; i < slot_count; i++) {
+        if (config->slot_group && config->slot_group[i] >= 32) return NULL;
+        if (!config->slot_overflow || !config->slot_overflow[i]) device_slot = true;
+    }
+    if (!device_slot) return NULL;
     ei_inference_service *service = ei_xcalloc(1, sizeof(*service));
     service->tokenizer = tokenizer;
     service->execute = execute;
@@ -787,6 +899,15 @@ ei_inference_service *ei_inference_service_create(
         }
     }
     service->slots = config->pipeline_slots > 1 ? config->pipeline_slots : 1;
+    for (size_t i = 0; i < service->slots; i++) {
+        if (config->slot_overflow && config->slot_overflow[i]) {
+            service->overflow_mask |= 1u << i;
+            continue;
+        }
+        size_t g = config->slot_group ? config->slot_group[i] : 0;
+        service->group_mask[g] |= 1u << i;
+        if (g + 1 > service->groups) service->groups = g + 1;
+    }
     service->backend_threads = ei_xmalloc(service->slots * sizeof(*service->backend_threads));
     for (size_t i = 0; i < service->slots; i++)
         if (pthread_create(&service->backend_threads[i], NULL, backend_main, service) != 0)
@@ -873,11 +994,13 @@ static cache_entry *submit_tokens_locked(ei_inference_service *service,
 
 static bool try_execute_solo_locked(ei_inference_service *service,
                                     cache_entry *entry) {
-    if (!service->solo_inline || backend_full(service)) return false;
-    // Bypass mode: a solo request also obeys the wave rule (short-only beside
-    // long waves).
-    if (bypass_mode(service) && service->busy_slots > 0 &&
-        !(service->long_mask == service->slot_mask && is_short(service, entry)))
+    if (!service->solo_inline) return false;
+    // A solo request obeys the wave rules: a device slot (short-only beside
+    // long waves in bypass mode); overflow slots are left to the backend.
+    size_t slot = 0;
+    int wave = pick_slot_locked(service, &slot);
+    if (wave == WAVE_NONE || wave == WAVE_OVERFLOW ||
+        (wave == WAVE_SHORT && !is_short(service, entry)))
         return false;
     if (entry->state != EI_ENTRY_PENDING) return false;
     if (service->queue_head != entry || entry->queue_next) return false;
@@ -886,7 +1009,7 @@ static bool try_execute_solo_locked(ei_inference_service *service,
     service->queue_head = NULL;
     service->queue_tail = NULL;
     service->queued_requests = 0;
-    size_t slot = claim_slot_locked(service);
+    claim_slot_locked(service, slot);
     if (bypass_mode(service) && !is_short(service, entry)) service->long_mask |= 1u << slot;
     pthread_mutex_unlock(&service->mutex);
 
@@ -963,6 +1086,7 @@ bool ei_inference_service_embed(ei_inference_service *service,
     }
     ei_tokens tokens;
     ei_tokenize_spm(service->tokenizer, text, text_len, true, false, &tokens);
+    truncate_tokens(service, &tokens);
     bool ok = ei_inference_service_embed_tokens(
         service, tokens.ids, tokens.n, out, err, err_len);
     ei_tokens_free(&tokens);
@@ -1024,11 +1148,12 @@ bool ei_inference_service_embed_batch_with_usage(
         }
     }
     for (size_t i = 0; i < batch_size; i++) {
-        if (tokens[i].n == 0 || tokens[i].n > context_limit(service->tokenizer)) {
+        truncate_tokens(service, &tokens[i]);
+        if (tokens[i].n == 0) {
             for (size_t j = 0; j < batch_size; j++) ei_tokens_free(&tokens[j]);
             free(entries);
             free(tokens);
-            set_error(err, err_len, "input token count exceeds the selected profile context limit");
+            set_error(err, err_len, "input produced no tokens");
             return false;
         }
     }

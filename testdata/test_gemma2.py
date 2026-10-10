@@ -158,8 +158,20 @@ def main():
                       {"content": [{"type": "audio", "data": red}]},
                       {"content": [{"type": "video", "frames": [red], "fps": 0}]},
                       {"content": [{"type": "text", "text": "ok", "image": red}]},
-                      "word "*9000):
+                      {"content": [{"type": "image", "data": red, "vision_tokens": 69}]},
+                      {"content": [{"type": "audio", "data": tone, "vision_tokens": 70}]}):
             request(port, {"model": "x", "input": value}, expected=400)
+        for tokens in (70, 1120):
+            request(port, {"model": "x", "input": {"content": [{"type": "image", "data": red, "vision_tokens": tokens},
+                                                               {"type": "video", "frames": [red], "vision_tokens": tokens}]}})
+        # Over-long input is truncated to the 8192-token context, never rejected.
+        clipped = [request(port, {"model": "x", "input": "word "*words}) for words in (9000, 9100)]
+        assert clipped[0]["usage"]["prompt_tokens"] == 8192
+        assert cosine(clipped[0]["data"][0]["embedding"], clipped[1]["data"][0]["embedding"]) > .999999
+        for tail in ([{"type": "image", "data": red}], [{"type": "audio", "data": tone}],
+                     [{"type": "video", "frames": [red, red]}]):
+            for words in (8100, 9000):
+                request(port, {"model": "x", "input": {"content": [{"type": "text", "text": "word "*words}] + tail}})
         print("EmbeddingGemma 2 HTTP: default profile, all modalities, mixed batches, dimensions, concurrency, limits passed", flush=True)
     finally:
         process.terminate()

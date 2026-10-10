@@ -3171,7 +3171,9 @@ priority. CUDA now has pipeline-slot clones (own stream, cuBLAS handle,
 workspace; shared weights) and a dedicated media context, like Metal.
 
 Mixed load (`perf/loadgen.c`): 10-token requests from 8 clients while 4
-clients send ~2048-token requests (440 words). Same binary per backend:
+clients send ~2.3k-token requests (440 numbered words; the old filler's token
+count also crept up as counters grew, so treat these as approximate — the
+fixed-filler rerun below is exact). Same binary per backend:
 
 | RTX 5090 | short req/s | short p50 | short p99 | long req/s |
 |---|---:|---:|---:|---:|
@@ -3190,3 +3192,135 @@ Correctness: a bypass server matches a plain one on 300 mixed-length texts at
 32-way concurrency (min cosine 0.999999137); `test_inference_service` passes;
 `make test-gemma2-cuda` passes with bypass off. Without a long background the
 rule changes nothing (short-alone rows equal).
+
+### 8k measurements and exact-token loadgen (2026-10-10)
+
+`perf/loadgen.c` now sends a unique `r<id> n<seq>` prefix plus a fixed `" the"`
+filler: exactly one token per filler word plus ~12, constant for the whole
+run (the old numbered words grew with the counters). 2036 words is a 2048-token
+request; 8170 words is ~8182 tokens, just under the 8,192 context.
+
+Engine, one 8,192-token sequence: CUDA (RTX 5090) 59.0 ms; Metal (M5 Max) 248.6
+ms; CPU x86 (Zen 5, AVX-512 VNNI) 6,649 ms; CPU ARM (M5 Max) 6,933 ms. At 8k the
+four global-attention layers dominate (CPU attention is fp32 and quadratic).
+
+HTTP on the 5090, default flags, 5 s per cell:
+
+| tokens | c1 req/s | c4 req/s | c16 req/s | c16 tok/s | c1 p50 |
+|---:|---:|---:|---:|---:|---:|
+| 2,048 | 79.7 | 87.2 | 89.2 | 183k | - |
+| ~8,182 | 16.0 | 17.4 | 18.9 | 155k | 62.7 ms |
+
+Mixed traffic on the 5090: 8 clients send 14-token requests while 4 clients
+send long ones.
+
+| long class | mode | short req/s | short p50 | short p99 | long req/s |
+|---|---|---:|---:|---:|---:|
+| 2,048 tokens | default | 171 | 47.9 ms | - | 84.3 |
+| 2,048 tokens | bypass 64 | 716 | 11.9 ms | 23.4 ms | 84.4 |
+| ~8,182 tokens | default | 45 | 179 ms | - | 17.1 |
+| ~8,182 tokens | bypass 64 | 175 | 59.5 ms | 115.8 ms | 17.1 |
+
+Against an 8k background a short request still waits for up to one in-flight
+59 ms long forward on the shared GPU (bypass waves overlap it on a
+high-priority stream but compete for SMs); long throughput is unchanged.
+
+### Context truncation and model-card audit (2026-10-10)
+
+Over-long input is now truncated instead of rejected. Text keeps the first
+8,191 tokens plus EOS (the reference tokenizer's truncation). Multimodal input
+shares the 8,192-token budget with a slot reserved for EOS: text is cut off,
+an image or frame is encoded at the largest vision budget that still fits
+(dropped below 70 tokens), and audio is trimmed to the remaining 25 tokens/s.
+Image/video parts take an optional `vision_tokens` (70..1120, card defaults
+280/140); the 300-second audio cap is gone (the context bounds it at ~327 s).
+
+Model card "do not use float16" check. Our GPU paths keep the residual stream,
+norms, softmax, and accumulators in fp32; fp16 appears only as GEMM/attention
+operands (CUDA: activations and weights; Metal: weights and K/V). An fp32
+reference probe recorded the largest operand magnitudes over code, numbers,
+CJK/Cyrillic/Arabic/emoji, punctuation runs, an 8k repeated-token sequence and
+2k random ids: residual 78, normed GEMM inputs 169, raw Q/K/V 559, GeGLU output
+71. Vision (noise, flat, gradients at 960x672) peaked at 732 and audio
+(extreme log-mel) at 138, against fp16's 65,504. BF16/F32 weights peak at 11;
+some vision position/patch weights are fp16-subnormal (absolute error < 6e-8).
+fp16 operands are safe for this model and carry 3 more mantissa bits than
+bf16; the card's warning concerns running the whole model (residual stream and
+accumulations) in fp16. Prefix formats, the symmetric 1,024-token sliding window
+(±512, llama.cpp `LLAMA_SWA_TYPE_SYMMETRIC`), media delimiters
+(`<|image>`/`<image|>` 255999/258882, `<|audio>`/`<audio|>` 256000/258883),
+Matryoshka re-normalization and the 768 default all match the card.
+
+### Executors: CPU workers, multiple GPUs, CPU overflow (2026-10-10)
+
+Request: spread load across many CPU cores and GPUs, with a user-chosen thread
+count. Each GPU pipeline slot and each CPU worker is now an executor (a slot of
+the inference service, tagged with its device); see CONTRIBUTING.md for the
+flags and scheduling rule. Prerequisites found on the way: the fast CPU graph
+kept one global workspace behind a global lock (now per-context, weight repack
+caches shared under a mutex), `EI_THREADS` was capped at 64 and the default
+pool at 32 threads, and `perf/loadgen.c` overflowed a 256-entry thread array
+above c256 (fixed; earlier results used c <= 256).
+
+One wave does not use a big machine. `bench_gemma2_cpu`, fast graph, 2x EPYC
+9754 (256 Zen 4c cores, 2 NUMA nodes, 32 L3 domains), tok/s:
+
+| pool threads | 14x32 | 32x16 | 128x8 | 512x4 |
+|---:|---:|---:|---:|---:|
+| 16 | 1,845 | 1,775 | 1,593 | 1,272 |
+| 32 | 3,348 | 3,467 | 3,108 | 2,499 |
+| 64 | 4,398 | 4,549 | 4,740 | 4,380 |
+| 128 | 1,658 | 1,878 | 1,955 | 2,603 |
+| 256 | 918 | 908 | 1,295 | 1,655 |
+
+HTTP on the same box (`perf/loadgen.c`, c256, 10 s, cache off, 256+ HTTP
+workers). "KxT" is K CPU workers of T threads, pinned along `ei_cpu_placement`:
+
+| layout | ~28-token req/s | p50 | ~242-token req/s | p50 |
+|---|---:|---:|---:|---:|
+| 1x64 (one pool) | 220 | 1,253 ms | 42.7 | 12.5 s |
+| 1x256 (one pool) | 119 | 2,707 ms | - | - |
+| 4x64 | 586 | 441 ms | - | - |
+| 8x32 | 764 | 366 ms | 101.8 | 3.26 s |
+| 16x16 | 826 | 270 ms | 112.9 | 2.81 s |
+| 8x16 (128 cores) | 455 | 606 ms | - | - |
+
+16x16 is 3.75x the best single pool on short requests (23k tok/s) and 2.6x on
+242-token requests (27k tok/s); half the cores give about half the throughput.
+Under full load each worker runs ~30% below its standalone speed (shared memory
+bandwidth). Pinning was worth +13% at 16x16 (390 -> 440 req/s before the HTTP
+fix). The 64-thread HTTP default had capped requests in flight (8x32 went 570
+-> 761 req/s at 256 workers); unless `--workers` is given the server now runs 32
+HTTP workers per executor. A per-worker wave cap (`--cpu-max-batch-tokens`,
+1024) changed nothing measurable but bounds a CPU wave's latency.
+
+GPU plus CPU overflow on the RTX 5090 box (Ryzen 9 9950X, 16 cores), 10 s:
+
+| load | GPU only | GPU + 2x8 CPU workers |
+|---|---|---|
+| 28 tokens c128 | 11,149 req/s, p99 11.8 ms | 11,142 req/s, p99 11.9 ms |
+| 28 tokens c1024 | 11,194 req/s, p99 102 ms | 10,844 req/s, p99 474 ms |
+| 242 tokens c128 | 1,454 req/s, p99 99 ms | 1,448 req/s, p99 481 ms |
+| 242 tokens c1024 | 1,546 req/s, p99 740 ms | 1,538 req/s, p99 1,106 ms |
+
+A first rule (overflow whenever every GPU slot is busy) cost 10-14% on short
+requests and pushed p99 to ~250 ms: CPU waves took requests the GPU's next
+11 ms wave would have served, and the CPU workers starved the HTTP threads.
+Overflow now waits for real backlog (queued work beyond `max_batch_tokens` per
+device) and takes from behind it. It still adds nothing on this box: 16 cores
+make a few thousand tok/s next to the GPU's ~350k. Even 256 EPYC cores (~27k
+tok/s) would add under 10% beside one 5090, so overflow stays opt-in.
+Parity: CPU overflow vs GPU-only min cosine 0.99981 (CUDA), 0.99966 (Metal);
+the int8-activation CPU path's known ceiling. Two engine copies on one GPU
+(`--cuda-devices 0,0 --pipeline-slots 2`) match a plain server at 0.9999995.
+Real multi-GPU scaling is unmeasured: no reachable multi-GPU CUDA box may be
+used (the 3090 box's GPU 0 is off limits; the MI300X box has no profile-2
+backend).
+
+Bug found by the 5090 sweep: the overflow check counted the request that
+crosses the backlog line as backlog while the take treated it as the devices'
+next wave. With exactly such a queue the backend picked an overflow wave, took
+nothing, and retried without waiting, holding the service mutex, so the GPU
+thread could never release its slot (server at 100% CPU, GPU idle). Both now
+use one `in_backlog` rule, an empty take waits on the condvar, and
+`test_inference_service` reproduces the boundary (it hangs the old code 3/3).

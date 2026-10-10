@@ -229,7 +229,8 @@ projection route for large flattened batches.
 
 Diagnostic controls:
 
-- `EI_THREADS`: override the CPU worker count.
+- `EI_THREADS` (1..1024; the server's `--threads` sets it): override the CPU
+  thread count. The default is every core up to 32.
 - `EI_CPU_SHORT_THREADS`: override the short-projection worker width.
 - `EI_CPU_DUAL_PROJECTION`: control paired projection accumulation.
 - `EI_CPU_FUSED_RMS_QUANT=0`: materialize normalized activations before Q8.
@@ -312,7 +313,26 @@ exactly (goldens identical to 9 digits):
   of at most N tokens are short. Waves never mix short and long requests, and
   while every in-flight wave is long a free slot starts a short-only wave, so
   short requests bypass long ones. On CUDA bypass waves run on high-priority
-  streams. Off (0) by default; ignored with a warning on CPU builds.
+  streams. Off (0) by default; on the CPU backend it needs `--cpu-workers` >= 2.
+- Executors (EmbeddingGemma 2; `ei_engine_configure_executors`): every GPU
+  pipeline slot and CPU worker is a slot of the inference service, tagged with
+  a group (its device). `pick_slot_locked` starts a wave on an idle device
+  first, else (without bypass) on the least-loaded device with a free slot.
+  `--cuda-devices all|I,J` loads weights per device (`ei_gemma2_cuda_create_on`;
+  the engine's context serves the first device). `--cpu-workers N` creates N
+  `ei_gemma2_fast` contexts (own workspace; shared weights and repack caches,
+  guarded by a mutex) with private spin pools splitting `--threads`; on Linux
+  pools are pinned along `ei_cpu_placement` (one hardware thread per core,
+  grouped by L3, SMT siblings last; `--cpu-pin off`), and the calling backend
+  thread is pinned to the pool's first CPU for each wave. CPU waves are capped
+  at `--cpu-max-batch-tokens` (`slot_max_batch_tokens`). Beside a GPU, CPU
+  workers are overflow slots: a wave starts only when no device slot can and
+  the queue holds requests of at most `--cpu-max-sequence-tokens` behind the
+  `max_batch_tokens x devices` tokens the devices' next waves absorb (the same
+  `in_backlog` rule decides eligibility and selection; a mismatch once spun
+  with the service mutex held). Unless `--workers` is given, HTTP workers grow
+  to 32 per executor. `test_inference_service` covers overflow budgets, the
+  backlog boundary, and spreading across devices.
 
 EmbeddingGemma 2 CPU (default on since 2026-10-09; `EI_GEMMA2_CPU_FAST=0`
 selects the unchanged reference graph):

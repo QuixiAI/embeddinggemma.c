@@ -21,28 +21,30 @@ static bool fail(char *err, size_t n, const char *message) {
     snprintf(err, n, "%s", message);
     return false;
 }
-static bool room(ei_media_input *m, size_t n, char *err, size_t len) {
-    if (n > MEDIA_CONTEXT - m->n)
-        return fail(err, len, "combined input exceeds 8192 tokens");
-    m->inputs = ei_xrealloc(m->inputs, (m->n + n) * 512 * sizeof(float));
-    return true;
+/* Inputs never exceed the shared context: text is clipped and media shrunk or
+ * trimmed to the room left, with a slot always reserved for the final EOS. */
+static size_t avail(const ei_media_input *m) {
+    size_t cap = MEDIA_CONTEXT - (m->tokenizer->model->add_eos ? 1 : 0);
+    return m->n < cap ? cap - m->n : 0;
 }
-static bool token(ei_media_input *m, int32_t id, char *err, size_t len) {
-    if (!room(m, 1, err, len))
-        return false;
+static void rows(ei_media_input *m, const float *src, size_t n) {
+    m->inputs = ei_xrealloc(m->inputs, (m->n + n) * 512 * sizeof(float));
+    memcpy(m->inputs + m->n * 512, src, n * 512 * sizeof(float));
+    m->n += n;
+}
+static void token(ei_media_input *m, int32_t id) {
     const ei_tensor *w = ei_gguf_tensor(m->text_model, "token_embd.weight", true);
+    m->inputs = ei_xrealloc(m->inputs, (m->n + 1) * 512 * sizeof(float));
     ei_dequantize_row_q8_0(w, id, m->inputs + m->n * 512);
     for (int z = 0; z < 512; ++z) m->inputs[m->n * 512 + z] *= sqrtf(512.0f);
     m->n++;
-    return true;
 }
 void ei_media_input_init(ei_media_input *m, const ei_gguf *text, const ei_tokenizer *tok,
                          const ei_gguf *projector, ei_thread_pool *pool) {
     *m = (ei_media_input){
         .text_model = text, .tokenizer = tok, .projector = projector, .pool = pool};
-    char err[80];
     if (tok->model->add_bos)
-        token(m, tok->model->bos_id, err, sizeof err);
+        token(m, tok->model->bos_id);
 }
 void ei_media_input_free(ei_media_input *m) {
     free(m->inputs);
@@ -52,11 +54,12 @@ void ei_media_input_free(ei_media_input *m) {
 bool ei_media_text(ei_media_input *m, const char *text, size_t len, char *err, size_t err_len) {
     ei_tokens t;
     ei_tokenize_spm(m->tokenizer, text, len, false, false, &t);
-    bool ok = true;
-    for (size_t i = 0; i < t.n && ok; ++i)
-        ok = token(m, t.ids[i], err, err_len);
+    (void)err;
+    (void)err_len;
+    for (size_t i = 0; i < t.n && avail(m); ++i)
+        token(m, t.ids[i]);
     ei_tokens_free(&t);
-    return ok;
+    return true;
 }
 static int b64digit(unsigned char c) {
     if (c >= 'A' && c <= 'Z')
@@ -152,17 +155,10 @@ static uint8_t *resize_axis(const uint8_t *src, int width, int height, int targe
     free(weights);
     return out;
 }
-static bool append_soft(ei_media_input *m, float *soft, size_t n, int start, int end, char *err,
-                        size_t len) {
-    if (!room(m, n + 2, err, len))
-        return false;
-    if (!token(m, start, err, len))
-        return false;
-    if (!room(m, n, err, len))
-        return false;
-    memcpy(m->inputs + m->n * 512, soft, n * 512 * sizeof(float));
-    m->n += n;
-    return token(m, end, err, len);
+static void append_soft(ei_media_input *m, const float *soft, size_t n, int start, int end) {
+    token(m, start);
+    rows(m, soft, n);
+    token(m, end);
 }
 bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budget, char *err,
                     size_t err_len) {
@@ -175,6 +171,13 @@ bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budge
         (size_t)w * h > 16 * 1024 * 1024) {
         free(bytes);
         return fail(err, err_len, "unsupported image or image exceeds 16 megapixels");
+    }
+    /* Shrink the token budget to the room left; drop the image below the minimum. */
+    if ((size_t)budget + 2 > avail(m))
+        budget = avail(m) >= 72 ? (int)avail(m) - 2 : 0;
+    if (budget < 70) {
+        free(bytes);
+        return true;
     }
     uint8_t *rgb = stbi_load_from_memory(bytes, (int)size, &w, &h, &c, 3);
     free(bytes);
@@ -191,9 +194,9 @@ bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budge
         tw = (int)ceil(w * scale / 48) * 48;
         th = (int)ceil(h * scale / 48) * 48;
     }
-    if ((size_t)tw * th / 2304 + 2 > MEDIA_CONTEXT - m->n) {
-        stbi_image_free(rgb);
-        return fail(err, err_len, "image exceeds remaining token budget");
+    if ((size_t)tw * th / 2304 + 2 > avail(m)) {
+        stbi_image_free(rgb); /* extreme aspect ratio: even the 48-pixel floor overflows */
+        return true;
     }
     /* Preserve aspect ratio within the aligned canvas, center-pad with black. */
     double scale = fmin((double)tw / w, (double)th / h);
@@ -229,8 +232,8 @@ bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budge
     if (m->lock)
         pthread_mutex_unlock(m->lock);
     free(canvas);
-    if (ok)
-        ok = append_soft(m, soft, n, 255999, 258882, err, err_len);
+    if (ok && n + 2 <= avail(m))
+        append_soft(m, soft, n, 255999, 258882);
     free(soft);
     return ok;
 }
@@ -301,13 +304,17 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
         return fail(err, err_len, "WAV must be mono 16000 Hz PCM16 or float32");
     }
     size_t samples = data_len / (bits / 8);
-    if (samples < 321 || samples > 16000 * 300) {
+    if (samples < 321) {
         free(bytes);
-        return fail(err, err_len, "audio duration must be 21 ms through 300 seconds");
+        return fail(err, err_len, "audio must be at least 21 ms long");
     }
-    if ((samples + 639) / 640 + 2 > MEDIA_CONTEXT - m->n) {
+    /* Trim the clip to the room left (25 tokens per second); drop it below one token. */
+    size_t room = avail(m) > 2 ? avail(m) - 2 : 0;
+    if (samples > room * 640)
+        samples = room * 640;
+    if (samples < 321) {
         free(bytes);
-        return fail(err, err_len, "audio exceeds remaining token budget");
+        return true;
     }
     float *pcm = ei_xmalloc(samples * sizeof(float));
     for (size_t i = 0; i < samples; ++i) {
@@ -333,7 +340,8 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
                 fmaxf(0, fminf((hz - edges[bin]) / (edges[bin + 1] - edges[bin]),
                                (edges[bin + 2] - hz) / (edges[bin + 2] - edges[bin + 1])));
         }
-    bool ok = token(m, 256000, err, err_len);
+    token(m, 256000);
+    bool ok = true;
     for (size_t offset = 0; ok && offset < samples; offset += 480000) {
         size_t count = samples - offset;
         if (count > 480000)
@@ -375,23 +383,22 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
         if (m->lock)
             pthread_mutex_unlock(m->lock);
         free(mel);
-        if (ok)
-            ok = room(m, n, err, err_len);
         if (ok) {
-            memcpy(m->inputs + m->n * 512, soft, n * 512 * sizeof(float));
-            m->n += n;
+            /* Per-chunk rounding can overshoot the estimate; keep the end marker's slot. */
+            size_t left = avail(m) > 1 ? avail(m) - 1 : 0;
+            rows(m, soft, n < left ? n : left);
         }
         free(soft);
     }
     free(pcm);
     if (ok)
-        ok = token(m, 258883, err, err_len);
+        token(m, 258883);
     return ok;
 }
 static bool finish_text(ei_media_input *m, float out[768], char *err, size_t err_len);
 bool ei_media_finish(ei_media_input *m, float out[768], char *err, size_t err_len) {
-    if (m->tokenizer->model->add_eos && !token(m, m->tokenizer->model->eos_id, err, err_len))
-        return false;
+    if (m->tokenizer->model->add_eos)
+        token(m, m->tokenizer->model->eos_id);
     if (m->lock)
         pthread_mutex_lock(m->lock);
     bool ok = finish_text(m, out, err, err_len);

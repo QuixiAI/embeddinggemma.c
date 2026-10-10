@@ -66,33 +66,47 @@ typedef struct {
     ei_block_q8_0 *xq;
     uint32_t *lo, *hi, *pos;
     float norm_w[4][512]; /* dequantized norm weights for the current layer */
+    /* Per-call activation repacks for the i8mm and AVX-512 GEMMs. */
+    int8_t *xpair_q;
+    float *xpair_s;
+    size_t xpair_cap;
+    uint8_t *x512_u;
+    float *x512_s;
+    size_t x512_cap;
 } workspace;
 
-static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static workspace ws;
+/* One workspace per context, so independent contexts (each with its own
+ * thread pool) run waves concurrently; the default context serves callers
+ * of ei_gemma2_embed_batch_fast. Repacked-weight caches are shared. */
+struct ei_gemma2_fast {
+    pthread_mutex_t lock;
+    workspace ws;
+};
+static ei_gemma2_fast default_ctx = {PTHREAD_MUTEX_INITIALIZER, {0}};
+static pthread_mutex_t weight_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void reserve(size_t n) {
-    if (ws.tokens >= n)
+static void reserve(workspace *ws, size_t n) {
+    if (ws->tokens >= n)
         return;
-    size_t cap = ws.tokens ? ws.tokens : 64;
+    size_t cap = ws->tokens ? ws->tokens : 64;
     while (cap < n)
         cap *= 2;
-    free(ws.x), free(ws.h), free(ws.q), free(ws.k), free(ws.v), free(ws.a), free(ws.up);
-    free(ws.gate), free(ws.ple), free(ws.xq), free(ws.lo), free(ws.hi), free(ws.pos);
-    ws.x = ei_xmalloc(cap * 512 * 4);
-    ws.h = ei_xmalloc(cap * 512 * 4);
-    ws.q = ei_xmalloc(cap * 2048 * 4);
-    ws.k = ei_xmalloc(cap * 512 * 4);
-    ws.v = ei_xmalloc(cap * 512 * 4);
-    ws.a = ei_xmalloc(cap * 2048 * 4);
-    ws.up = ei_xmalloc(cap * 2048 * 4);
-    ws.gate = ei_xmalloc(cap * 2048 * 4);
-    ws.ple = ei_xmalloc(cap * 512 * 24 * 4);
-    ws.xq = ei_xmalloc(cap * 2048 / 32 * sizeof(ei_block_q8_0));
-    ws.lo = ei_xmalloc(cap * 4);
-    ws.hi = ei_xmalloc(cap * 4);
-    ws.pos = ei_xmalloc(cap * 4);
-    ws.tokens = cap;
+    free(ws->x), free(ws->h), free(ws->q), free(ws->k), free(ws->v), free(ws->a), free(ws->up);
+    free(ws->gate), free(ws->ple), free(ws->xq), free(ws->lo), free(ws->hi), free(ws->pos);
+    ws->x = ei_xmalloc(cap * 512 * 4);
+    ws->h = ei_xmalloc(cap * 512 * 4);
+    ws->q = ei_xmalloc(cap * 2048 * 4);
+    ws->k = ei_xmalloc(cap * 512 * 4);
+    ws->v = ei_xmalloc(cap * 512 * 4);
+    ws->a = ei_xmalloc(cap * 2048 * 4);
+    ws->up = ei_xmalloc(cap * 2048 * 4);
+    ws->gate = ei_xmalloc(cap * 2048 * 4);
+    ws->ple = ei_xmalloc(cap * 512 * 24 * 4);
+    ws->xq = ei_xmalloc(cap * 2048 / 32 * sizeof(ei_block_q8_0));
+    ws->lo = ei_xmalloc(cap * 4);
+    ws->hi = ei_xmalloc(cap * 4);
+    ws->pos = ei_xmalloc(cap * 4);
+    ws->tokens = cap;
 }
 
 /* RoPE tables for both bases, identical to the reference's per-element
@@ -221,15 +235,15 @@ static int short_grain(ei_thread_pool *pool, int tasks, int n) {
     }
     return (tasks + width - 1) / width;
 }
-static bool gemm_q8_i8mm(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq, int n,
+static bool gemm_q8_i8mm(workspace *ws, ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq, int n,
                          float *y);
-static bool gemm_q8_x86_512(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq,
+static bool gemm_q8_x86_512(workspace *ws, ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq,
                             int n, float *y);
-static void gemm_q8(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq, int n,
+static void gemm_q8(workspace *ws, ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq, int n,
                     float *y) {
-    if (gemm_q8_i8mm(pool, w, xq, n, y))
+    if (gemm_q8_i8mm(ws, pool, w, xq, n, y))
         return;
-    if (gemm_q8_x86_512(pool, w, xq, n, y))
+    if (gemm_q8_x86_512(ws, pool, w, xq, n, y))
         return;
     // Short waves: 8-row blocks so every thread gets work; long: 32-row tiles.
     int rr = n <= 8 ? 8 : 32;
@@ -357,48 +371,47 @@ static void i8mm_rows(void *opaque, int32_t begin, int32_t end) {
     }
 }
 /* Activations to token-pair layout (odd tail paired with zeros). */
-static int8_t *xpair_q;
-static float *xpair_s;
-static size_t xpair_cap;
-static bool gemm_q8_i8mm(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq, int n,
+static bool gemm_q8_i8mm(workspace *ws, ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq, int n,
                          float *y) {
     int k = (int)w->ne[0], m = (int)w->ne[1], kb = k / 32;
     if (!i8mm_enabled() || m % 32 || n < 4)
         return false;
+    pthread_mutex_lock(&weight_cache_lock);
     paired_weight *pw = paired_of(w);
+    pthread_mutex_unlock(&weight_cache_lock);
     int np = (n + 3) / 4 * 4;
     size_t need = (size_t)np * kb * 32;
-    if (need > xpair_cap) {
-        free(xpair_q), free(xpair_s);
-        xpair_q = ei_xmalloc(need);
-        xpair_s = ei_xmalloc((size_t)np * kb * sizeof(float));
-        xpair_cap = need;
+    if (need > ws->xpair_cap) {
+        free(ws->xpair_q), free(ws->xpair_s);
+        ws->xpair_q = ei_xmalloc(need);
+        ws->xpair_s = ei_xmalloc((size_t)np * kb * sizeof(float));
+        ws->xpair_cap = need;
     }
-    pair_rows(xq, n & ~1, kb, xpair_q, xpair_s);
+    pair_rows(xq, n & ~1, kb, ws->xpair_q, ws->xpair_s);
     for (int t = n & ~1; t < np; t += 2) {
         /* tail pairs: real token (if any) then zeros */
         for (int p = 0; p < kb; p++) {
-            int8_t *dst = xpair_q + ((size_t)(t / 2) * kb + p) * 64;
+            int8_t *dst = ws->xpair_q + ((size_t)(t / 2) * kb + p) * 64;
             memset(dst, 0, 64);
-            xpair_s[((size_t)(t / 2) * kb + p) * 2] = 0;
-            xpair_s[((size_t)(t / 2) * kb + p) * 2 + 1] = 0;
+            ws->xpair_s[((size_t)(t / 2) * kb + p) * 2] = 0;
+            ws->xpair_s[((size_t)(t / 2) * kb + p) * 2 + 1] = 0;
             if (t < n) {
                 const ei_block_q8_0 *a = xq + (size_t)t * kb + p;
                 for (int c = 0; c < 4; c++)
                     memcpy(dst + c * 16, a->qs + c * 8, 8);
-                xpair_s[((size_t)(t / 2) * kb + p) * 2] = half_to_float(a->d);
+                ws->xpair_s[((size_t)(t / 2) * kb + p) * 2] = half_to_float(a->d);
             }
         }
     }
-    mm_job_i8 j = {pw->q, xpair_q, pw->s, xpair_s, y, kb, m, n, m / 32};
+    mm_job_i8 j = {pw->q, ws->xpair_q, pw->s, ws->xpair_s, y, kb, m, n, m / 32};
     int tasks = j.row_blocks * ((np + 31) / 32);
     PROF(0, ei_parallel_for(pool, tasks, short_grain(pool, tasks, n), i8mm_rows, &j));
     return true;
 }
 #else
-static bool gemm_q8_i8mm(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq, int n,
+static bool gemm_q8_i8mm(workspace *ws, ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq, int n,
                          float *y) {
-    (void)pool, (void)w, (void)xq, (void)n, (void)y;
+    (void)ws, (void)pool, (void)w, (void)xq, (void)n, (void)y;
     return false;
 }
 #endif
@@ -429,33 +442,32 @@ static void x512_rows(void *opaque, int32_t begin, int32_t end) {
                                  j->m);
     }
 }
-static uint8_t *x512_u;
-static float *x512_s;
-static size_t x512_cap;
-static bool gemm_q8_x86_512(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq,
+static bool gemm_q8_x86_512(workspace *ws, ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq,
                             int n, float *y) {
     int k = (int)w->ne[0], m = (int)w->ne[1];
     // Short waves stay on the 4-row tile with its short-wave task width.
     if (!g2x_gemm512_enabled() || n <= 8 || k % 64 || m % 4)
         return false;
+    pthread_mutex_lock(&weight_cache_lock);
     const void *pw = g2x_weight_of(w, w->data, m, k);
+    pthread_mutex_unlock(&weight_cache_lock);
     if (!pw)
         return false;
-    if ((size_t)n * k > x512_cap) {
-        free(x512_u), free(x512_s);
-        x512_u = ei_xmalloc((size_t)n * k);
-        x512_s = ei_xmalloc((size_t)n * (k / 32) * sizeof(float));
-        x512_cap = (size_t)n * k;
+    if ((size_t)n * k > ws->x512_cap) {
+        free(ws->x512_u), free(ws->x512_s);
+        ws->x512_u = ei_xmalloc((size_t)n * k);
+        ws->x512_s = ei_xmalloc((size_t)n * (k / 32) * sizeof(float));
+        ws->x512_cap = (size_t)n * k;
     }
-    x512_job j = {pw, x512_u, x512_s, y, k, m, n, (m + 31) / 32, xq};
+    x512_job j = {pw, ws->x512_u, ws->x512_s, y, k, m, n, (m + 31) / 32, xq};
     PROF(0, ei_parallel_for(pool, n, 16, x512_acts, &j));
     PROF(0, ei_parallel_for(pool, j.row_blocks * ((n + 31) / 32), 1, x512_rows, &j));
     return true;
 }
 #else
-static bool gemm_q8_x86_512(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq,
+static bool gemm_q8_x86_512(workspace *ws, ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq,
                             int n, float *y) {
-    (void)pool, (void)w, (void)xq, (void)n, (void)y;
+    (void)ws, (void)pool, (void)w, (void)xq, (void)n, (void)y;
     return false;
 }
 #endif
@@ -598,6 +610,7 @@ typedef struct {
     const float *w;
     float scale;
     int width, layer, d, kv, rope_base;
+    workspace *ws;
 } row_job;
 
 /* gelu_tanh over a row. NEON: tanh(u) = 1 - 2 / (exp(2u) + 1) with a
@@ -666,58 +679,60 @@ static void rope_row(float *r, int d, int pos, int base) {
 }
 static void row_tokens(void *opaque, int32_t begin, int32_t end) {
     row_job *j = opaque;
+    workspace *ws = j->ws;
     for (int t = begin; t < end; t++) {
         switch (j->op) {
         case ROW_NORM_QUANT: {
             float *y = j->out + (size_t)t * 512;
             memcpy(y, j->in + (size_t)t * 512, 512 * 4);
             rms_row(y, 512, j->w);
-            quant_row(y, ws.xq + (size_t)t * 16, 512);
+            quant_row(y, ws->xq + (size_t)t * 16, 512);
             break;
         }
         case ROW_QKV_POST: {
             int d = j->d;
             for (int hd = 0; hd < 4; hd++) {
-                float *r = ws.q + ((size_t)t * 4 + hd) * d;
-                rms_row(r, d, ws.norm_w[0]);
-                rope_row(r, d, (int)ws.pos[t], j->rope_base);
+                float *r = ws->q + ((size_t)t * 4 + hd) * d;
+                rms_row(r, d, ws->norm_w[0]);
+                rope_row(r, d, (int)ws->pos[t], j->rope_base);
             }
             for (int hd = 0; hd < j->kv; hd++) {
-                float *r = ws.k + ((size_t)t * j->kv + hd) * d;
-                rms_row(r, d, ws.norm_w[1]);
-                rope_row(r, d, (int)ws.pos[t], j->rope_base);
-                rms_row(ws.v + ((size_t)t * j->kv + hd) * d, d, NULL);
+                float *r = ws->k + ((size_t)t * j->kv + hd) * d;
+                rms_row(r, d, ws->norm_w[1]);
+                rope_row(r, d, (int)ws->pos[t], j->rope_base);
+                rms_row(ws->v + ((size_t)t * j->kv + hd) * d, d, NULL);
             }
             break;
         }
         case ROW_POST_ADD: {
-            float *h = j->out + (size_t)t * 512, *x = ws.x + (size_t)t * 512;
+            float *h = j->out + (size_t)t * 512, *x = ws->x + (size_t)t * 512;
             rms_row(h, 512, j->w);
             for (int z = 0; z < 512; z++)
                 x[z] = (x[z] + h[z]) * j->scale;
             break;
         }
         case ROW_GELU_QUANT: {
-            float *g = ws.gate + (size_t)t * 2048;
-            const float *u = ws.up + (size_t)t * 2048;
+            float *g = ws->gate + (size_t)t * 2048;
+            const float *u = ws->up + (size_t)t * 2048;
             gelu_mul_row(g, u, 2048);
-            quant_row(g, ws.xq + (size_t)t * 64, 2048);
+            quant_row(g, ws->xq + (size_t)t * 64, 2048);
             break;
         }
         case ROW_PLE_GATE_QUANT: {
-            float *h = ws.h + (size_t)t * 512;
-            const float *p = ws.ple + ((size_t)t * 24 + j->layer) * 512;
+            float *h = ws->h + (size_t)t * 512;
+            const float *p = ws->ple + ((size_t)t * 24 + j->layer) * 512;
             gelu_mul_row(h, p, 512);
-            quant_row(h, ws.xq + (size_t)t * 16, 512);
+            quant_row(h, ws->xq + (size_t)t * 16, 512);
             break;
         }
         case ROW_QUANT:
-            quant_row(j->in + (size_t)t * j->width, ws.xq + (size_t)t * j->width / 32, j->width);
+            quant_row(j->in + (size_t)t * j->width, ws->xq + (size_t)t * j->width / 32, j->width);
             break;
         }
     }
 }
-static void rows(ei_thread_pool *pool, int n, row_job job) {
+static void rows(workspace *ws, ei_thread_pool *pool, int n, row_job job) {
+    job.ws = ws;
     PROF(2, ei_parallel_for(pool, n, 8, row_tokens, &job));
 }
 
@@ -725,6 +740,7 @@ static void rows(ei_thread_pool *pool, int n, row_job job) {
 
 typedef struct {
     int n, kv, d, window;
+    workspace *ws;
 } attn_job;
 #if !defined(__ARM_NEON)
 static float dot_f(const float *a, const float *b, int d) {
@@ -751,6 +767,7 @@ static float dot_f(const float *a, const float *b, int d) {
 enum { QB = 8 };
 static void attention_rows(void *opaque, int32_t begin, int32_t end) {
     attn_job *j = opaque;
+    workspace *ws = j->ws;
     int d = j->d, blocks = (j->n + QB - 1) / QB;
     static _Thread_local float scores[QB][8192];
     for (int task = begin; task < end; task++) {
@@ -759,7 +776,7 @@ static void attention_rows(void *opaque, int32_t begin, int32_t end) {
         int lo[QB], hi[QB], klo = 1 << 30, khi = 0;
         for (int i = 0; i < nq; i++) {
             int t = t0 + i;
-            lo[i] = (int)ws.lo[t], hi[i] = (int)ws.hi[t];
+            lo[i] = (int)ws->lo[t], hi[i] = (int)ws->hi[t];
             if (j->window) {
                 if (t - j->window > lo[i])
                     lo[i] = t - j->window;
@@ -772,7 +789,7 @@ static void attention_rows(void *opaque, int32_t begin, int32_t end) {
         const float *q[QB];
         float max[QB], total[QB];
         for (int i = 0; i < nq; i++) {
-            q[i] = ws.q + ((size_t)(t0 + i) * 4 + hd) * d;
+            q[i] = ws->q + ((size_t)(t0 + i) * 4 + hd) * d;
             max[i] = -INFINITY;
             total[i] = 0;
         }
@@ -781,7 +798,7 @@ static void attention_rows(void *opaque, int32_t begin, int32_t end) {
         for (int s0 = 0; s0 < nk; s0 += 4) {
             const float *kp[4];
             for (int c = 0; c < 4; c++)
-                kp[c] = ws.k + ((size_t)(klo + (s0 + c < nk ? s0 + c : s0)) * j->kv + kh) * d;
+                kp[c] = ws->k + ((size_t)(klo + (s0 + c < nk ? s0 + c : s0)) * j->kv + kh) * d;
             for (int i0 = 0; i0 < nq; i0 += 4) {
                 const float *qp[4];
                 for (int r = 0; r < 4; r++)
@@ -837,8 +854,8 @@ static void attention_rows(void *opaque, int32_t begin, int32_t end) {
         /* O = P V with 8 queries x 8 dims in registers across the key loop. */
 #if defined(__x86_64__)
         if (g2x_level()) {
-            g2x_pv(ws.v + ((size_t)klo * j->kv + kh) * d, (size_t)j->kv * d, nk, scores[0], 8192, nq,
-                   d, ws.a + ((size_t)t0 * 4 + hd) * d, (size_t)4 * d);
+            g2x_pv(ws->v + ((size_t)klo * j->kv + kh) * d, (size_t)j->kv * d, nk, scores[0], 8192, nq,
+                   d, ws->a + ((size_t)t0 * 4 + hd) * d, (size_t)4 * d);
             continue;
         }
 #endif
@@ -848,7 +865,7 @@ static void attention_rows(void *opaque, int32_t begin, int32_t end) {
             for (int i = 0; i < QB; i++)
                 o[i][0] = o[i][1] = vdupq_n_f32(0);
             for (int sk = 0; sk < nk; sk++) {
-                const float *v = ws.v + ((size_t)(klo + sk) * j->kv + kh) * d + z;
+                const float *v = ws->v + ((size_t)(klo + sk) * j->kv + kh) * d + z;
                 float32x4_t v0 = vld1q_f32(v), v1 = vld1q_f32(v + 4);
                 for (int i = 0; i < nq; i++) {
                     float pr = scores[i][sk];
@@ -857,16 +874,16 @@ static void attention_rows(void *opaque, int32_t begin, int32_t end) {
                 }
             }
             for (int i = 0; i < nq; i++) {
-                float *out = ws.a + ((size_t)(t0 + i) * 4 + hd) * d + z;
+                float *out = ws->a + ((size_t)(t0 + i) * 4 + hd) * d + z;
                 vst1q_f32(out, o[i][0]);
                 vst1q_f32(out + 4, o[i][1]);
             }
 #else
             for (int i = 0; i < nq; i++) {
-                float *out = ws.a + ((size_t)(t0 + i) * 4 + hd) * d + z;
+                float *out = ws->a + ((size_t)(t0 + i) * 4 + hd) * d + z;
                 memset(out, 0, 8 * 4);
                 for (int sk = 0; sk < nk; sk++) {
-                    const float *v = ws.v + ((size_t)(klo + sk) * j->kv + kh) * d + z;
+                    const float *v = ws->v + ((size_t)(klo + sk) * j->kv + kh) * d + z;
                     for (int c = 0; c < 8; c++)
                         out[c] += scores[i][sk] * v[c];
                 }
@@ -878,92 +895,115 @@ static void attention_rows(void *opaque, int32_t begin, int32_t end) {
 
 /* ---- graph -------------------------------------------------------------- */
 
+ei_gemma2_fast *ei_gemma2_fast_create(void) {
+    ei_gemma2_fast *ctx = ei_xcalloc(1, sizeof *ctx);
+    pthread_mutex_init(&ctx->lock, NULL);
+    return ctx;
+}
+void ei_gemma2_fast_free(ei_gemma2_fast *ctx) {
+    if (!ctx)
+        return;
+    workspace *ws = &ctx->ws;
+    free(ws->x), free(ws->h), free(ws->q), free(ws->k), free(ws->v), free(ws->a), free(ws->up);
+    free(ws->gate), free(ws->ple), free(ws->xq), free(ws->lo), free(ws->hi), free(ws->pos);
+    free(ws->xpair_q), free(ws->xpair_s), free(ws->x512_u), free(ws->x512_s);
+    pthread_mutex_destroy(&ctx->lock);
+    free(ctx);
+}
 bool ei_gemma2_embed_batch_fast(const ei_gguf *g, ei_thread_pool *pool, const int32_t *ids,
                                 const float *inputs, const size_t *offsets, size_t batch,
                                 float *out, char *err, size_t err_len) {
+    return ei_gemma2_embed_batch_fast_ctx(&default_ctx, g, pool, ids, inputs, offsets, batch, out,
+                                          err, err_len);
+}
+bool ei_gemma2_embed_batch_fast_ctx(ei_gemma2_fast *ctx, const ei_gguf *g, ei_thread_pool *pool,
+                                    const int32_t *ids, const float *inputs,
+                                    const size_t *offsets, size_t batch, float *out, char *err,
+                                    size_t err_len) {
     size_t count = offsets[batch];
     if (!count || count > 8192) {
         snprintf(err, err_len, "EmbeddingGemma 2 accepts 1..8192 input tokens");
         return false;
     }
     pthread_once(&rope_once, build_rope);
-    pthread_mutex_lock(&lock);
-    reserve(count);
+    pthread_mutex_lock(&ctx->lock);
+    workspace *ws = &ctx->ws;
+    reserve(ws, count);
     int n = (int)count;
     for (size_t s = 0; s < batch; s++)
         for (size_t t = offsets[s]; t < offsets[s + 1]; t++) {
-            ws.lo[t] = (uint32_t)offsets[s];
-            ws.hi[t] = (uint32_t)offsets[s + 1];
-            ws.pos[t] = (uint32_t)(t - offsets[s]);
+            ws->lo[t] = (uint32_t)offsets[s];
+            ws->hi[t] = (uint32_t)offsets[s + 1];
+            ws->pos[t] = (uint32_t)(t - offsets[s]);
         }
     const ei_tensor *emb = tensor_of(g, "token_embd.weight");
     if (inputs)
-        memcpy(ws.x, inputs, count * 512 * 4);
+        memcpy(ws->x, inputs, count * 512 * 4);
     for (int t = 0; t < n && !inputs; t++) {
         const ei_block_q8_0 *row = (const ei_block_q8_0 *)emb->data + (size_t)ids[t] * 16;
         // (d * q) * sqrt(512), the reference and media rounding order.
         for (int b = 0; b < 16; b++) {
             float d = half_to_float(row[b].d);
             for (int z = 0; z < 32; z++)
-                ws.x[(size_t)t * 512 + b * 32 + z] = d * row[b].qs[z] * sqrtf(512.0f);
+                ws->x[(size_t)t * 512 + b * 32 + z] = d * row[b].qs[z] * sqrtf(512.0f);
         }
     }
-    gemm_f(pool, tensor_of(g, "per_layer_model_proj.weight"), ws.x, n, ws.ple);
+    gemm_f(pool, tensor_of(g, "per_layer_model_proj.weight"), ws->x, n, ws->ple);
     for (size_t i = 0; i < count * 512 * 24; i++)
-        ws.ple[i] /= sqrtf(512.0f);
-    dequant_norm(tensor_of(g, "per_layer_proj_norm.weight"), 512, ws.norm_w[0]);
+        ws->ple[i] /= sqrtf(512.0f);
+    dequant_norm(tensor_of(g, "per_layer_proj_norm.weight"), 512, ws->norm_w[0]);
     for (size_t r = 0; r < count * 24; r++)
-        rms_row(ws.ple + r * 512, 512, ws.norm_w[0]);
+        rms_row(ws->ple + r * 512, 512, ws->norm_w[0]);
     for (int l = 0; l < 24; l++) {
         char name[128];
 #define T(suffix) (snprintf(name, sizeof name, "blk.%d." suffix ".weight", l), tensor_of(g, name))
         int d = l % 6 == 5 ? 512 : 256, kv = 512 / d;
-        dequant_norm(T("attn_norm"), 512, ws.norm_w[2]);
-        rows(pool, n, (row_job){.op = ROW_NORM_QUANT, .in = ws.x, .out = ws.h, .w = ws.norm_w[2]});
-        gemm_q8(pool, T("attn_q"), ws.xq, n, ws.q);
-        gemm_q8(pool, T("attn_k"), ws.xq, n, ws.k);
-        gemm_q8(pool, T("attn_v"), ws.xq, n, ws.v);
-        dequant_norm(T("attn_q_norm"), d, ws.norm_w[0]);
-        dequant_norm(T("attn_k_norm"), d, ws.norm_w[1]);
-        rows(pool, n,
+        dequant_norm(T("attn_norm"), 512, ws->norm_w[2]);
+        rows(ws, pool, n, (row_job){.op = ROW_NORM_QUANT, .in = ws->x, .out = ws->h, .w = ws->norm_w[2]});
+        gemm_q8(ws, pool, T("attn_q"), ws->xq, n, ws->q);
+        gemm_q8(ws, pool, T("attn_k"), ws->xq, n, ws->k);
+        gemm_q8(ws, pool, T("attn_v"), ws->xq, n, ws->v);
+        dequant_norm(T("attn_q_norm"), d, ws->norm_w[0]);
+        dequant_norm(T("attn_k_norm"), d, ws->norm_w[1]);
+        rows(ws, pool, n,
              (row_job){.op = ROW_QKV_POST, .d = d, .kv = kv, .rope_base = l % 6 == 5 ? 1 : 0});
-        attn_job aj = {n, kv, d, l % 6 == 5 ? 0 : 512};
+        attn_job aj = {n, kv, d, l % 6 == 5 ? 0 : 512, ws};
         PROF(3, ei_parallel_for(pool, 4 * ((n + QB - 1) / QB), 1, attention_rows, &aj));
-        rows(pool, n, (row_job){.op = ROW_QUANT, .in = ws.a, .width = 4 * d});
-        gemm_q8(pool, T("attn_output"), ws.xq, n, ws.h);
-        dequant_norm(T("post_attention_norm"), 512, ws.norm_w[2]);
-        rows(pool, n, (row_job){.op = ROW_POST_ADD, .out = ws.h, .w = ws.norm_w[2], .scale = 1});
-        dequant_norm(T("ffn_norm"), 512, ws.norm_w[2]);
-        rows(pool, n, (row_job){.op = ROW_NORM_QUANT, .in = ws.x, .out = ws.h, .w = ws.norm_w[2]});
-        gemm_q8(pool, T("ffn_up"), ws.xq, n, ws.up);
-        gemm_q8(pool, T("ffn_gate"), ws.xq, n, ws.gate);
-        rows(pool, n, (row_job){.op = ROW_GELU_QUANT});
-        gemm_q8(pool, T("ffn_down"), ws.xq, n, ws.h);
-        dequant_norm(T("post_ffw_norm"), 512, ws.norm_w[2]);
-        rows(pool, n, (row_job){.op = ROW_POST_ADD, .out = ws.h, .w = ws.norm_w[2], .scale = 1});
-        rows(pool, n, (row_job){.op = ROW_QUANT, .in = ws.x, .width = 512});
-        gemm_q8(pool, T("inp_gate"), ws.xq, n, ws.h);
-        rows(pool, n, (row_job){.op = ROW_PLE_GATE_QUANT, .layer = l});
-        gemm_q8(pool, T("proj"), ws.xq, n, ws.a);
-        dequant_norm(T("post_norm"), 512, ws.norm_w[2]);
+        rows(ws, pool, n, (row_job){.op = ROW_QUANT, .in = ws->a, .width = 4 * d});
+        gemm_q8(ws, pool, T("attn_output"), ws->xq, n, ws->h);
+        dequant_norm(T("post_attention_norm"), 512, ws->norm_w[2]);
+        rows(ws, pool, n, (row_job){.op = ROW_POST_ADD, .out = ws->h, .w = ws->norm_w[2], .scale = 1});
+        dequant_norm(T("ffn_norm"), 512, ws->norm_w[2]);
+        rows(ws, pool, n, (row_job){.op = ROW_NORM_QUANT, .in = ws->x, .out = ws->h, .w = ws->norm_w[2]});
+        gemm_q8(ws, pool, T("ffn_up"), ws->xq, n, ws->up);
+        gemm_q8(ws, pool, T("ffn_gate"), ws->xq, n, ws->gate);
+        rows(ws, pool, n, (row_job){.op = ROW_GELU_QUANT});
+        gemm_q8(ws, pool, T("ffn_down"), ws->xq, n, ws->h);
+        dequant_norm(T("post_ffw_norm"), 512, ws->norm_w[2]);
+        rows(ws, pool, n, (row_job){.op = ROW_POST_ADD, .out = ws->h, .w = ws->norm_w[2], .scale = 1});
+        rows(ws, pool, n, (row_job){.op = ROW_QUANT, .in = ws->x, .width = 512});
+        gemm_q8(ws, pool, T("inp_gate"), ws->xq, n, ws->h);
+        rows(ws, pool, n, (row_job){.op = ROW_PLE_GATE_QUANT, .layer = l});
+        gemm_q8(ws, pool, T("proj"), ws->xq, n, ws->a);
+        dequant_norm(T("post_norm"), 512, ws->norm_w[2]);
         float scale = element(T("layer_output_scale"), 0);
-        rows(pool, n, (row_job){.op = ROW_POST_ADD, .out = ws.a, .w = ws.norm_w[2], .scale = scale});
+        rows(ws, pool, n, (row_job){.op = ROW_POST_ADD, .out = ws->a, .w = ws->norm_w[2], .scale = scale});
 #undef T
     }
-    dequant_norm(tensor_of(g, "output_norm.weight"), 512, ws.norm_w[2]);
-    rows(pool, n, (row_job){.op = ROW_NORM_QUANT, .in = ws.x, .out = ws.h, .w = ws.norm_w[2]});
+    dequant_norm(tensor_of(g, "output_norm.weight"), 512, ws->norm_w[2]);
+    rows(ws, pool, n, (row_job){.op = ROW_NORM_QUANT, .in = ws->x, .out = ws->h, .w = ws->norm_w[2]});
     const ei_tensor *output = tensor_of(g, "output.weight");
     if (output->type == EI_T_Q8_0)
-        gemm_q8(pool, output, ws.xq, n, ws.a);
+        gemm_q8(ws, pool, output, ws->xq, n, ws->a);
     else
-        gemm_f(pool, output, ws.h, n, ws.a);
+        gemm_f(pool, output, ws->h, n, ws->a);
     for (size_t s = 0; s < batch; s++) {
         float *o = out + s * 768;
         size_t len = offsets[s + 1] - offsets[s];
         memset(o, 0, 768 * 4);
         for (size_t t = offsets[s]; t < offsets[s + 1]; t++)
             for (int z = 0; z < 768; z++)
-                o[z] += ws.a[t * 768 + z] / (float)len;
+                o[z] += ws->a[t * 768 + z] / (float)len;
         ei_l2_normalize(o, 768);
     }
     if (getenv("EI_GEMMA2_CPU_PROFILE")) {
@@ -972,6 +1012,6 @@ bool ei_gemma2_embed_batch_fast(const ei_gguf *g, ei_thread_pool *pool, const in
         fprintf(stderr, "\n");
     }
     memset(prof, 0, sizeof prof);
-    pthread_mutex_unlock(&lock);
+    pthread_mutex_unlock(&ctx->lock);
     return true;
 }

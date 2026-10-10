@@ -1,11 +1,14 @@
 #if defined(__linux__)
-#define _POSIX_C_SOURCE 200809L /* clock_gettime under -std=c11 on glibc */
+#define _GNU_SOURCE /* clock_gettime under -std=c11, CPU affinity on glibc */
 #endif
 #include "parallel.h"
 
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -22,6 +25,7 @@ struct ei_thread_pool {
     worker_context *contexts;
     int32_t worker_count;
     int32_t total_threads;
+    int32_t *cpus; /* pinned pools: [0] the caller, [1 + i] worker i */
 
     pthread_mutex_t mutex;
     pthread_cond_t done;
@@ -101,8 +105,20 @@ static void *spin_worker_main(worker_context *worker) {
     }
 }
 
+static void pin_self(int32_t cpu) {
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#else
+    (void)cpu;
+#endif
+}
+
 static void *worker_main(void *opaque) {
     worker_context *worker = opaque;
+    if (worker->pool->cpus) pin_self(worker->pool->cpus[1 + worker->index]);
     ei_thread_pool *pool = worker->pool;
     if (pool->spin_ns) return spin_worker_main(worker);
     pthread_mutex_lock(&pool->mutex);
@@ -122,28 +138,116 @@ static void *worker_main(void *opaque) {
     return NULL;
 }
 
+int32_t ei_cpu_count(void) {
+    long available = sysconf(_SC_NPROCESSORS_ONLN);
+    return available < 1 ? 1 : available > 4096 ? 4096 : (int32_t)available;
+}
+
+/* EI_THREADS, else every core up to 32 (the historical default; CPU workers
+ * occupy larger machines). */
 static int32_t default_thread_count(void) {
     const char *value = getenv("EI_THREADS");
     if (value && *value) {
         char *end = NULL;
         long parsed = strtol(value, &end, 10);
-        if (*end != '\0' || parsed < 1 || parsed > 64) {
-            ei_die("EI_THREADS must be an integer from 1 to 64");
+        if (*end != '\0' || parsed < 1 || parsed > 1024) {
+            ei_die("EI_THREADS must be an integer from 1 to 1024");
         }
         return (int32_t)parsed;
     }
-    long available = sysconf(_SC_NPROCESSORS_ONLN);
-    if (available < 1) available = 1;
-    if (available > 32) available = 32;
-    return (int32_t)available;
+    int32_t available = ei_cpu_count();
+    return available > 32 ? 32 : available;
 }
 
 static uint32_t create_spin_us;
+static const int32_t *create_cpus;
+
 ei_thread_pool *ei_thread_pool_create_spin(int32_t requested_threads, uint32_t default_spin_us) {
     create_spin_us = default_spin_us;
     ei_thread_pool *pool = ei_thread_pool_create(requested_threads);
     create_spin_us = 0;
     return pool;
+}
+
+ei_thread_pool *ei_thread_pool_create_pinned(int32_t threads, uint32_t default_spin_us,
+                                             const int32_t *cpus) {
+    create_cpus = cpus;
+    ei_thread_pool *pool = ei_thread_pool_create_spin(threads, default_spin_us);
+    create_cpus = NULL;
+    return pool;
+}
+
+#if defined(__linux__)
+static int read_sys_int(const char *format, int32_t cpu) {
+    char path[160];
+    snprintf(path, sizeof path, format, cpu);
+    FILE *f = fopen(path, "r");
+    int value = -1;
+    if (f) {
+        if (fscanf(f, "%d", &value) != 1) value = -1;
+        fclose(f);
+    }
+    return value;
+}
+typedef struct {
+    int32_t cpu, smt, l3, core, package;
+} cpu_key;
+static int cpu_key_cmp(const void *a, const void *b) {
+    const cpu_key *x = a, *y = b;
+    if (x->smt != y->smt) return x->smt - y->smt;
+    if (x->l3 != y->l3) return x->l3 - y->l3;
+    return x->cpu - y->cpu;
+}
+#endif
+
+int32_t ei_cpu_placement(int32_t *cpus, int32_t max) {
+    int32_t n = ei_cpu_count();
+    if (n > max) n = max;
+#if defined(__linux__)
+    cpu_key *keys = calloc((size_t)n, sizeof *keys);
+    if (!keys) ei_die("out of memory ordering CPUs");
+    for (int32_t i = 0; i < n; i++) {
+        keys[i].cpu = i;
+        keys[i].l3 = read_sys_int("/sys/devices/system/cpu/cpu%d/cache/index3/id", i);
+        keys[i].core = read_sys_int("/sys/devices/system/cpu/cpu%d/topology/core_id", i);
+        keys[i].package =
+            read_sys_int("/sys/devices/system/cpu/cpu%d/topology/physical_package_id", i);
+        // SMT rank: siblings after the first logical CPU of a core.
+        for (int32_t j = 0; j < i; j++)
+            if (keys[j].core >= 0 && keys[j].core == keys[i].core &&
+                keys[j].package == keys[i].package)
+                keys[i].smt++;
+    }
+    qsort(keys, (size_t)n, sizeof *keys, cpu_key_cmp);
+    for (int32_t i = 0; i < n; i++) cpus[i] = keys[i].cpu;
+    free(keys);
+#else
+    for (int32_t i = 0; i < n; i++) cpus[i] = i;
+#endif
+    return n;
+}
+
+void ei_thread_pool_bind_caller(const ei_thread_pool *pool, ei_cpu_binding *saved) {
+    saved->bound = false;
+#if defined(__linux__)
+    if (!pool || !pool->cpus) return;
+    cpu_set_t *old = (cpu_set_t *)saved->mask;
+    _Static_assert(sizeof(cpu_set_t) <= sizeof saved->mask, "cpu_set_t fits");
+    if (pthread_getaffinity_np(pthread_self(), sizeof *old, old) != 0) return;
+    pin_self(pool->cpus[0]);
+    saved->bound = true;
+#else
+    (void)pool;
+#endif
+}
+
+void ei_thread_pool_unbind_caller(const ei_cpu_binding *saved) {
+#if defined(__linux__)
+    if (saved->bound)
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), (const cpu_set_t *)saved->mask);
+#else
+    (void)saved;
+#endif
 }
 
 ei_thread_pool *ei_thread_pool_create(int32_t requested_threads) {
@@ -153,6 +257,11 @@ ei_thread_pool *ei_thread_pool_create(int32_t requested_threads) {
     if (!pool) ei_die("out of memory creating CPU thread pool");
     pool->total_threads = total;
     pool->worker_count = total - 1;
+    if (create_cpus) {
+        pool->cpus = malloc((size_t)total * sizeof *pool->cpus);
+        if (!pool->cpus) ei_die("out of memory creating CPU thread pool");
+        memcpy(pool->cpus, create_cpus, (size_t)total * sizeof *pool->cpus);
+    }
     if (pthread_mutex_init(&pool->mutex, NULL) != 0 ||
         pthread_cond_init(&pool->done, NULL) != 0) {
         ei_die("failed to initialize CPU thread pool");
@@ -194,6 +303,7 @@ void ei_thread_pool_destroy(ei_thread_pool *pool) {
     pthread_cond_destroy(&pool->done);
     pthread_mutex_destroy(&pool->mutex);
     free(pool->contexts);
+    free(pool->cpus);
     free(pool->workers);
     free(pool);
 }

@@ -91,6 +91,20 @@ The target is the hardware ceiling under many concurrent requests (SlimServe
   back-to-back in one process (`make bench-gemma2-metal`, `EI_BENCH_BASE`) or
   interleaved; separate HTTP runs are not comparable across time.
 
+## EmbeddingGemma 2 scaling lessons (2026-10-10)
+
+- **One CPU wave peaks at ~64 threads and collapses past it** (256-thread pool
+  slower than 32). Big machines need `--cpu-workers` (independent pools, pinned
+  by L3 domain): 16x16 = 3.75x the best single pool on 256 EPYC cores.
+- **CPU overflow beside a fast GPU is ~worthless**: a 5090 is 15-100x all the
+  cores, and CPU workers starve the HTTP threads. It stays opt-in and only
+  takes real backlog. The real multipliers are more GPUs and CPU-only workers.
+- **HTTP workers cap requests in flight** (one keep-alive connection per
+  worker); a "slow" executor layout may just be starved. Check `busy=` in
+  `EI_WAVE_LOG` before blaming kernels.
+- **Scheduler predicates must agree**: a slot picker that promises work the
+  taker won't take spins with the service mutex held (a full deadlock).
+
 ## How to do kernel / perf work here
 
 - **Measure before building.** Profile to size the prize first. An env-gated
@@ -143,6 +157,8 @@ Remote backend boxes (repos cloned at `~/embeddinggemma-bench` on each):
   NEVER touch it, always `CUDA_VISIBLE_DEVICES=1`. `nvcc` at `/usr/local/cuda/bin`
   (not in PATH).
 - **ROCm** — `ssh EricMI300X` — MI300X (gfx942), ROCm 7.2. All 8 GPUs usually idle.
+  Its 2x EPYC 9754 (256 cores, 2 NUMA nodes) is the many-core CPU test bed;
+  `~/eg2-work` holds a synced tree plus the EmbeddingGemma 2 models.
 - **XPU** — `ssh -p 29732 lazarus@69.127.50.54` — Arc Pro B60. **The `~/.ssh/config`
   `QuadB60` HostName is STALE (192.168.0.115); use the direct endpoint above.**
   Build needs `source /opt/intel/oneapi/setvars.sh` in the same shell; gnome-shell

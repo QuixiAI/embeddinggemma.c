@@ -319,8 +319,12 @@ selects the unchanged reference graph):
   soft tokens use it too, so content-object text matches plain text.
 - `EI_GEMMA2_CPU_I8MM` (default on where `FEAT_I8MM`): `smmla` Q8 GEMM on
   row-pair-interleaved weights (repacked at first use) for waves of 4+ tokens.
-- `EI_GEMMA2_CPU_SHORT_THREADS=N` (default 6): tasks per GEMM for waves of at
-  most 8 tokens; short waves are wake-up bound.
+- `EI_GEMMA2_CPU_SHORT_THREADS=N` (default 2/3 of the pool): tasks per GEMM
+  for waves of at most 8 tokens; short waves are wake-up and preemption bound.
+- x86-64 (`src/gemma2_fast_x86.c`, runtime-dispatched, generic builds): AVX2 +
+  FMA, VNNI 256-bit, and on AVX-512 VNNI CPUs a repacked 512-bit GEMM (u8
+  activations with a precomputed -128*sum(w) correction).
+  `EI_GEMMA2_CPU_X86=scalar|avx2|vnni256` forces a tier.
 - `EI_GEMMA2_CPU_PROFILE=1`: per-call GEMM/row/attention wall time.
 - `EI_POOL_SPIN_US=N`: pool workers spin N us on a published
   generation/participant ticket before parking, so back-to-back parallel

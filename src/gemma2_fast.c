@@ -8,6 +8,7 @@
  * quantized once per normalized input, a 4-row x 4-token NEON sdot Q8 GEMM
  * tile, threaded SIMD row kernels, cached RoPE tables, persistent workspace. */
 #include "gemma2.h"
+#include "gemma2_fast_x86.h"
 #include "kernels.h"
 #include <math.h>
 #include <pthread.h>
@@ -169,6 +170,12 @@ static void q8_tile(const ei_block_q8_0 *w, const ei_block_q8_0 *x, float *y, in
         for (int r = 0; r < 4; r++)
             y[(size_t)t * m + r] = vaddvq_f32(acc[r][t]);
 #else
+#if defined(__x86_64__)
+    if (g2x_level()) {
+        g2x_q8_tile(w, x, y, kb, m, nt);
+        return;
+    }
+#endif
     for (int t = 0; t < nt; t++)
         for (int r = 0; r < 4; r++) {
             float sum = 0;
@@ -197,20 +204,37 @@ static void q8_rows(void *opaque, int32_t begin, int32_t end) {
                         kb, j->m, t_end - t < 4 ? t_end - t : 4);
     }
 }
+/* Waves of <= 8 tokens are wake-up and preemption bound: spread them over
+ * ~2/3 of the pool rather than every thread (EI_GEMMA2_CPU_SHORT_THREADS
+ * overrides). Measured best near 12 of 18 threads on an M5 Max and 21-32 of
+ * 32 on a Ryzen 9950X; derived from the pool, not tuned per machine. */
+static int short_grain(ei_thread_pool *pool, int tasks, int n) {
+    if (n > 8)
+        return 1;
+    static int width = -1;
+    if (width < 0) {
+        const char *env = getenv("EI_GEMMA2_CPU_SHORT_THREADS");
+        int threads = ei_thread_pool_threads(pool);
+        width = env ? atoi(env) : threads * 2 / 3;
+        if (width < 1)
+            width = 1;
+    }
+    return (tasks + width - 1) / width;
+}
 static bool gemm_q8_i8mm(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq, int n,
                          float *y);
+static bool gemm_q8_x86_512(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq,
+                            int n, float *y);
 static void gemm_q8(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq, int n,
                     float *y) {
     if (gemm_q8_i8mm(pool, w, xq, n, y))
         return;
+    if (gemm_q8_x86_512(pool, w, xq, n, y))
+        return;
     // Short waves: 8-row blocks so every thread gets work; long: 32-row tiles.
     int rr = n <= 8 ? 8 : 32;
     q8_job j = {w->data, xq, y, (int)w->ne[0], (int)w->ne[1], n, (int)(w->ne[1] + rr - 1) / rr, rr};
-    // Short waves are wake-up bound: ~6 tasks (the 300M T=1 lesson) beat 18.
-    int tasks = j.row_blocks * ((n + 31) / 32), width = getenv("EI_GEMMA2_CPU_SHORT_THREADS")
-                                                          ? atoi(getenv("EI_GEMMA2_CPU_SHORT_THREADS"))
-                                                          : 6;
-    int grain = n <= 8 && width > 0 ? (tasks + width - 1) / width : 1;
+    int tasks = j.row_blocks * ((n + 31) / 32), grain = short_grain(pool, tasks, n);
     PROF(0, ei_parallel_for(pool, tasks, grain, q8_rows, &j));
 }
 
@@ -367,12 +391,70 @@ static bool gemm_q8_i8mm(ei_thread_pool *pool, const ei_tensor *w, const ei_bloc
         }
     }
     mm_job_i8 j = {pw->q, xpair_q, pw->s, xpair_s, y, kb, m, n, m / 32};
-    PROF(0, ei_parallel_for(pool, j.row_blocks * ((np + 31) / 32), 1, i8mm_rows, &j));
+    int tasks = j.row_blocks * ((np + 31) / 32);
+    PROF(0, ei_parallel_for(pool, tasks, short_grain(pool, tasks, n), i8mm_rows, &j));
     return true;
 }
 #else
 static bool gemm_q8_i8mm(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq, int n,
                          float *y) {
+    (void)pool, (void)w, (void)xq, (void)n, (void)y;
+    return false;
+}
+#endif
+
+/* ---- x86 AVX-512 VNNI GEMM on repacked operands (gemma2_fast_x86.c) ---------- */
+#if defined(__x86_64__)
+typedef struct {
+    const void *w;
+    uint8_t *xu;
+    float *xs;
+    float *y;
+    int k, m, n, row_blocks;
+    const ei_block_q8_0 *xq;
+} x512_job;
+static void x512_acts(void *opaque, int32_t begin, int32_t end) {
+    x512_job *j = opaque;
+    g2x_acts(j->xq, begin, end, j->k, j->xu, j->xs);
+}
+static void x512_rows(void *opaque, int32_t begin, int32_t end) {
+    x512_job *j = opaque;
+    for (int task = begin; task < end; task++) {
+        int rb = task % j->row_blocks, tb = task / j->row_blocks;
+        int r_end = rb * 32 + 32 < j->m ? rb * 32 + 32 : j->m;
+        int t_end = tb * 32 + 32 < j->n ? tb * 32 + 32 : j->n;
+        for (int t = tb * 32; t < t_end; t += 4)
+            for (int r = rb * 32; r < r_end; r += 4)
+                g2x_gemm512_tile(j->w, r, j->xu, j->xs, t, t_end - t < 4 ? t_end - t : 4, j->k, j->y,
+                                 j->m);
+    }
+}
+static uint8_t *x512_u;
+static float *x512_s;
+static size_t x512_cap;
+static bool gemm_q8_x86_512(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq,
+                            int n, float *y) {
+    int k = (int)w->ne[0], m = (int)w->ne[1];
+    // Short waves stay on the 4-row tile with its short-wave task width.
+    if (!g2x_gemm512_enabled() || n <= 8 || k % 64 || m % 4)
+        return false;
+    const void *pw = g2x_weight_of(w, w->data, m, k);
+    if (!pw)
+        return false;
+    if ((size_t)n * k > x512_cap) {
+        free(x512_u), free(x512_s);
+        x512_u = ei_xmalloc((size_t)n * k);
+        x512_s = ei_xmalloc((size_t)n * (k / 32) * sizeof(float));
+        x512_cap = (size_t)n * k;
+    }
+    x512_job j = {pw, x512_u, x512_s, y, k, m, n, (m + 31) / 32, xq};
+    PROF(0, ei_parallel_for(pool, n, 16, x512_acts, &j));
+    PROF(0, ei_parallel_for(pool, j.row_blocks * ((n + 31) / 32), 1, x512_rows, &j));
+    return true;
+}
+#else
+static bool gemm_q8_x86_512(ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq,
+                            int n, float *y) {
     (void)pool, (void)w, (void)xq, (void)n, (void)y;
     return false;
 }
@@ -401,6 +483,11 @@ static void f_rows(void *opaque, int32_t begin, int32_t end) {
                     vst1q_f32(rows[r] + z + 4,
                               vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(b), 16)));
                 }
+                continue;
+            }
+#elif defined(__x86_64__)
+            if (j->w->type == EI_T_BF16 && g2x_level()) {
+                g2x_bf16_row((const uint16_t *)j->w->data + (size_t)(r0 + r) * k, rows[r], k);
                 continue;
             }
 #endif
@@ -434,6 +521,19 @@ static void f_rows(void *opaque, int32_t begin, int32_t end) {
                 for (int r = 0; r < nr; r++)
                     j->y[(size_t)(t0 + t) * j->m + r0 + r] = vaddvq_f32(acc[r][t]);
 #else
+#if defined(__x86_64__)
+            if (g2x_level() && k % 8 == 0) {
+                const float *xt[4], *wr[4] = {rows[0], rows[1], rows[2], rows[3]};
+                for (int t = 0; t < 4; t++)
+                    xt[t] = j->x + (size_t)(t0 + (t < nt ? t : 0)) * k;
+                float dots[4][4];
+                g2x_dot4x4(wr, xt, k, dots);
+                for (int t = 0; t < nt; t++)
+                    for (int r = 0; r < nr; r++)
+                        j->y[(size_t)(t0 + t) * j->m + r0 + r] = dots[r][t];
+                continue;
+            }
+#endif
             for (int t = 0; t < nt; t++)
                 for (int r = 0; r < nr; r++) {
                     float sum = 0;
@@ -468,6 +568,10 @@ static float sum_squares(const float *x, int d) {
         s += x[z] * x[z];
     return s;
 #else
+#if defined(__x86_64__)
+    if (g2x_level())
+        return g2x_sum_squares(x, d);
+#endif
     double s = 0;
     for (int z = 0; z < d; z++)
         s += (double)x[z] * x[z];
@@ -529,11 +633,22 @@ static void gelu_mul_row(float *g, const float *u, int n) {
         float32x4_t gelu = vmulq_f32(vmulq_f32(half, x), vaddq_f32(one, t));
         vst1q_f32(g + z, u ? vmulq_f32(gelu, vld1q_f32(u + z)) : gelu);
     }
+#elif defined(__x86_64__)
+    if (g2x_level()) {
+        g2x_gelu_mul_row(g, u, n);
+        return;
+    }
 #endif
     for (; z < n; z++)
         g[z] = ei_gelu_tanh(g[z]) * (u ? u[z] : 1.0f);
 }
 static void quant_row(const float *x, ei_block_q8_0 *q, int width) {
+#if defined(__x86_64__) && !defined(__AVX2__)
+    if (g2x_level()) {
+        g2x_quantize_row_q8_0(x, q, width); /* the AVX2 build's rounding, dispatched */
+        return;
+    }
+#endif
     ei_quantize_row_q8_0(x, q, width);
 }
 static void rms_row(float *r, int d, const float *w) {
@@ -691,9 +806,14 @@ static void attention_rows(void *opaque, int32_t begin, int32_t end) {
                     for (int c = 0; c < 4; c++)
                         dots[r][c] = vaddvq_f32(acc[r][c]);
 #else
-                for (int r = 0; r < 4; r++)
-                    for (int c = 0; c < 4; c++)
-                        dots[r][c] = dot_f(qp[r], kp[c], d);
+#if defined(__x86_64__)
+                if (g2x_level())
+                    g2x_dot4x4(qp, kp, d, dots);
+                else
+#endif
+                    for (int r = 0; r < 4; r++)
+                        for (int c = 0; c < 4; c++)
+                            dots[r][c] = dot_f(qp[r], kp[c], d);
 #endif
                 for (int r = 0; r < 4 && i0 + r < nq; r++)
                     for (int c = 0; c < 4 && s0 + c < nk; c++) {
@@ -715,6 +835,13 @@ static void attention_rows(void *opaque, int32_t begin, int32_t end) {
                 scores[i][sk] /= total[i];
         }
         /* O = P V with 8 queries x 8 dims in registers across the key loop. */
+#if defined(__x86_64__)
+        if (g2x_level()) {
+            g2x_pv(ws.v + ((size_t)klo * j->kv + kh) * d, (size_t)j->kv * d, nk, scores[0], 8192, nq,
+                   d, ws.a + ((size_t)t0 * 4 + hd) * d, (size_t)4 * d);
+            continue;
+        }
+#endif
         for (int z = 0; z < d; z += 8) {
 #if defined(__ARM_NEON)
             float32x4_t o[QB][2];

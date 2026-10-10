@@ -4,6 +4,7 @@
 #include "parallel.h"
 
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
@@ -68,9 +69,14 @@ static void *spin_worker_main(worker_context *worker) {
         uint64_t now = atomic_load_explicit(&pool->ticket, memory_order_acquire);
         if (now >> 32 == seen >> 32) {
             uint64_t deadline = pool_now_ns() + pool->spin_ns;
+            unsigned polls = 0;
             while ((now = atomic_load_explicit(&pool->ticket, memory_order_acquire)) >> 32 ==
                        seen >> 32 &&
                    pool_now_ns() < deadline) {
+                // Yield now and then: on an oversubscribed host a spinner can
+                // occupy the core a preempted worker needs to finish its task.
+                if ((++polls & 63) == 0)
+                    sched_yield();
             }
         }
         if (now >> 32 == seen >> 32) {
@@ -222,7 +228,10 @@ void ei_parallel_for(ei_thread_pool *pool, int32_t count, int32_t grain,
             if (pool->contexts[i].sleeping) pthread_cond_signal(&pool->contexts[i].start);
         pthread_mutex_unlock(&pool->mutex);
         run_jobs(pool);
+        unsigned polls = 0;
         while (atomic_load_explicit(&pool->pending, memory_order_acquire) != 0) {
+            if ((++polls & 63) == 0)
+                sched_yield(); // let a preempted helper back onto a core
         }
         return;
     }

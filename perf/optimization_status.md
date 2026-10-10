@@ -3130,3 +3130,31 @@ goldens and the HTTP suite (vision tower 0.999131 through the generic width-64
 kernel). Running sm_86 code on the 5090 through PTX JIT was not possible:
 driver 595.91 (CUDA 13.2) rejects PTX from the 13.3 toolchain ("unsupported
 toolchain"), so 3090 execution itself remains unverified here.
+
+## 2026-10-10: EmbeddingGemma 2 CPU on x86-64 (Ryzen 9 9950X)
+
+`src/gemma2_fast_x86.c`, runtime-dispatched (generic builds, no `-mavx2`),
+following QuixiCore-CPU's x86 findings (sign trick |w| x x*sign(w); AVX-512
+promoted per kernel by measurement). 9950X: 16 Zen 5 cores / 32 threads,
+AVX2, AVX-512 (VL/DQ/VNNI/BF16), AVX-VNNI. `make bench-gemma2-cpu`, ms:
+
+| case | scalar | AVX2 | VNNI 256 | VNNI 512 repacked + parallel repack + width |
+|---|---:|---:|---:|---:|
+| 1x1 | 4.26 | 5.37 | 5.18 | 3.8-4.1 |
+| 8x1 | 24.1 | 10.7 | 12.0 | 6.9-8.6 |
+| 32x16 | 482.6 | 187.5 | 174.6 | 116-121 |
+| 512x1 | 757.9 | 238.3 | 224.7 | 168-170 |
+
+- The 512-bit kernel stores activations as u8 (q XOR 0x80) and seeds each
+  32-byte half's accumulator with the block's precomputed -128*sum(w), so
+  vpdpbusd needs no per-element sign work; two Q8 blocks per instruction.
+- Its first version repacked activations single-threaded per GEMM (~35 ms of
+  156 at 32x16, invisible to the stage profile); parallel and SIMD now.
+- Short-wave width: the M5-tuned 6 tasks starved 16 cores (1x1 5.4 ms); it is
+  now 2/3 of the pool (12 on an M5 Max, 21 on the 9950X), and the i8mm path
+  uses it too (it spread 4..8-token waves over every thread).
+- Spin pool under load: with two cores busy on other work, spinning workers
+  and the waiting caller held the cores a preempted helper needed (M5: 32x4
+  57 ms, 32x16 108 ms). Spinners now `sched_yield` every 64 polls: 18.5 and
+  60.6 ms on the same loaded host.
+- Accuracy: `make test-gemma2` passes on x86 (text 0.999606) and on the M5.

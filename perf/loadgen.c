@@ -1,6 +1,7 @@
 // Minimal keep-alive HTTP load generator for embedding servers (no wrk/hey/ab needed).
 // build: cc -O2 -pthread -o loadgen perf/loadgen.c
 // usage: loadgen PORT WORDS CONCURRENCY SECONDS   (~4.6 tokens per generated word)
+// Prints requests/s and latency p50/p90/p99 (ms).
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -16,6 +17,8 @@
 static int port, words, secs;
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static long total;
+static double *lat;
+static size_t lat_n, lat_cap;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static int conn(void) {
     int fd = socket(AF_INET, SOCK_STREAM, 0), one = 1;
@@ -35,6 +38,7 @@ static void *worker(void *arg) {
         for (int w = 0; w < words; w++) p += sprintf(body + p, "w%ld%ld ", id, n * 31 + w);
         p += sprintf(body + p, "\"}");
         int r = sprintf(req, "POST /api/embed HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", p, body);
+        double t_start = now();
         if (write(fd, req, r) != r) { close(fd); fd = conn(); continue; }
         size_t got = 0; long clen = -1; char *hdr_end = NULL;
         int closed = 0;
@@ -53,10 +57,19 @@ static void *worker(void *arg) {
         }
         if (strncmp(buf, "HTTP/1.1 200", 12)) { fprintf(stderr, "bad response: %.80s\n", buf); exit(1); }
         n++;
+        double ms = (now() - t_start) * 1e3;
+        pthread_mutex_lock(&mu);
+        if (lat_n == lat_cap) { lat_cap = lat_cap ? lat_cap * 2 : 4096; lat = realloc(lat, lat_cap * sizeof *lat); }
+        lat[lat_n++] = ms;
+        pthread_mutex_unlock(&mu);
         if (strcasestr(buf, "connection: close")) { close(fd); fd = conn(); }
     }
     pthread_mutex_lock(&mu); total += n; pthread_mutex_unlock(&mu);
     return NULL;
+}
+int cmp(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
 }
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
@@ -64,6 +77,10 @@ int main(int argc, char **argv) {
     pthread_t t[256];
     for (long i = 0; i < c; i++) pthread_create(&t[i], NULL, worker, (void *)i);
     for (int i = 0; i < c; i++) pthread_join(t[i], NULL);
-    printf("%.1f req/s\n", (double)total / secs);
+    int cmp(const void *a, const void *b);
+    qsort(lat, lat_n, sizeof *lat, cmp);
+    double p50 = lat_n ? lat[lat_n / 2] : 0, p90 = lat_n ? lat[lat_n * 9 / 10] : 0,
+           p99 = lat_n ? lat[lat_n * 99 / 100] : 0;
+    printf("%.1f req/s  p50 %.2f ms  p90 %.2f ms  p99 %.2f ms\n", (double)total / secs, p50, p90, p99);
     return 0;
 }

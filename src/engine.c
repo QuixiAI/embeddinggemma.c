@@ -189,6 +189,9 @@ void ei_engine_free(ei_engine *e) {
     ei_gemma2_metal_free(e->gemma2_metal);
 #endif
 #if defined(EI_ENABLE_CUDA)
+    for (size_t i = 1; i < e->gemma2_slot_count && e->gemma2_cuda; i++)
+        ei_gemma2_cuda_free(e->gemma2_cuda_slots[i]);
+    ei_gemma2_cuda_free(e->gemma2_cuda_media);
     ei_gemma2_cuda_free(e->gemma2_cuda);
     ei_cuda_engine_free(e->cuda);
 #endif
@@ -1108,8 +1111,21 @@ bool ei_engine_set_pipeline_slots(ei_engine *e, size_t slots, char *err, size_t 
         return e->gemma2_media != NULL;
     }
 #endif
+#if defined(EI_ENABLE_CUDA)
+    if (e->gemma2_cuda) {
+        e->gemma2_cuda_slots[0] = e->gemma2_cuda;
+        for (size_t i = 1; i < slots; i++)
+            // Long waves start only on an idle backend, so they hold slot 0;
+            // bypass waves run on slots 1.. at the GPU's highest priority.
+            if (!(e->gemma2_cuda_slots[i] = ei_gemma2_cuda_clone(e->gemma2_cuda, true, err, err_len)))
+                return false;
+        e->gemma2_slot_count = slots;
+        e->gemma2_cuda_media = ei_gemma2_cuda_clone(e->gemma2_cuda, false, err, err_len);
+        return e->gemma2_cuda_media != NULL;
+    }
+#endif
     (void)e;
-    set_err(err, err_len, "pipeline slots > 1 require EmbeddingGemma 2 on Metal");
+    set_err(err, err_len, "pipeline slots > 1 require EmbeddingGemma 2 on Metal or CUDA");
     return false;
 }
 
@@ -1129,6 +1145,21 @@ bool ei_engine_embed_tokens_batch_slot(ei_engine *e, size_t slot, const int32_t 
                 return false;
         return ei_gemma2_metal_batch(e->gemma2_slots[slot], ids, offsets, batch_size, out, err,
                                      err_len);
+    }
+#endif
+#if defined(EI_ENABLE_CUDA)
+    if (slot > 0 && slot < e->gemma2_slot_count && e->gemma2_cuda) {
+        if (!offsets || batch_size == 0 || offsets[0] != 0) {
+            set_err(err, err_len, "batch offsets must start at zero");
+            return false;
+        }
+        for (size_t s = 0; s < batch_size; s++)
+            if (offsets[s + 1] < offsets[s] ||
+                !token_ids_valid(ids + offsets[s], offsets[s + 1] - offsets[s], 8192, err,
+                                 err_len))
+                return false;
+        return ei_gemma2_cuda_batch(e->gemma2_cuda_slots[slot], ids, offsets, batch_size, out,
+                                    err, err_len);
     }
 #endif
     (void)slot;

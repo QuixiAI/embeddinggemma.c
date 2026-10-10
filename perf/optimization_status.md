@@ -3158,3 +3158,35 @@ AVX2, AVX-512 (VL/DQ/VNNI/BF16), AVX-VNNI. `make bench-gemma2-cpu`, ms:
   57 ms, 32x16 108 ms). Spinners now `sched_yield` every 64 polls: 18.5 and
   60.6 ms on the same loaded host.
 - Accuracy: `make test-gemma2` passes on x86 (text 0.999606) and on the M5.
+
+## 2026-10-10: Mixed-traffic scheduling (`--short-bypass-tokens`)
+
+Service rule (`inference_service.c`, with `pipeline_slots > 1`): requests of at
+most N tokens are short; waves are homogeneous (the head's class, or short-only
+when bypassing); an idle backend starts any wave; with waves in flight a new
+wave may start only if every in-flight wave is long and a short request is
+queued. Long waves therefore start only on an idle backend (slot 0), and CUDA
+runs bypass waves on slot clones created at the device's greatest stream
+priority. CUDA now has pipeline-slot clones (own stream, cuBLAS handle,
+workspace; shared weights) and a dedicated media context, like Metal.
+
+Mixed load (`perf/loadgen.c`): 10-token requests from 8 clients while 4
+clients send ~2048-token requests (440 words). Same binary per backend:
+
+| RTX 5090 | short req/s | short p50 | short p99 | long req/s |
+|---|---:|---:|---:|---:|
+| short alone (reference) | 4,283 | 1.85 ms | 1.95 ms | - |
+| default (1 slot) | 146 | 55.0 ms | 56.4 ms | 74.1 |
+| `--pipeline-slots 2` | 145 | 55.3 ms | 56.4 ms | 73.9 |
+| bypass 64 | 578 | 13.6 ms | 26.9 ms | 74.4 |
+| bypass 64 + high-priority bypass streams | 829 | 5.0 ms | 27.0 ms | 70.6 |
+
+| M5 Max (Metal, host loaded by user builds) | short req/s | short p50 | short p99 | long req/s |
+|---|---:|---:|---:|---:|
+| default | 43.4 | 175.5 ms | 227.9 ms | 22.1 |
+| bypass 64 (no queue priorities on Metal) | 143.1 | 56.3 ms | 97.4 ms | 19.9 |
+
+Correctness: a bypass server matches a plain one on 300 mixed-length texts at
+32-way concurrency (min cosine 0.999999137); `test_inference_service` passes;
+`make test-gemma2-cuda` passes with bypass off. Without a long background the
+rule changes nothing (short-alone rows equal).

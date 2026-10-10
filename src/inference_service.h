@@ -29,6 +29,11 @@ typedef struct {
      * execute_slot must be set; it receives the wave's slot in [0, slots). */
     size_t pipeline_slots;
     ei_inference_execute_slot_fn execute_slot;
+    /* Mixed traffic: requests of at most this many tokens are "short". While
+     * every in-flight wave is long, a free slot may start a short-only wave,
+     * so short requests bypass long waves; waves never mix the two classes.
+     * 0 disables (the historical collection). Needs pipeline_slots > 1. */
+    size_t short_bypass_tokens;
 } ei_inference_service_config;
 
 typedef struct {

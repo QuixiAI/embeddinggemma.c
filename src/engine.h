@@ -19,6 +19,8 @@ typedef struct {
     size_t gemma2_slot_count;
     void *gemma2_media;
     void *gemma2_cuda;
+    void *gemma2_cuda_slots[EI_MAX_PIPELINE_SLOTS]; /* [0] = gemma2_cuda */
+    void *gemma2_cuda_media;                        /* media context with slots */
     void *cuda;
     void *rocm;
     void *xpu;
@@ -58,8 +60,9 @@ bool ei_engine_embed_tokens(ei_engine *e, const int32_t *ids, size_t n_tokens,
 bool ei_engine_embed_tokens_batch(ei_engine *e, const int32_t *ids,
                                   const size_t *offsets, size_t batch_size,
                                   float *out, char *err, size_t err_len);
-/* Overlapping waves for EmbeddingGemma 2 on Metal: slots > 1 creates per-slot
- * queues/workspaces sharing the weights. Other backends accept only 1. */
+/* Overlapping waves for EmbeddingGemma 2 on Metal or CUDA: slots > 1 creates
+ * per-slot queues/streams and workspaces sharing the weights, plus a media
+ * context. Other backends accept only 1. */
 bool ei_engine_set_pipeline_slots(ei_engine *e, size_t slots, char *err, size_t err_len);
 /* Like ei_engine_embed_tokens_batch on pipeline slot `slot` (< slot count);
  * distinct slots may run concurrently from different threads. */

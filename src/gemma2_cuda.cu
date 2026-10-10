@@ -1469,3 +1469,39 @@ extern "C" bool ei_gemma2_cuda_audio(void *ctx, const ei_gguf *g, const float *m
     engine *e = (engine *)ctx;
     return use_projector(e, g, err, len) && audio(e, mel, frames, out, tokens, err, len);
 }
+
+extern "C" void *ei_gemma2_cuda_clone(void *ctx, bool high_priority, char *err, size_t len) {
+    engine *p = (engine *)ctx, *e = new engine();
+    e->g = p->g;
+    e->device = p->device;
+    e->token_embd = p->token_embd;
+    e->ple_proj = p->ple_proj;
+    e->output = p->output;
+    e->ple_norm = p->ple_norm;
+    e->output_norm = p->output_norm;
+    e->rope[0] = p->rope[0];
+    e->rope[1] = p->rope[1];
+    for (int l = 0; l < kLayers; l++)
+        e->layers[l] = p->layers[l];
+    e->use_graphs = p->use_graphs;
+    e->mma_attention = p->mma_attention;
+    // Shared weights stay owned by the parent; the clone owns its stream,
+    // cuBLAS handle, workspace, graphs, and any projector weights it loads.
+    int least = 0, greatest = 0;
+    bool ok = check(cudaSetDevice(e->device), "select device", err, len) &&
+              check(cudaDeviceGetStreamPriorityRange(&least, &greatest), "stream priorities", err,
+                    len) &&
+              check(cudaStreamCreateWithPriority(&e->stream, cudaStreamNonBlocking,
+                                                 high_priority ? greatest : least),
+                    "stream", err, len) &&
+              check_blas(cublasCreate(&e->blas), "create", err, len) &&
+              check_blas(cublasSetStream(e->blas, e->stream), "stream", err, len) &&
+              check(cudaMalloc(&e->blas_workspace, 32 << 20), "cuBLAS workspace", err, len) &&
+              check_blas(cublasSetWorkspace(e->blas, e->blas_workspace, 32 << 20), "workspace",
+                         err, len);
+    if (!ok) {
+        ei_gemma2_cuda_free(e);
+        return nullptr;
+    }
+    return e;
+}

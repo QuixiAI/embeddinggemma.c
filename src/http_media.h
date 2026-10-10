@@ -127,7 +127,8 @@ static bool embed_structured(const server_opts *opts, const sv_string *input, fl
                         opts->engine->thread_pool);
     // With pipeline slots, media owns a context separate from every text slot.
     m.metal = opts->engine->gemma2_media ? opts->engine->gemma2_media : opts->engine->gemma2_metal;
-    m.cuda = opts->engine->gemma2_cuda;
+    m.cuda = opts->engine->gemma2_cuda_media ? opts->engine->gemma2_cuda_media
+                                             : opts->engine->gemma2_cuda;
     m.lock = &inference_mutex; // engine calls only; parsing and decoding run unlocked
     const char *p = input->s;
     bool ok = false;

@@ -10,6 +10,10 @@ extern "C" {
 /* EmbeddingGemma 2 text tower on CUDA (packed multi-sequence waves). */
 void *ei_gemma2_cuda_create(const ei_gguf *g, char *err, size_t len);
 void ei_gemma2_cuda_free(void *ctx);
+/* A pipeline slot: shares ctx's weights, with its own stream (high_priority:
+ * the device's greatest stream priority), cuBLAS handle and workspace so waves
+ * on different slots can run concurrently. */
+void *ei_gemma2_cuda_clone(void *ctx, bool high_priority, char *err, size_t len);
 bool ei_gemma2_cuda_batch(void *ctx, const int32_t *ids, const size_t *offsets, size_t batch,
                           float *out, char *err, size_t len);
 /* One sequence of 512-wide input rows (media soft tokens interleaved with text). */

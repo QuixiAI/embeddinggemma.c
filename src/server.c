@@ -89,6 +89,7 @@ typedef struct {
     size_t max_batch_requests;
     size_t max_batch_sequence_tokens;
     size_t pipeline_slots;
+    size_t short_bypass_tokens;
     size_t max_client_batch_size;
     size_t tokenizer_workers;
     uint32_t batch_wait_us;
@@ -1287,7 +1288,8 @@ static void usage(const char *argv0) {
             "          [--batch-wait-us N] [--keepalive-connections N]\n"
             "          [--keepalive-max-requests N] [--keepalive-timeout-ms N]\n"
             "          [--response-cache-mb N] [--persistent-cache-path PATH]\n"
-            "          [--pipeline-slots N]  (embeddinggemma-2 Metal waves in flight, 1..8)\n"
+            "          [--pipeline-slots N]  (embeddinggemma-2 GPU waves in flight, 1..8)\n"
+            "          [--short-bypass-tokens N]  (short requests bypass long waves; implies 2 slots)\n"
             "default listen: 0.0.0.0:%d\n"
             "default model: $XDG_CACHE_HOME/embeddinggemma.c/%s\n"
             "               or $HOME/.cache/embeddinggemma.c/%s\n",
@@ -1368,6 +1370,8 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
         } else if (strcmp(argv[i], "--max-batch-requests") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 1, 256,
                                 &opts->max_batch_requests)) return false;
+        } else if (strcmp(argv[i], "--short-bypass-tokens") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 0, 8192, &opts->short_bypass_tokens)) return false;
         } else if (strcmp(argv[i], "--pipeline-slots") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 1, EI_MAX_PIPELINE_SLOTS, &opts->pipeline_slots))
                 return false;
@@ -1597,9 +1601,15 @@ int main(int argc, char **argv) {
                            reserve_error, sizeof reserve_error)) {
         ei_die("cannot reserve inference workspace: %s", reserve_error);
     }
+    bool implied_slots = opts.short_bypass_tokens && opts.pipeline_slots < 2;
+    if (implied_slots) opts.pipeline_slots = 2;
     if (!ei_engine_set_pipeline_slots(&engine, opts.pipeline_slots, reserve_error,
-                                      sizeof reserve_error))
-        ei_die("cannot create pipeline slots: %s", reserve_error);
+                                      sizeof reserve_error)) {
+        if (!implied_slots) ei_die("cannot create pipeline slots: %s", reserve_error);
+        fprintf(stderr, "short-request bypass disabled: %s\n", reserve_error);
+        opts.pipeline_slots = 1;
+        opts.short_bypass_tokens = 0;
+    }
     ei_inference_service_config service_config = {
         .cache_entries = opts.cache_entries,
         .max_batch_tokens = opts.max_batch_tokens,
@@ -1610,6 +1620,7 @@ int main(int argc, char **argv) {
         .cache_path = opts.persistent_cache_path,
         .cache_fingerprint = cache_fingerprint,
         .pipeline_slots = opts.pipeline_slots,
+        .short_bypass_tokens = opts.short_bypass_tokens,
         .execute_slot = opts.pipeline_slots > 1 ? execute_engine_batch_slot : NULL,
     };
     ei_inference_service *service = ei_inference_service_create(

@@ -308,6 +308,11 @@ exactly (goldens identical to 9 digits):
   neutral above ~128 tokens): one packed wave beats overlapping small ones.
   `EI_WAVE_LOG=1` prints each wave (slot, sequences, tokens, execute time,
   idle gap) to stderr.
+- `--short-bypass-tokens N` (server, Metal or CUDA; implies 2 slots): requests
+  of at most N tokens are short. Waves never mix short and long requests, and
+  while every in-flight wave is long a free slot starts a short-only wave, so
+  short requests bypass long ones. On CUDA bypass waves run on high-priority
+  streams. Off (0) by default; ignored with a warning on CPU builds.
 
 EmbeddingGemma 2 CPU (default on since 2026-10-09; `EI_GEMMA2_CPU_FAST=0`
 selects the unchanged reference graph):

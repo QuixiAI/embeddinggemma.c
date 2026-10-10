@@ -34,73 +34,78 @@ void ei_model_load(ei_model *m, const char *path) {
     ei_gguf_open(g, path);
 
     const ei_kv *arch = ei_gguf_kv(g, "general.architecture", true);
-    if (arch->type != EI_GGUF_STRING ||
-        arch->v.s.len != strlen("gemma-embedding") ||
-        memcmp(arch->v.s.str, "gemma-embedding", arch->v.s.len) != 0) {
-        ei_die("%s: not a gemma-embedding GGUF (this engine serves exactly one model)", path);
+    m->embeddinggemma2 = arch->type == EI_GGUF_STRING &&
+                         arch->v.s.len == strlen("gemma-embedding2") &&
+                         memcmp(arch->v.s.str, "gemma-embedding2", arch->v.s.len) == 0;
+    if (!m->embeddinggemma2 &&
+        (arch->type != EI_GGUF_STRING || arch->v.s.len != strlen("gemma-embedding") ||
+         memcmp(arch->v.s.str, "gemma-embedding", arch->v.s.len) != 0)) {
+        ei_die("%s: expected a gemma-embedding or gemma-embedding2 GGUF", path);
     }
 
     const ei_kv *tok_model = ei_gguf_kv(g, "tokenizer.ggml.model", true);
-    if (tok_model->type != EI_GGUF_STRING ||
-        tok_model->v.s.len != strlen("llama") ||
-        memcmp(tok_model->v.s.str, "llama", tok_model->v.s.len) != 0) {
-        ei_die("%s: unsupported tokenizer model (expected llama/SPM)", path);
+    const char *tokenizer_name = m->embeddinggemma2 ? "gemma4" : "llama";
+    if (tok_model->type != EI_GGUF_STRING || tok_model->v.s.len != strlen(tokenizer_name) ||
+        memcmp(tok_model->v.s.str, tokenizer_name, tok_model->v.s.len) != 0) {
+        ei_die("%s: unsupported tokenizer model (expected %s)", path, tokenizer_name);
     }
 
+    if (!m->embeddinggemma2) {
     #define CHECK_HPARAM(key, expect) do { \
-        uint64_t v = ei_gguf_kv_u64(g, key, 0); \
-        if (v != (expect)) ei_die("%s: %s = %llu, engine is built for %llu", \
-                                  path, key, (unsigned long long)v, \
-                                  (unsigned long long)(expect)); \
-    } while (0)
-
-    CHECK_HPARAM("gemma-embedding.block_count",           EI_N_LAYER);
-    CHECK_HPARAM("gemma-embedding.embedding_length",      EI_N_EMBD);
-    CHECK_HPARAM("gemma-embedding.feed_forward_length",   EI_N_FF);
-    CHECK_HPARAM("gemma-embedding.attention.head_count",  EI_N_HEAD);
-    CHECK_HPARAM("gemma-embedding.attention.head_count_kv", EI_N_HEAD_KV);
-    CHECK_HPARAM("gemma-embedding.attention.key_length",  EI_HEAD_DIM);
-    CHECK_HPARAM("gemma-embedding.attention.value_length", EI_HEAD_DIM);
-    CHECK_HPARAM("gemma-embedding.context_length",        EI_N_CTX);
-    #undef CHECK_HPARAM
-
-    m->rms_eps = (float)ei_gguf_kv_f64(g, "gemma-embedding.attention.layer_norm_rms_epsilon", 1e-6);
-    m->rope_base_full = (float)ei_gguf_kv_f64(g, "gemma-embedding.rope.freq_base", 1000000.0);
-    /* SWA layers train with their own (lower) rope base; absent key = 10000
-     * per llama.cpp's default for this arch. */
-    m->rope_base_swa = (float)ei_gguf_kv_f64(g, "gemma-embedding.rope.freq_base_swa", 10000.0);
-    m->swa_window = (uint32_t)ei_gguf_kv_u64(g, "gemma-embedding.attention.sliding_window", 512);
-    m->swa_period = (uint32_t)ei_gguf_kv_u64(g, "gemma-embedding.attention.sliding_window_pattern", 6);
-
-    m->token_embd  = want(g, "token_embd.weight", EI_T_Q8_0, EI_N_EMBD, EI_VOCAB);
-    m->output_norm = want_f32_vec(g, "output_norm.weight", EI_N_EMBD);
-
-    for (int il = 0; il < EI_N_LAYER; il++) {
-        char n[128];
-        ei_layer *L = &m->layers[il];
-        #define T(field, suffix, ty, a, b) do { \
-            snprintf(n, sizeof n, "blk.%d." suffix, il); \
-            L->field = want(g, n, ty, a, b); \
+            uint64_t v = ei_gguf_kv_u64(g, key, 0); \
+            if (v != (expect)) ei_die("%s: %s = %llu, engine is built for %llu", \
+                                      path, key, (unsigned long long)v, \
+                                      (unsigned long long)(expect)); \
         } while (0)
-        #define V(field, suffix, len) do { \
-            snprintf(n, sizeof n, "blk.%d." suffix, il); \
-            L->field = want_f32_vec(g, n, len); \
-        } while (0)
-        T(attn_q,      "attn_q.weight",      EI_T_Q4_0, EI_N_EMBD, EI_N_HEAD * EI_HEAD_DIM);
-        T(attn_k,      "attn_k.weight",      EI_T_Q4_0, EI_N_EMBD, EI_N_HEAD_KV * EI_HEAD_DIM);
-        T(attn_v,      "attn_v.weight",      EI_T_Q4_0, EI_N_EMBD, EI_N_HEAD_KV * EI_HEAD_DIM);
-        T(attn_output, "attn_output.weight", EI_T_Q4_0, EI_N_HEAD * EI_HEAD_DIM, EI_N_EMBD);
-        T(ffn_up,      "ffn_up.weight",      EI_T_Q4_0, EI_N_EMBD, EI_N_FF);
-        T(ffn_gate,    "ffn_gate.weight",    EI_T_Q4_0, EI_N_EMBD, EI_N_FF);
-        T(ffn_down,    "ffn_down.weight",    EI_T_Q4_0, EI_N_FF, EI_N_EMBD);
-        V(attn_norm,           "attn_norm.weight",           EI_N_EMBD);
-        V(attn_q_norm,         "attn_q_norm.weight",         EI_HEAD_DIM);
-        V(attn_k_norm,         "attn_k_norm.weight",         EI_HEAD_DIM);
-        V(post_attention_norm, "post_attention_norm.weight", EI_N_EMBD);
-        V(ffn_norm,            "ffn_norm.weight",            EI_N_EMBD);
-        V(post_ffw_norm,       "post_ffw_norm.weight",       EI_N_EMBD);
-        #undef T
-        #undef V
+
+        CHECK_HPARAM("gemma-embedding.block_count",           EI_N_LAYER);
+        CHECK_HPARAM("gemma-embedding.embedding_length",      EI_N_EMBD);
+        CHECK_HPARAM("gemma-embedding.feed_forward_length",   EI_N_FF);
+        CHECK_HPARAM("gemma-embedding.attention.head_count",  EI_N_HEAD);
+        CHECK_HPARAM("gemma-embedding.attention.head_count_kv", EI_N_HEAD_KV);
+        CHECK_HPARAM("gemma-embedding.attention.key_length",  EI_HEAD_DIM);
+        CHECK_HPARAM("gemma-embedding.attention.value_length", EI_HEAD_DIM);
+        CHECK_HPARAM("gemma-embedding.context_length",        EI_N_CTX);
+        #undef CHECK_HPARAM
+
+        m->rms_eps = (float)ei_gguf_kv_f64(g, "gemma-embedding.attention.layer_norm_rms_epsilon", 1e-6);
+        m->rope_base_full = (float)ei_gguf_kv_f64(g, "gemma-embedding.rope.freq_base", 1000000.0);
+        /* SWA layers train with their own (lower) rope base; absent key = 10000
+         * per llama.cpp's default for this arch. */
+        m->rope_base_swa = (float)ei_gguf_kv_f64(g, "gemma-embedding.rope.freq_base_swa", 10000.0);
+        m->swa_window = (uint32_t)ei_gguf_kv_u64(g, "gemma-embedding.attention.sliding_window", 512);
+        m->swa_period = (uint32_t)ei_gguf_kv_u64(g, "gemma-embedding.attention.sliding_window_pattern", 6);
+
+        m->token_embd  = want(g, "token_embd.weight", EI_T_Q8_0, EI_N_EMBD, EI_VOCAB);
+        m->output_norm = want_f32_vec(g, "output_norm.weight", EI_N_EMBD);
+
+        for (int il = 0; il < EI_N_LAYER; il++) {
+            char n[128];
+            ei_layer *L = &m->layers[il];
+            #define T(field, suffix, ty, a, b) do { \
+                snprintf(n, sizeof n, "blk.%d." suffix, il); \
+                L->field = want(g, n, ty, a, b); \
+            } while (0)
+            #define V(field, suffix, len) do { \
+                snprintf(n, sizeof n, "blk.%d." suffix, il); \
+                L->field = want_f32_vec(g, n, len); \
+            } while (0)
+            T(attn_q,      "attn_q.weight",      EI_T_Q4_0, EI_N_EMBD, EI_N_HEAD * EI_HEAD_DIM);
+            T(attn_k,      "attn_k.weight",      EI_T_Q4_0, EI_N_EMBD, EI_N_HEAD_KV * EI_HEAD_DIM);
+            T(attn_v,      "attn_v.weight",      EI_T_Q4_0, EI_N_EMBD, EI_N_HEAD_KV * EI_HEAD_DIM);
+            T(attn_output, "attn_output.weight", EI_T_Q4_0, EI_N_HEAD * EI_HEAD_DIM, EI_N_EMBD);
+            T(ffn_up,      "ffn_up.weight",      EI_T_Q4_0, EI_N_EMBD, EI_N_FF);
+            T(ffn_gate,    "ffn_gate.weight",    EI_T_Q4_0, EI_N_EMBD, EI_N_FF);
+            T(ffn_down,    "ffn_down.weight",    EI_T_Q4_0, EI_N_FF, EI_N_EMBD);
+            V(attn_norm,           "attn_norm.weight",           EI_N_EMBD);
+            V(attn_q_norm,         "attn_q_norm.weight",         EI_HEAD_DIM);
+            V(attn_k_norm,         "attn_k_norm.weight",         EI_HEAD_DIM);
+            V(post_attention_norm, "post_attention_norm.weight", EI_N_EMBD);
+            V(ffn_norm,            "ffn_norm.weight",            EI_N_EMBD);
+            V(post_ffw_norm,       "post_ffw_norm.weight",       EI_N_EMBD);
+            #undef T
+            #undef V
+        }
     }
 
     m->tok_tokens = want_arr(g, "tokenizer.ggml.tokens", EI_GGUF_STRING, EI_VOCAB);

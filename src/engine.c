@@ -1,10 +1,13 @@
 #include "engine.h"
+#include "gemma2.h"
 
 #if defined(EI_ENABLE_METAL)
 #include "engine_metal.h"
+#include "gemma2_metal.h"
 #endif
 #if defined(EI_ENABLE_CUDA)
 #include "engine_cuda.h"
+#include "gemma2_cuda.h"
 #endif
 #if defined(EI_ENABLE_ROCM)
 #include "engine_rocm.h"
@@ -26,6 +29,38 @@ void ei_engine_load_backend(ei_engine *e, const char *model_path, const char *ba
     ei_model_load(&e->model, model_path);
     ei_tokenizer_init(&e->tokenizer, &e->model);
     e->backend_name = "cpu";
+    if (e->model.embeddinggemma2) {
+        ei_gemma2_validate(&e->model.gguf);
+        const char *requested = backend && *backend ? backend : "auto";
+#if defined(EI_ENABLE_METAL)
+        if (!strcmp(requested, "auto") || !strcmp(requested, "metal")) {
+            char err[512];
+            e->gemma2_metal = ei_gemma2_metal_create(&e->model.gguf, err, sizeof err);
+            if (e->gemma2_metal) e->backend_name = "metal";
+            else if (!strcmp(requested, "metal")) ei_die("%s", err);
+            else fprintf(stderr, "Metal unavailable, using CPU: %s\n", err);
+        }
+#endif
+#if defined(EI_ENABLE_CUDA)
+        if (!strcmp(requested, "auto") || !strcmp(requested, "cuda")) {
+            char err[512];
+            e->gemma2_cuda = ei_gemma2_cuda_create(&e->model.gguf, err, sizeof err);
+            if (e->gemma2_cuda) e->backend_name = "cuda";
+            else if (!strcmp(requested, "cuda")) ei_die("%s", err);
+            else fprintf(stderr, "CUDA unavailable, using CPU: %s\n", err);
+        }
+#endif
+        // The CPU pool also serves media towers when a GPU runs the text tower.
+        if (e->gemma2_cuda) {
+            e->thread_pool = ei_thread_pool_create_spin(0, 50);
+            return;
+        }
+        if (!e->gemma2_metal && strcmp(requested, "auto") && strcmp(requested, "cpu"))
+            ei_die("EmbeddingGemma 2 backend '%s' is not available in this build", requested);
+        // Short CPU waves are wake-up bound; the gemma2 pool spins 50 us.
+        if (!e->gemma2_metal) e->thread_pool = ei_thread_pool_create_spin(0, 50);
+        return;
+    }
     e->short_projection_threads = 6;
     e->multirow_min_tokens = 512;
     const char *dual_projection = getenv("EI_CPU_DUAL_PROJECTION");
@@ -148,8 +183,13 @@ void ei_engine_load(ei_engine *e, const char *model_path) {
 void ei_engine_free(ei_engine *e) {
 #if defined(EI_ENABLE_METAL)
     ei_metal_engine_free(e->metal);
+    for (size_t i = 1; i < e->gemma2_slot_count; i++)
+        ei_gemma2_metal_free(e->gemma2_slots[i]);
+    ei_gemma2_metal_free(e->gemma2_media);
+    ei_gemma2_metal_free(e->gemma2_metal);
 #endif
 #if defined(EI_ENABLE_CUDA)
+    ei_gemma2_cuda_free(e->gemma2_cuda);
     ei_cuda_engine_free(e->cuda);
 #endif
 #if defined(EI_ENABLE_ROCM)
@@ -182,14 +222,14 @@ int32_t ei_engine_threads(const ei_engine *e) {
     return ei_thread_pool_threads(e->thread_pool);
 }
 
-static bool token_ids_valid(const int32_t *ids, size_t n, char *err, size_t err_len) {
+static bool token_ids_valid(const int32_t *ids, size_t n, size_t limit, char *err, size_t err_len) {
     if (n == 0) {
         set_err(err, err_len, "tokenizer produced no tokens");
         return false;
     }
-    if (n > EI_N_CTX) {
+    if (n > limit) {
         if (err && err_len) {
-            snprintf(err, err_len, "input has %zu tokens, maximum context is %d", n, EI_N_CTX);
+            snprintf(err, err_len, "input has %zu tokens, maximum context is %zu", n, limit);
         }
         return false;
     }
@@ -845,14 +885,33 @@ bool ei_engine_reserve(ei_engine *e, size_t total_tokens, size_t batch_size,
                                       err, err_len);
     }
 #endif
-    ensure_workspace(e, total_tokens);
+    if (!e->model.embeddinggemma2) ensure_workspace(e, total_tokens);
     if (err && err_len) err[0] = '\0';
     return true;
 }
 
 bool ei_engine_embed_tokens(ei_engine *e, const int32_t *ids, size_t n_tokens,
                             float out[EI_N_EMBD], char *err, size_t err_len) {
-    if (!token_ids_valid(ids, n_tokens, err, err_len)) return false;
+    if (!token_ids_valid(ids, n_tokens, e->model.embeddinggemma2 ? 8192 : EI_N_CTX, err, err_len))
+        return false;
+#if defined(EI_ENABLE_METAL)
+    if (e->gemma2_metal)
+        return ei_gemma2_metal_embed(e->gemma2_metal, ids, NULL, n_tokens, out, err, err_len);
+#endif
+#if defined(EI_ENABLE_CUDA)
+    if (e->gemma2_cuda) {
+        size_t offsets[2] = {0, n_tokens};
+        return ei_gemma2_cuda_batch(e->gemma2_cuda, ids, offsets, 1, out, err, err_len);
+    }
+#endif
+    if (e->model.embeddinggemma2 && ei_gemma2_cpu_fast()) {
+        size_t offsets[2] = {0, n_tokens};
+        return ei_gemma2_embed_batch_fast(&e->model.gguf, e->thread_pool, ids, NULL, offsets, 1,
+                                          out, err, err_len);
+    }
+    if (e->model.embeddinggemma2)
+        return ei_gemma2_embed(&e->model.gguf, e->thread_pool, ids, NULL, n_tokens, out, err,
+                               err_len);
 
 #if defined(EI_ENABLE_METAL)
     if (e->metal) {
@@ -918,7 +977,9 @@ bool ei_engine_embed_tokens_batch(ei_engine *e, const int32_t *ids,
     for (size_t sequence = 0; sequence < batch_size; sequence++) {
         size_t start = offsets[sequence];
         size_t stop = offsets[sequence + 1];
-        if (stop < start || !token_ids_valid(ids + start, stop - start, err, err_len)) {
+        if (stop < start ||
+            !token_ids_valid(ids + start, stop - start, e->model.embeddinggemma2 ? 8192 : EI_N_CTX,
+                             err, err_len)) {
             return false;
         }
     }
@@ -932,6 +993,8 @@ bool ei_engine_embed_tokens_batch(ei_engine *e, const int32_t *ids,
     }
 
 #if defined(EI_ENABLE_METAL)
+    if (e->gemma2_metal)
+        return ei_gemma2_metal_batch(e->gemma2_metal, ids, offsets, batch_size, out, err, err_len);
     if (e->metal) {
         return ei_metal_engine_embed_tokens_batch(
             e->metal, ids, offsets, batch_size, out, err, err_len);
@@ -956,8 +1019,15 @@ bool ei_engine_embed_tokens_batch(ei_engine *e, const int32_t *ids,
     }
 #endif
 
+#if defined(EI_ENABLE_CUDA)
+    if (e->gemma2_cuda)
+        return ei_gemma2_cuda_batch(e->gemma2_cuda, ids, offsets, batch_size, out, err, err_len);
+#endif
+    if (e->model.embeddinggemma2 && ei_gemma2_cpu_fast())
+        return ei_gemma2_embed_batch_fast(&e->model.gguf, e->thread_pool, ids, NULL, offsets,
+                                          batch_size, out, err, err_len);
     // Two one-token CPU requests do not amortize the packed-path setup.
-    if (total_tokens < 4) {
+    if (e->model.embeddinggemma2 || total_tokens < 4) {
         for (size_t sequence = 0; sequence < batch_size; sequence++) {
             size_t start = offsets[sequence];
             size_t count = offsets[sequence + 1] - start;
@@ -1019,4 +1089,48 @@ bool ei_engine_embed(ei_engine *e, const char *text, size_t len, float out[EI_N_
     bool ok = ei_engine_embed_tokens(e, toks.ids, toks.n, out, err, err_len);
     ei_tokens_free(&toks);
     return ok;
+}
+
+bool ei_engine_set_pipeline_slots(ei_engine *e, size_t slots, char *err, size_t err_len) {
+    if (slots == 0 || slots > EI_MAX_PIPELINE_SLOTS) {
+        set_err(err, err_len, "pipeline slots must be 1..8");
+        return false;
+    }
+    if (slots == 1) return true;
+#if defined(EI_ENABLE_METAL)
+    if (e->gemma2_metal) {
+        e->gemma2_slots[0] = e->gemma2_metal;
+        for (size_t i = 1; i < slots; i++)
+            if (!(e->gemma2_slots[i] = ei_gemma2_metal_clone(e->gemma2_metal, err, err_len)))
+                return false;
+        e->gemma2_slot_count = slots;
+        e->gemma2_media = ei_gemma2_metal_clone(e->gemma2_metal, err, err_len);
+        return e->gemma2_media != NULL;
+    }
+#endif
+    (void)e;
+    set_err(err, err_len, "pipeline slots > 1 require EmbeddingGemma 2 on Metal");
+    return false;
+}
+
+bool ei_engine_embed_tokens_batch_slot(ei_engine *e, size_t slot, const int32_t *ids,
+                                       const size_t *offsets, size_t batch_size,
+                                       float *out, char *err, size_t err_len) {
+#if defined(EI_ENABLE_METAL)
+    if (slot > 0 && slot < e->gemma2_slot_count) {
+        if (!offsets || batch_size == 0 || offsets[0] != 0) {
+            set_err(err, err_len, "batch offsets must start at zero");
+            return false;
+        }
+        for (size_t s = 0; s < batch_size; s++)
+            if (offsets[s + 1] < offsets[s] ||
+                !token_ids_valid(ids + offsets[s], offsets[s + 1] - offsets[s], 8192, err,
+                                 err_len))
+                return false;
+        return ei_gemma2_metal_batch(e->gemma2_slots[slot], ids, offsets, batch_size, out, err,
+                                     err_len);
+    }
+#endif
+    (void)slot;
+    return ei_engine_embed_tokens_batch(e, ids, offsets, batch_size, out, err, err_len);
 }

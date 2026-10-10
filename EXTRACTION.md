@@ -228,3 +228,72 @@ info: name string, n_dims u32 (≤4), ne i64×n_dims, type i32, offset u64
 - Norm weights pre-shifted (+1 baked in) — plain multiply.
 - Dense head absent — skip.
 - Mean pool includes bos/eos; serve L2-normalized.
+
+## EmbeddingGemma 2 native profile (2026-10-07)
+
+Reference checkout: llama.cpp `7481354a174714a3447ea0f8723c1dd1b3cbf8e2`,
+including PR #30054. New weights are pinned to Hugging Face revision
+`bfcd298762cc34d0357ece5ebdd31791a3a374d8` of
+`ggml-org/embeddinggemma-2-GGUF`:
+
+- Text Q8_0 SHA256: `2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135`.
+- Combined projector Q8_0 SHA256: `c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f`.
+
+Algorithm references in that checkout:
+
+- `src/models/gemma-embedding2.cpp`: 24-layer bidirectional transformer,
+  512 hidden channels, 2048 FFN channels, four query heads; head width 256
+  with two KV heads on SWA layers and 512 with one KV head on every sixth
+  full-attention layer. Q/K learned RMS norms, V unweighted RMS norm,
+  attention scale 1, symmetric SWA +/-512. Per-layer input projection is BF16,
+  even in the Q8_0 file. Per-layer gated projections, residual output scales,
+  final learned 512-to-768 projection, mean pooling and L2 normalization.
+- `src/llama-vocab.cpp`: Gemma4 BPE uses UTF-8 symbols, spaces escaped to
+  U+2581, ranked pair merges, newline-run splitting and SPM byte fallback.
+  The original profile continues to use score-based SentencePiece merging.
+- `tools/mtmd/models/gemma4v.cpp`, `tools/mtmd/clip.cpp`: native vision tower,
+  16 layers of width 768, 12 heads of width 64, 16x16 RGB patches, separate
+  X/Y learned positions and axial NEOX RoPE, 3x3 mean pooling, unweighted
+  pre-projection RMS and a 768-to-512 projection. This GGUF omits the GELU
+  flag, so the reference selects QuickGELU. The native implementation follows
+  the GGUF/reference behavior; it must not silently substitute the HF config's
+  tanh GELU. Input patches use the reference convolution's FP16 rounding.
+- `tools/mtmd/models/gemma4a.cpp`: two stride-2 convolutions followed by
+  12 width-1024 conformer layers; half-step SiLU FFNs, clipped projections,
+  causal chunked attention with relative position terms, depthwise causal
+  convolution, output 1536-to-512 projection. The conversion swaps the names
+  `norm_conv` and `conv_norm`; the native loader follows the reference mapping.
+- `tools/mtmd/mtmd-audio.cpp`: mono 16 kHz, 320-sample periodic Hann window,
+  FFT 512, hop 160, 128 HTK mel bins, magnitude spectrum and natural log
+  with floor 0.001, semicausal left padding and 30-second chunks.
+- `tools/mtmd/mtmd-image.cpp`: aspect-preserving 48-pixel alignment and
+  centered padding, separable antialiased Pillow-style bicubic interpolation.
+- Hugging Face Transformers `processing_embedding_gemma2.py`: image/audio
+  begin/end token IDs and video frame timestamps. The media encoder output
+  replaces soft-token positions without token-embedding scaling. BOS/EOS and
+  media delimiters participate in the same mean-pooled text backbone.
+
+`testdata/gemma2-goldens.json` records exact tokenizer IDs, reference text
+embeddings, raw encoder outputs, final media embeddings, and HTTP fixtures
+including image resize and audio feature extraction. Regenerate encoder
+fixtures with `testdata/generate_gemma2_reference.cpp`, linked only in a test
+program against the reference checkout's `mtmd`, `llama`, `ggml` and
+`ggml-base` libraries. Arguments are text GGUF, projector GGUF, and one of
+`vision`, `audio`, `image`, `wave`. Text fixtures use the reference server's
+`/tokenize` (`add_special=true`, `parse_special=false`) and `/v1/embeddings`
+with mean pooling and CPU inference.
+
+The server never links those libraries. `src/vendor/stb_image.h` is stb_image
+v2.30 from the reference checkout's vendor tree; its public-domain/MIT license
+is retained in the file. It provides image decoding only. The CPU graphs run
+in native C; the new Metal backend implements the same
+text, vision, and audio graphs with resident weights and GPU activations. Media
+decoding/resizing/mel preprocessing remains native CPU code.
+
+`src/gemma2_metal.m` dispatches model-specific kernels in
+`src/metal/kernels/gemma2.metal`. The opt-in Metal 4 tensor projection adapts
+the existing profile's packed-weight tile/matmul dispatch; the opt-in flash
+kernels adapt its 8-query/32-key online-softmax implementation for head
+widths 64, 256, and 512, grouped KV heads, axial vision positions, and packed
+sequence bounds. Both are independently owned native kernels with no ggml
+runtime dependency. CUDA/ROCm/XPU graphs for profile 2 remain pending.

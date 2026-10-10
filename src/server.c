@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "engine.h"
+#include "profiles.h"
+#include "media.h"
 #include "float_format.h"
 #include "http_docs.h"
 #include "inference_service.h"
@@ -10,6 +12,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/uio.h>
@@ -22,8 +25,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define MODEL_URL "https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/embeddinggemma-300M-qat-Q4_0.gguf"
-#define DEFAULT_MODEL_NAME "embeddinggemma-300m"
+static pthread_mutex_t inference_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define EMBEDDINGGEMMA_DEFAULT_PORT 42666
 #define MAX_BODY_BYTES (16u * 1024u * 1024u)
 #define MAX_HEADER_BYTES (64u * 1024u)
@@ -49,6 +51,7 @@ typedef struct {
 
 typedef struct {
     sv_string *items;
+    bool *structured;
     size_t n;
 } string_list;
 
@@ -73,12 +76,19 @@ typedef struct {
     int port;
     const char *backend;
     const char *model_path;
+    const char *projector_path;
+    const ei_profile *profile;
+    ei_engine *engine;
+    ei_gguf *projector;
+    bool profile_explicit;
+    bool batch_tokens_explicit;
     size_t workers;
     size_t max_queue;
     size_t cache_entries;
     size_t max_batch_tokens;
     size_t max_batch_requests;
     size_t max_batch_sequence_tokens;
+    size_t pipeline_slots;
     size_t max_client_batch_size;
     size_t tokenizer_workers;
     uint32_t batch_wait_us;
@@ -304,6 +314,8 @@ static bool parse_json_string(const char **p, sv_string *out, char *err, size_t 
 
 static bool append_input(string_list *list, sv_string s) {
     list->items = ei_xrealloc(list->items, sizeof(sv_string) * (list->n + 1u));
+    list->structured = ei_xrealloc(list->structured, sizeof(bool) * (list->n + 1));
+    list->structured[list->n] = false;
     list->items[list->n++] = s;
     return true;
 }
@@ -311,6 +323,7 @@ static bool append_input(string_list *list, sv_string s) {
 static void free_inputs(string_list *list) {
     for (size_t i = 0; i < list->n; i++) free(list->items[i].s);
     free(list->items);
+    free(list->structured);
     memset(list, 0, sizeof *list);
 }
 
@@ -329,6 +342,56 @@ static const char *find_json_field(const char *body, const char *name) {
     return NULL;
 }
 
+static bool parse_input_item(const char **p, string_list *inputs, char *err, size_t len) {
+    skip_ws(p);
+    if (**p == '"') {
+        sv_string value;
+        if (!parse_json_string(p, &value, err, len)) return false;
+        return append_input(inputs, value);
+    }
+    if (**p != '{') {
+        snprintf(err, len, "input must contain strings or content objects");
+        return false;
+    }
+    const char *start = *p;
+    char stack[32];
+    size_t depth = 0;
+    do {
+        char c = **p;
+        if (!c) {
+            snprintf(err, len, "unterminated input object");
+            return false;
+        }
+        if (c == '"') {
+            sv_string temp;
+            if (!parse_json_string(p, &temp, err, len)) return false;
+            free(temp.s);
+            continue;
+        }
+        if (c == '{' || c == '[') {
+            if (depth == sizeof stack) {
+                snprintf(err, len, "input nesting too deep");
+                return false;
+            }
+            stack[depth++] = c;
+        } else if (c == '}' || c == ']') {
+            if (!depth || stack[depth - 1] != (c == '}' ? '{' : '[')) {
+                snprintf(err, len, "invalid input nesting");
+                return false;
+            }
+            --depth;
+        }
+        ++*p;
+    } while (depth);
+    size_t n = (size_t)(*p - start);
+    char *copy = ei_xmalloc(n + 1);
+    memcpy(copy, start, n);
+    copy[n] = 0;
+    append_input(inputs, (sv_string){copy, n});
+    inputs->structured[inputs->n - 1] = true;
+    return true;
+}
+
 static bool parse_embed_request(const char *body, string_list *inputs,
                                 int32_t *dimensions, embedding_encoding *encoding,
                                 char *err, size_t err_len) {
@@ -338,32 +401,26 @@ static bool parse_embed_request(const char *body, string_list *inputs,
         return false;
     }
     skip_ws(&p);
-    if (*p == '"') {
-        sv_string s;
-        if (!parse_json_string(&p, &s, err, err_len)) return false;
-        append_input(inputs, s);
+    if (*p == '"' || *p == '{') {
+        if (!parse_input_item(&p, inputs, err, err_len)) return false;
     } else {
         if (*p != '[') {
-            snprintf(err, err_len, "input must be a string or an array of strings");
+            snprintf(err, err_len, "input must be a string, content object, or array");
             return false;
         }
-        p++;
-        skip_ws(&p);
-        if (*p == ']') {
-            snprintf(err, err_len, "input array must contain at least one string");
-            return false;
-        }
+        ++p;
         for (;;) {
-            sv_string s;
-            if (!parse_json_string(&p, &s, err, err_len)) return false;
-            append_input(inputs, s);
+            if (!parse_input_item(&p, inputs, err, err_len)) return false;
             skip_ws(&p);
-            if (*p == ']') break;
+            if (*p == ']') {
+                ++p;
+                break;
+            }
             if (*p != ',') {
                 snprintf(err, err_len, "expected comma or closing bracket in input array");
                 return false;
             }
-            p++;
+            ++p;
         }
     }
 
@@ -716,11 +773,13 @@ static void handle_tags(int fd, const server_opts *opts, bool keep_alive) {
     (void)opts;
     sbuf b = {0};
     sbuf_append_z(&b, "{\"models\":[{\"name\":");
-    sbuf_append_json_string(&b, DEFAULT_MODEL_NAME, strlen(DEFAULT_MODEL_NAME));
+    sbuf_append_json_string(&b, opts->profile->name, strlen(opts->profile->name));
     sbuf_append_z(&b, "}]}");
     http_response(fd, 200, "OK", b.data, keep_alive);
     free(b.data);
 }
+
+#include "http_media.h"
 
 static void handle_embed(int fd, ei_inference_service *service,
                          const server_opts *opts, const char *body,
@@ -788,9 +847,26 @@ static void handle_embed(int fd, ei_inference_service *service,
         lengths[i] = inputs.items[i].len;
     }
     size_t prompt_tokens = 0;
-    if (!ei_inference_service_embed_batch_with_usage(
-            service, texts, lengths, inputs.n, embeddings, &prompt_tokens,
-            err, sizeof err)) {
+    bool any_structured = false;
+    for (size_t i = 0; i < inputs.n; ++i)
+        any_structured |= inputs.structured[i];
+    bool embedded = true;
+    if (any_structured) {
+        for (size_t i = 0; i < inputs.n && embedded; ++i) {
+            size_t count = 0;
+            if (inputs.structured[i]) {
+                embedded = embed_structured(opts, &inputs.items[i], embeddings + i * EI_N_EMBD,
+                                            &count, err, sizeof err);
+            } else
+                embedded = ei_inference_service_embed_batch_with_usage(
+                    service, texts + i, lengths + i, 1, embeddings + i * EI_N_EMBD, &count, err,
+                    sizeof err);
+            prompt_tokens += count;
+        }
+    } else
+        embedded = ei_inference_service_embed_batch_with_usage(
+            service, texts, lengths, inputs.n, embeddings, &prompt_tokens, err, sizeof err);
+    if (!embedded) {
         free(embeddings);
         free(lengths);
         free(texts);
@@ -1002,7 +1078,7 @@ static char *resolve_model_path(const server_opts *opts) {
         root = path_join(home && *home ? home : ".", ".cache");
     }
     char *directory = path_join(root, "embeddinggemma.c");
-    char *model = path_join(directory, "embeddinggemma-300M-qat-Q4_0.gguf");
+    char *model = path_join(directory, opts->profile->file);
     free(directory);
     free(root);
     return model;
@@ -1085,7 +1161,7 @@ static downloader_result run_downloader(const char *program,
     return DOWNLOADER_FAILED;
 }
 
-static void download_model(const char *model_path) {
+static void download_model(const char *model_path, const char *url) {
     char *model_dir = dirname_copy(model_path);
     mkdir_p(model_dir);
     free(model_dir);
@@ -1105,14 +1181,25 @@ static void download_model(const char *model_path) {
         ei_die("cannot close temporary download file: %s", strerror(errno));
     }
 
-    fprintf(stderr, "model missing; downloading %s\n", MODEL_URL);
+    fprintf(stderr, "model missing; downloading %s\n", url);
     fprintf(stderr, "destination: %s\n", model_path);
 
     char *curl_arguments[] = {
-        "curl", "-fL", "--retry", "3", "--retry-delay", "1",
-        "--connect-timeout", "30", "--progress-bar",
-        "--user-agent", "embeddinggemma.c/1.0",
-        "-o", tmp_path, MODEL_URL, NULL,
+        "curl",
+        "-fL",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "1",
+        "--connect-timeout",
+        "30",
+        "--progress-bar",
+        "--user-agent",
+        "embeddinggemma.c/1.0",
+        "-o",
+        tmp_path,
+        (char *)url,
+        NULL,
     };
     downloader_result curl_result =
         run_downloader("curl", curl_arguments);
@@ -1120,8 +1207,7 @@ static void download_model(const char *model_path) {
     downloader_result wget_result = DOWNLOADER_UNAVAILABLE;
     if (curl_result != DOWNLOADER_SUCCEEDED) {
         char *wget_arguments[] = {
-            "wget", "--tries=3", "--timeout=30",
-            "-O", tmp_path, MODEL_URL, NULL,
+            "wget", "--tries=3", "--timeout=30", "-O", tmp_path, (char *)url, NULL,
         };
         wget_result = run_downloader("wget", wget_arguments);
     }
@@ -1152,9 +1238,9 @@ static void download_model(const char *model_path) {
     free(tmp_path);
 }
 
-static void ensure_model_available(const char *model_path) {
+static void ensure_model_available(const char *model_path, const char *url) {
     if (regular_file_exists(model_path)) return;
-    download_model(model_path);
+    download_model(model_path, url);
 }
 
 /* Fingerprint the model so a persisted cache is only reused with the exact
@@ -1191,20 +1277,21 @@ static void handle_stop_signal(int sig) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s [--bind ADDR] [--port PORT] [--backend auto|cpu|metal|cuda|rocm|xpu]\n"
-        "          [--model PATH] [--workers N] [--max-queue N]\n"
-        "          [--cache-entries N] [--max-batch-tokens N]\n"
-        "          [--max-batch-requests N]\n"
-        "          [--max-batch-sequence-tokens N]\n"
-        "          [--max-client-batch-size N] [--tokenizer-workers N]\n"
-        "          [--batch-wait-us N] [--keepalive-connections N]\n"
-        "          [--keepalive-max-requests N] [--keepalive-timeout-ms N]\n"
-        "          [--response-cache-mb N] [--persistent-cache-path PATH]\n"
-        "default listen: 0.0.0.0:%d\n"
-        "default model: $XDG_CACHE_HOME/embeddinggemma.c/%s\n"
-        "               or $HOME/.cache/embeddinggemma.c/%s\n",
-        argv0, EMBEDDINGGEMMA_DEFAULT_PORT, "embeddinggemma-300M-qat-Q4_0.gguf",
-        "embeddinggemma-300M-qat-Q4_0.gguf");
+            "usage: %s [--bind ADDR] [--port PORT] [--backend auto|cpu|metal|cuda|rocm|xpu]\n"
+            "          [--profile embeddinggemma-2|embeddinggemma-300m]\n"
+            "          [--model PATH] [--mmproj PATH] [--workers N] [--max-queue N]\n"
+            "          [--cache-entries N] [--max-batch-tokens N]\n"
+            "          [--max-batch-requests N]\n"
+            "          [--max-batch-sequence-tokens N]\n"
+            "          [--max-client-batch-size N] [--tokenizer-workers N]\n"
+            "          [--batch-wait-us N] [--keepalive-connections N]\n"
+            "          [--keepalive-max-requests N] [--keepalive-timeout-ms N]\n"
+            "          [--response-cache-mb N] [--persistent-cache-path PATH]\n"
+            "          [--pipeline-slots N]  (embeddinggemma-2 Metal waves in flight, 1..8)\n"
+            "default listen: 0.0.0.0:%d\n"
+            "default model: $XDG_CACHE_HOME/embeddinggemma.c/%s\n"
+            "               or $HOME/.cache/embeddinggemma.c/%s\n",
+            argv0, EMBEDDINGGEMMA_DEFAULT_PORT, ei_profiles[0].file, ei_profiles[0].file);
 }
 
 static bool parse_size_arg(const char *value, size_t minimum, size_t maximum,
@@ -1224,12 +1311,19 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
     opts->port = EMBEDDINGGEMMA_DEFAULT_PORT;
     opts->backend = DEFAULT_INFERENCE_BACKEND;
     opts->model_path = NULL;
+    opts->projector_path = NULL;
+    opts->profile = &ei_profiles[0];
+    opts->engine = NULL;
+    opts->projector = NULL;
+    opts->profile_explicit = false;
+    opts->batch_tokens_explicit = false;
     opts->workers = 64;
     opts->max_queue = 256;
     opts->cache_entries = 4096;
-    opts->max_batch_tokens = 4096;
+    opts->max_batch_tokens = 8192;
     opts->max_batch_requests = 64;
     opts->max_batch_sequence_tokens = 1024;
+    opts->pipeline_slots = 1;
     opts->max_client_batch_size = 32;
     opts->tokenizer_workers = 8;
     opts->batch_wait_us = 200;
@@ -1253,6 +1347,12 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
                 strcmp(opts->backend, "hip") != 0 &&
                 strcmp(opts->backend, "xpu") != 0 &&
                 strcmp(opts->backend, "sycl") != 0) return false;
+        } else if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) {
+            opts->profile = ei_profile_find(argv[++i]);
+            opts->profile_explicit = true;
+            if (!opts->profile) return false;
+        } else if (strcmp(argv[i], "--mmproj") == 0 && i + 1 < argc) {
+            opts->projector_path = argv[++i];
         } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             opts->model_path = argv[++i];
         } else if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
@@ -1264,46 +1364,41 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
         } else if (strcmp(argv[i], "--max-batch-tokens") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], EI_N_CTX, 65536,
                                 &opts->max_batch_tokens)) return false;
+            opts->batch_tokens_explicit = true;
         } else if (strcmp(argv[i], "--max-batch-requests") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 1, 256,
                                 &opts->max_batch_requests)) return false;
-        } else if (strcmp(argv[i], "--max-batch-sequence-tokens") == 0 &&
-                   i + 1 < argc) {
-            if (!parse_size_arg(argv[++i], 1, EI_N_CTX,
-                                &opts->max_batch_sequence_tokens)) return false;
-        } else if (strcmp(argv[i], "--max-client-batch-size") == 0 &&
-                   i + 1 < argc) {
+        } else if (strcmp(argv[i], "--pipeline-slots") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, EI_MAX_PIPELINE_SLOTS, &opts->pipeline_slots))
+                return false;
+        } else if (strcmp(argv[i], "--max-batch-sequence-tokens") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 8192, &opts->max_batch_sequence_tokens)) return false;
+        } else if (strcmp(argv[i], "--max-client-batch-size") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 1, 256,
                                 &opts->max_client_batch_size)) return false;
-        } else if (strcmp(argv[i], "--tokenizer-workers") == 0 &&
-                   i + 1 < argc) {
+        } else if (strcmp(argv[i], "--tokenizer-workers") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 0, 64,
                                 &opts->tokenizer_workers)) return false;
         } else if (strcmp(argv[i], "--batch-wait-us") == 0 && i + 1 < argc) {
             size_t value;
             if (!parse_size_arg(argv[++i], 0, 1000000, &value)) return false;
             opts->batch_wait_us = (uint32_t)value;
-        } else if (strcmp(argv[i], "--keepalive-connections") == 0 &&
-                   i + 1 < argc) {
+        } else if (strcmp(argv[i], "--keepalive-connections") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 0, 255,
                                 &opts->keepalive_connections)) return false;
             keepalive_connections_set = true;
-        } else if (strcmp(argv[i], "--keepalive-max-requests") == 0 &&
-                   i + 1 < argc) {
+        } else if (strcmp(argv[i], "--keepalive-max-requests") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 1, 1000000,
                                 &opts->keepalive_max_requests)) return false;
-        } else if (strcmp(argv[i], "--keepalive-timeout-ms") == 0 &&
-                   i + 1 < argc) {
+        } else if (strcmp(argv[i], "--keepalive-timeout-ms") == 0 && i + 1 < argc) {
             size_t value;
             if (!parse_size_arg(argv[++i], 1, 60000, &value)) return false;
             opts->keepalive_timeout_ms = (uint32_t)value;
-        } else if (strcmp(argv[i], "--response-cache-mb") == 0 &&
-                   i + 1 < argc) {
+        } else if (strcmp(argv[i], "--response-cache-mb") == 0 && i + 1 < argc) {
             size_t value;
             if (!parse_size_arg(argv[++i], 0, 4096, &value)) return false;
             opts->response_cache_bytes = value * 1024u * 1024u;
-        } else if (strcmp(argv[i], "--persistent-cache-path") == 0 &&
-                   i + 1 < argc) {
+        } else if (strcmp(argv[i], "--persistent-cache-path") == 0 && i + 1 < argc) {
             opts->persistent_cache_path = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
@@ -1433,8 +1528,22 @@ static void *server_worker_main(void *opaque) {
 static bool execute_engine_batch(void *opaque, const int32_t *ids,
                                  const size_t *offsets, size_t batch_size,
                                  float *out, char *err, size_t err_len) {
-    return ei_engine_embed_tokens_batch(
-        opaque, ids, offsets, batch_size, out, err, err_len);
+    ei_engine *engine = opaque;
+    if (!engine->model.embeddinggemma2)
+        return ei_engine_embed_tokens_batch(engine, ids, offsets, batch_size, out, err, err_len);
+    pthread_mutex_lock(&inference_mutex);
+    bool ok = ei_engine_embed_tokens_batch(opaque, ids, offsets, batch_size, out, err, err_len);
+    pthread_mutex_unlock(&inference_mutex);
+    return ok;
+}
+
+// Pipeline slots: each slot owns a separate engine context, and media runs on
+// its own context, so text waves need no global lock.
+static bool execute_engine_batch_slot(void *opaque, size_t slot, const int32_t *ids,
+                                      const size_t *offsets, size_t batch_size, float *out,
+                                      char *err, size_t err_len) {
+    return ei_engine_embed_tokens_batch_slot(opaque, slot, ids, offsets, batch_size, out, err,
+                                             err_len);
 }
 
 int main(int argc, char **argv) {
@@ -1447,11 +1556,38 @@ int main(int argc, char **argv) {
     }
 
     char *model_path = resolve_model_path(&opts);
-    ensure_model_available(model_path);
+    ensure_model_available(model_path, opts.profile->url);
+    /* --model remains compatible with existing scripts; identify its profile. */
+    ei_gguf probe;
+    ei_gguf_open(&probe, model_path);
+    const ei_kv *arch = ei_gguf_kv(&probe, "general.architecture", true);
+    bool second = arch->type == EI_GGUF_STRING && arch->v.s.len == strlen("gemma-embedding2") &&
+                  !memcmp(arch->v.s.str, "gemma-embedding2", arch->v.s.len);
+    ei_gguf_close(&probe);
+    const ei_profile *detected = &ei_profiles[second ? 0 : 1];
+    if (opts.profile_explicit && opts.profile != detected)
+        ei_die("--profile and model architecture disagree");
+    opts.profile = detected;
+    if (!opts.batch_tokens_explicit) opts.max_batch_tokens = second ? 8192 : 4096;
+
+    if (!second && opts.projector_path) ei_die("--mmproj requires embeddinggemma-2");
 
     fprintf(stderr, "loading model: %s\n", model_path);
     ei_engine engine;
     ei_engine_load_backend(&engine, model_path, opts.backend);
+    opts.engine = &engine;
+    ei_gguf projector = {0};
+    if (second) {
+        char *dir = dirname_copy(model_path);
+        char *path = opts.projector_path ? dup_z(opts.projector_path)
+                                         : path_join(dir, opts.profile->projector_file);
+        free(dir);
+        ensure_model_available(path, opts.profile->projector_url);
+        ei_gguf_open(&projector, path);
+        ei_gemma2_validate_projector(&projector);
+        opts.projector = &projector;
+        free(path);
+    }
     uint64_t cache_fingerprint = opts.persistent_cache_path
         ? model_fingerprint(model_path) : 0;
     free(model_path);
@@ -1461,6 +1597,9 @@ int main(int argc, char **argv) {
                            reserve_error, sizeof reserve_error)) {
         ei_die("cannot reserve inference workspace: %s", reserve_error);
     }
+    if (!ei_engine_set_pipeline_slots(&engine, opts.pipeline_slots, reserve_error,
+                                      sizeof reserve_error))
+        ei_die("cannot create pipeline slots: %s", reserve_error);
     ei_inference_service_config service_config = {
         .cache_entries = opts.cache_entries,
         .max_batch_tokens = opts.max_batch_tokens,
@@ -1470,6 +1609,8 @@ int main(int argc, char **argv) {
         .batch_wait_us = opts.batch_wait_us,
         .cache_path = opts.persistent_cache_path,
         .cache_fingerprint = cache_fingerprint,
+        .pipeline_slots = opts.pipeline_slots,
+        .execute_slot = opts.pipeline_slots > 1 ? execute_engine_batch_slot : NULL,
     };
     ei_inference_service *service = ei_inference_service_create(
         &engine.tokenizer, execute_engine_batch, &engine, &service_config);
@@ -1515,15 +1656,14 @@ int main(int argc, char **argv) {
         ei_die("listen failed: %s", strerror(errno));
     }
 
-    fprintf(stderr, "embeddinggemma.c serving %s on http://%s:%d (%s backend, "
-                    "%zu workers, %zu batch tokens, %zu-token packing cutoff, "
-                    "%zu cache entries, %zu keep-alive connections, "
-                    "%zu MiB response cache)\n",
-            DEFAULT_MODEL_NAME, opts.bind_host, opts.port, ei_engine_backend(&engine),
-            opts.workers, opts.max_batch_tokens,
-            opts.max_batch_sequence_tokens, opts.cache_entries,
-            opts.keepalive_connections,
-            opts.response_cache_bytes / (1024u * 1024u));
+    fprintf(stderr,
+            "embeddinggemma.c serving %s on http://%s:%d (%s backend, "
+            "%zu workers, %zu batch tokens, %zu-token packing cutoff, "
+            "%zu cache entries, %zu keep-alive connections, "
+            "%zu MiB response cache)\n",
+            opts.profile->name, opts.bind_host, opts.port, ei_engine_backend(&engine), opts.workers,
+            opts.max_batch_tokens, opts.max_batch_sequence_tokens, opts.cache_entries,
+            opts.keepalive_connections, opts.response_cache_bytes / (1024u * 1024u));
 
     /* Graceful shutdown so the persistent cache is flushed. sigaction without
      * SA_RESTART makes accept() return EINTR when a stop signal arrives. */

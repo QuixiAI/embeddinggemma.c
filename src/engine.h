@@ -6,10 +6,19 @@
 #include "quants.h"
 #include "tokenizer.h"
 
+#define EI_MAX_PIPELINE_SLOTS 8
+
 typedef struct {
     ei_model model;
     ei_tokenizer tokenizer;
     void *metal;
+    void *gemma2_metal;
+    /* Pipeline slots 1.. (slot 0 is gemma2_metal) and a dedicated media
+     * context, created by ei_engine_set_pipeline_slots. */
+    void *gemma2_slots[EI_MAX_PIPELINE_SLOTS];
+    size_t gemma2_slot_count;
+    void *gemma2_media;
+    void *gemma2_cuda;
     void *cuda;
     void *rocm;
     void *xpu;
@@ -49,5 +58,13 @@ bool ei_engine_embed_tokens(ei_engine *e, const int32_t *ids, size_t n_tokens,
 bool ei_engine_embed_tokens_batch(ei_engine *e, const int32_t *ids,
                                   const size_t *offsets, size_t batch_size,
                                   float *out, char *err, size_t err_len);
+/* Overlapping waves for EmbeddingGemma 2 on Metal: slots > 1 creates per-slot
+ * queues/workspaces sharing the weights. Other backends accept only 1. */
+bool ei_engine_set_pipeline_slots(ei_engine *e, size_t slots, char *err, size_t err_len);
+/* Like ei_engine_embed_tokens_batch on pipeline slot `slot` (< slot count);
+ * distinct slots may run concurrently from different threads. */
+bool ei_engine_embed_tokens_batch_slot(ei_engine *e, size_t slot, const int32_t *ids,
+                                       const size_t *offsets, size_t batch_size,
+                                       float *out, char *err, size_t err_len);
 
 #endif /* EI_ENGINE_H */

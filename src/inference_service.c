@@ -57,7 +57,8 @@ struct ei_inference_service {
     void *execute_opaque;
     ei_inference_service_config config;
 
-    pthread_t backend_thread;
+    pthread_t *backend_threads;
+    size_t slots;
     pthread_t *tokenizer_threads;
     size_t tokenizer_thread_count;
     pthread_mutex_t mutex;
@@ -67,7 +68,8 @@ struct ei_inference_service {
     bool adaptive_batch_wait;
     bool batch_wave;
     bool solo_inline;
-    bool backend_busy;
+    size_t busy_slots;
+    uint32_t slot_mask;
     uint64_t batch_hot_until_ns;
     uint64_t batch_hot_window_ns;
     uint64_t batch_wait_cap_ns;
@@ -91,8 +93,43 @@ struct ei_inference_service {
     ei_inference_service_stats stats;
 };
 
+static size_t context_limit(const ei_tokenizer *tokenizer) {
+    return tokenizer && tokenizer->model && tokenizer->model->embeddinggemma2 ? 8192 : EI_N_CTX;
+}
+
 static void set_error(char *err, size_t err_len, const char *message) {
     if (err && err_len) snprintf(err, err_len, "%s", message);
+}
+
+static bool backend_full(const ei_inference_service *service) {
+    return service->busy_slots >= service->slots;
+}
+
+static size_t claim_slot_locked(ei_inference_service *service) {
+    size_t slot = 0;
+    while (service->slot_mask & (1u << slot)) slot++;
+    if (slot >= service->slots) ei_die("inference service claimed slot %zu of %zu", slot,
+                                       service->slots);
+    service->slot_mask |= 1u << slot;
+    service->busy_slots++;
+    return slot;
+}
+
+static void release_slot_locked(ei_inference_service *service, size_t slot) {
+    service->slot_mask &= ~(1u << slot);
+    service->busy_slots--;
+    // Another backend thread may be waiting for a free slot.
+    if (service->slots > 1) pthread_cond_broadcast(&service->queue_ready);
+}
+
+static bool run_execute(ei_inference_service *service, size_t slot, const int32_t *ids,
+                        const size_t *offsets, size_t batch_size, float *out, char *err,
+                        size_t err_len) {
+    if (service->config.execute_slot)
+        return service->config.execute_slot(service->execute_opaque, slot, ids, offsets,
+                                            batch_size, out, err, err_len);
+    return service->execute(service->execute_opaque, ids, offsets, batch_size, out, err,
+                            err_len);
 }
 
 static size_t next_power_of_two(size_t value) {
@@ -320,20 +357,23 @@ static void *tokenizer_main(void *opaque) {
 
 static void *backend_main(void *opaque) {
     ei_inference_service *service = opaque;
+    uint64_t last_end = 0;
     size_t max_requests = service->config.max_batch_requests;
     cache_entry **batch = ei_xmalloc(sizeof(*batch) * max_requests);
     size_t *offsets = ei_xmalloc(sizeof(*offsets) * (max_requests + 1));
-    int32_t *ids = ei_xmalloc(sizeof(*ids) * service->config.max_batch_tokens);
+    size_t capacity = service->config.max_batch_tokens;
+    if (capacity < context_limit(service->tokenizer)) capacity = context_limit(service->tokenizer);
+    int32_t *ids = ei_xmalloc(sizeof(*ids) * capacity);
     float *output = ei_xmalloc(sizeof(*output) * max_requests * EI_N_EMBD);
 
     pthread_mutex_lock(&service->mutex);
     for (;;) {
-        // backend_busy also covers a solo inline execution on a worker
-        // thread; dispatching concurrently would race on the engine. Inline
-        // completion always signals queue_ready, so waiting on busy is safe
-        // even during shutdown.
+        // Busy slots also cover solo inline executions on worker threads;
+        // dispatching onto a busy slot would race on its engine context.
+        // Releasing a slot always signals queue_ready, so waiting on a full
+        // backend is safe even during shutdown.
         while ((!service->queue_head && !service->stopping) ||
-               service->backend_busy) {
+               backend_full(service)) {
             pthread_cond_wait(&service->queue_ready, &service->mutex);
         }
         if (!service->queue_head) break;
@@ -365,6 +405,9 @@ static void *backend_main(void *opaque) {
             }
         }
 
+        // With several backend threads, others (and solo inline runs) may have
+        // taken the queue or every slot while this one waited for the wave.
+        if (!service->queue_head || backend_full(service)) continue;
         size_t batch_size = 0;
         size_t total_tokens = 0;
         offsets[0] = 0;
@@ -433,12 +476,24 @@ static void *backend_main(void *opaque) {
             memcpy(ids + offsets[i], batch[i]->ids,
                    batch[i]->n_tokens * sizeof(*ids));
         }
-        service->backend_busy = true;
+        size_t slot = claim_slot_locked(service);
         pthread_mutex_unlock(&service->mutex);
 
+        // Diagnostic: EI_WAVE_LOG=1 prints each wave and the backend idle gap
+        // (time this thread spent since its previous wave finished).
+        static int wave_log = -1;
+        if (wave_log < 0) wave_log = getenv("EI_WAVE_LOG") != NULL;
+        uint64_t exec_start = wave_log ? monotonic_ns() : 0;
         char error[256];
-        bool ok = service->execute(service->execute_opaque, ids, offsets,
-                                   batch_size, output, error, sizeof error);
+        bool ok = run_execute(service, slot, ids, offsets, batch_size, output, error,
+                              sizeof error);
+        if (wave_log) {
+            uint64_t exec_end = monotonic_ns();
+            fprintf(stderr, "wave slot=%zu seqs=%zu tokens=%zu exec=%.3fms gap=%.3fms busy=%zu\n",
+                    slot, batch_size, total_tokens, (exec_end - exec_start) / 1e6,
+                    last_end ? (exec_start - last_end) / 1e6 : 0.0, service->busy_slots);
+            last_end = exec_end;
+        }
 
         if (ok) {
             for (size_t i = 0; i < batch_size; i++) {
@@ -447,7 +502,7 @@ static void *backend_main(void *opaque) {
             }
         }
         pthread_mutex_lock(&service->mutex);
-        service->backend_busy = false;
+        release_slot_locked(service, slot);
         service->active_peak = service->active_requests;
         service->stats.batches++;
         service->stats.sequences += batch_size;
@@ -508,8 +563,8 @@ static void load_persistent_cache(ei_inference_service *service) {
         uint64_t hash = 0;
         uint32_t n_tokens = 0;
         if (fread(&hash, sizeof hash, 1, file) != 1 ||
-            fread(&n_tokens, sizeof n_tokens, 1, file) != 1 ||
-            n_tokens == 0 || n_tokens > EI_N_CTX) {
+            fread(&n_tokens, sizeof n_tokens, 1, file) != 1 || n_tokens == 0 ||
+            n_tokens > context_limit(service->tokenizer)) {
             break; /* truncated or corrupt: keep what loaded cleanly */
         }
         cache_entry *entry = ei_xcalloc(1, sizeof(*entry));
@@ -611,10 +666,10 @@ ei_inference_service *ei_inference_service_create(
     const ei_tokenizer *tokenizer, ei_inference_execute_fn execute,
     void *execute_opaque, const ei_inference_service_config *config) {
     if (!execute || !config || config->max_batch_tokens < EI_N_CTX ||
-        config->max_batch_requests == 0 ||
-        config->max_batch_sequence_tokens == 0 ||
-        config->max_batch_sequence_tokens > EI_N_CTX ||
-        (config->tokenizer_workers > 0 && !tokenizer)) {
+        config->max_batch_requests == 0 || config->max_batch_sequence_tokens == 0 ||
+        config->max_batch_sequence_tokens > context_limit(tokenizer) ||
+        (config->tokenizer_workers > 0 && !tokenizer) ||
+        config->pipeline_slots > 32 || (config->pipeline_slots > 1 && !config->execute_slot)) {
         return NULL;
     }
     ei_inference_service *service = ei_xcalloc(1, sizeof(*service));
@@ -661,9 +716,11 @@ ei_inference_service *ei_inference_service_create(
             }
         }
     }
-    if (pthread_create(&service->backend_thread, NULL, backend_main, service) != 0) {
-        ei_die("failed to create inference backend thread");
-    }
+    service->slots = config->pipeline_slots > 1 ? config->pipeline_slots : 1;
+    service->backend_threads = ei_xmalloc(service->slots * sizeof(*service->backend_threads));
+    for (size_t i = 0; i < service->slots; i++)
+        if (pthread_create(&service->backend_threads[i], NULL, backend_main, service) != 0)
+            ei_die("failed to create inference backend thread %zu", i);
     return service;
 }
 
@@ -671,9 +728,11 @@ void ei_inference_service_free(ei_inference_service *service) {
     if (!service) return;
     pthread_mutex_lock(&service->mutex);
     service->stopping = true;
-    pthread_cond_signal(&service->queue_ready);
+    pthread_cond_broadcast(&service->queue_ready);
     pthread_mutex_unlock(&service->mutex);
-    pthread_join(service->backend_thread, NULL);
+    for (size_t i = 0; i < service->slots; i++)
+        pthread_join(service->backend_threads[i], NULL);
+    free(service->backend_threads);
 
     pthread_mutex_lock(&service->tokenizer_mutex);
     service->tokenizer_stopping = true;
@@ -714,7 +773,7 @@ static cache_entry *submit_tokens_locked(ei_inference_service *service,
             lru_push_front(service, entry);
         } else if (entry->state == EI_ENTRY_PENDING) {
             service->stats.coalesced_requests++;
-            if (service->backend_busy || service->queue_head) {
+            if (service->busy_slots || service->queue_head) {
                 mark_batch_hot(service);
             }
         }
@@ -733,7 +792,7 @@ static cache_entry *submit_tokens_locked(ei_inference_service *service,
     }
     entry->hash_next = *slot;
     *slot = entry;
-    if (service->queue_head || service->backend_busy) mark_batch_hot(service);
+    if (service->queue_head || service->busy_slots) mark_batch_hot(service);
     if (service->queue_tail) service->queue_tail->queue_next = entry;
     else service->queue_head = entry;
     service->queue_tail = entry;
@@ -744,7 +803,7 @@ static cache_entry *submit_tokens_locked(ei_inference_service *service,
 
 static bool try_execute_solo_locked(ei_inference_service *service,
                                     cache_entry *entry) {
-    if (!service->solo_inline || service->backend_busy) return false;
+    if (!service->solo_inline || backend_full(service)) return false;
     if (entry->state != EI_ENTRY_PENDING) return false;
     if (service->queue_head != entry || entry->queue_next) return false;
     if (service->queued_requests != 1) return false;
@@ -752,17 +811,16 @@ static bool try_execute_solo_locked(ei_inference_service *service,
     service->queue_head = NULL;
     service->queue_tail = NULL;
     service->queued_requests = 0;
-    service->backend_busy = true;
+    size_t slot = claim_slot_locked(service);
     pthread_mutex_unlock(&service->mutex);
 
     size_t offsets[2] = {0, entry->n_tokens};
     float output[EI_N_EMBD];
     char error[256];
-    bool ok = service->execute(service->execute_opaque, entry->ids, offsets,
-                               1, output, error, sizeof error);
+    bool ok = run_execute(service, slot, entry->ids, offsets, 1, output, error, sizeof error);
 
     pthread_mutex_lock(&service->mutex);
-    service->backend_busy = false;
+    release_slot_locked(service, slot);
     service->active_peak = service->active_requests;
     service->stats.batches++;
     service->stats.sequences++;
@@ -777,7 +835,7 @@ static bool try_execute_solo_locked(ei_inference_service *service,
         snprintf(entry->error, sizeof entry->error, "%s", error);
     }
     pthread_cond_broadcast(&entry->done);
-    // The backend waits out backend_busy (including during shutdown); wake
+    // The backend waits out busy slots (including during shutdown); wake
     // it so it can drain anything that queued during the inline run.
     pthread_cond_signal(&service->queue_ready);
     prune_cache(service);
@@ -803,8 +861,8 @@ bool ei_inference_service_embed_tokens(ei_inference_service *service,
                                        const int32_t *ids, size_t n_tokens,
                                        float out[EI_N_EMBD],
                                        char *err, size_t err_len) {
-    if (!service || !ids || n_tokens == 0 || n_tokens > EI_N_CTX) {
-        set_error(err, err_len, "input token count must be 1..2048");
+    if (!service || !ids || n_tokens == 0 || n_tokens > context_limit(service->tokenizer)) {
+        set_error(err, err_len, "input token count exceeds the selected profile context limit");
         return false;
     }
     pthread_mutex_lock(&service->mutex);
@@ -890,11 +948,11 @@ bool ei_inference_service_embed_batch_with_usage(
         }
     }
     for (size_t i = 0; i < batch_size; i++) {
-        if (tokens[i].n == 0 || tokens[i].n > EI_N_CTX) {
+        if (tokens[i].n == 0 || tokens[i].n > context_limit(service->tokenizer)) {
             for (size_t j = 0; j < batch_size; j++) ei_tokens_free(&tokens[j]);
             free(entries);
             free(tokens);
-            set_error(err, err_len, "input token count must be 1..2048");
+            set_error(err, err_len, "input token count exceeds the selected profile context limit");
             return false;
         }
     }

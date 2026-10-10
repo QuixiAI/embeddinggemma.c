@@ -2717,3 +2717,416 @@ repeat/re-index/eval workloads.
 
 - CUDA and ROCm SwiGLU->quant fusion (neutral / -45%), ROCm default graph
   capture (neutral / -1.5% mixed). Kept opt-in-off or not landed.
+
+## 2026-10-07: EmbeddingGemma 2 native Metal graphs
+
+Status: implemented and validated on Apple M5 Max. The Metal executable now
+selects Metal for the default EmbeddingGemma 2 profile. Native text, vision,
+and audio graphs use resident Q8/BF16/F32 GGUF weights and reusable GPU
+workspaces; sampled video frames use the vision graph. Image decoding,
+resizing, and WAV/log-mel preprocessing remain on the CPU. Production does
+not link llama.cpp, ggml, or mtmd. Other accelerator ports for this profile
+remain pending.
+
+Packed text inference resets RoPE positions per sequence, masks attention at
+sequence boundaries, and pools each sequence separately. Packing is bounded
+to 8192 total tokens per GPU graph, with larger batches split into waves.
+The default FP32 Metal 3.1 path preserves the CPU reference graph. New numeric
+optimizations follow the repository's default-off policy:
+
+- `EI_GEMMA2_METAL_TENSOR=1`: Metal 4 64x64 projection tiles from 32 tokens,
+  decoding packed Q8/BF16/F32 weights into FP16 tiles; FP32 activations and
+  accumulation. Applies to text, vision, and audio projections.
+- `EI_GEMMA2_METAL_FLASH=1`: 8-query/32-key tiled attention from 128 tokens,
+  specialized for vision width 64 and text widths 256/512, grouped KV heads,
+  and packed sequence bounds. FP16 Q/K/V, FP32 probabilities and accumulation.
+- `EI_GEMMA2_METAL_PROFILE=1`: CPU encoding/GPU/total timing diagnostics.
+
+Hardware/toolchain: M5 Max, macOS 26.6.2 (25G83), Xcode 27.0 (27A266a),
+Apple clang 21.0.0, Metal Toolchain 27A266a. Working tree based on `55964e2`,
+with the uncommitted second-profile implementation. The Xcode Metal component
+was missing after the toolchain update and was installed before compilation.
+
+Measured full-graph latency, averaging medians from direct/optimized and
+optimized/direct order, two warmups and five iterations per cell, two seconds
+between runs. These compare two native implementations of the new profile,
+not llama.cpp or the original 300M model:
+
+| tokens | direct FP32 (ms) | tensor + flash (ms) | speedup |
+|---:|---:|---:|---:|
+| 1 | 4.096 | 4.062 | 1.01x |
+| 32 | 27.277 | 26.191 | 1.04x |
+| 512 | 455.198 | 29.877 | 15.24x |
+| 2048 | 2157.080 | 79.212 | 27.23x |
+
+At T32, packed batches of 4 and 16 took 25.250/29.975 ms versus
+104.973/420.149 ms serialized (4.16x/14.02x), minimum cosine 0.999965310.
+The batch harness alternates measurement order within each cell. Raw runs:
+`perf/results/gemma2-metal-2026-10-07/` (ignored). CPU encoding measured about
+0.2 ms versus 26-30 ms GPU time at T32/T512: no graph-capture work was added.
+These are engine measurements; the original profile's 54-cell HTTP claims
+must not be applied to this profile.
+
+Correctness:
+
+- Reference fixtures: text minimum cosine 0.999720425. Direct vision tower
+  0.999124900, final vision embedding 0.999815996; audio tower 0.999920276,
+  final audio embedding 0.999738263. Both optimized flags also pass every
+  reference gate (minimum raw vision cosine 0.999109421).
+- Direct/optimized text routes at 1, 7, 31, 32, 33, 127, 128, 129, 512,
+  1025, 2048, and 8192 tokens: minimum cosine 0.999991856.
+- Mixed packed batches spanning both thresholds: direct self-parity 1.0;
+  optimized minimum 0.999968472. Larger vision/audio route comparisons pass.
+- `make test-gemma2-metal` and the same suite with both flags enabled:
+  all HTTP modalities, mixed inputs, dimensions, concurrency, limits, and
+  default-profile selection pass. The helper asserts the selected backend.
+- `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 make test-gemma2-metal-routes`
+  passes. Validation initially exposed its doubled shadow-memory footprint
+  exceeding 32 KiB for the 512-wide flash kernel. Its disjoint FP32 output
+  accumulator tiles now use device scratch, keeping threadgroup use below
+  16 KiB and preserving parity and measured throughput.
+- Original-profile `make test-metal test-http-metal`, CPU `make test`, and
+  `make check` pass. Original Metal packed parity remains 0.999956071.
+
+Retain both optimized paths as opt-in. No new-model performance claim against
+llama.cpp has been established. Short-request latency and further media
+throughput tuning remain separate measured optimization work.
+
+## 2026-10-09: EmbeddingGemma 2 batched-serving Metal stack
+
+Status: implemented behind default-off flags (`EI_GEMMA2_METAL_GEMV`, `_FUSED`,
+`_TENSOR2`, `_FLASH2`) and `--pipeline-slots N`; byte-identical when off.
+Design and ceilings: `perf/gemma2_kernel_design.md`. Target is the hardware
+ceiling under concurrent load, not llama.cpp (single-request design); llama.cpp
+rows below are context only.
+
+Host: M5 Max (6P+12E, 128 GB), macOS 26.6.2, AC power. A resident VM (~11%
+memory) and the user's single-core compiler builds ran throughout; engine A/Bs
+are back-to-back in one process (`make bench-gemma2-metal`, median of 3-7), so
+both sides see the same conditions.
+
+Why the default path did not scale: `g2_mm` is one simdgroup per (row, token)
+with no weight reuse across tokens, so packing four 32-token requests cost what
+four separate requests cost. HTTP default at 32 tokens: 36.6 emb/s at c1, 42.9
+at c16 (llama.cpp 127 / 766). Ablation (`EI_GEMMA2_METAL_SKIP`) showed a T=1
+forward was a ~600-dispatch dependency chain at ~7-10 us per dispatch.
+
+Retained, each measured against the route before it (engine, ms):
+
+| step | 1x1 | 32x1 | 32x4 | 128x1 | 32x16 | 512x4 | 2048x1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| default | 4.1 | 27.2 | 94.7 | 100.7 | 367 | - | 2157 (10-07) |
+| + GEMV (weight-stationary, 4 rows x 8 tokens/decode) | 3.0 | 7.1 | 13.6 | 24.2 | - | - | - |
+| + FUSED (25 -> 11 dispatches/layer) | 2.24 | 6.7 | 14.0 | 20.1 | 44.3 | - | - |
+| old TENSOR+FLASH (10-07 opt-in) | 4.05 | 26.2 | 25.4 | 25.3 | 30.0 | 79.7 | 79.6 |
+| + TENSOR2 (fp16 row-major matmul2d, relaxed) + FLASH | 2.25 | 6.9 | 5.9 | 5.9 | 12.4 | 59.5 | 59.4 |
+| + FLASH2 (matmul2d flash) | 2.24 | 5.4 | 5.6 | 5.9 | 8.7 | 31.5 | 42.1 |
+
+8192x1: 487.7 -> 277.7 ms (1.76x) for FLASH2 over the old flash. At 2048 tokens
+the GEMMs run ~15 ms (~37 TFLOPS of the 43-55 matmul2d ceiling); attention is
+the remaining majority. GEMV/TENSOR2 crossover ~36 tokens (default 40);
+FLASH2 from 16 tokens; 64-token GEMM tiles from 256 tokens.
+
+Rejected or superseded (engine A/B vs old TENSOR+FLASH unless noted):
+
+- matmul2d with a native int8 operand and per-32-group scales applied to a
+  temporary cooperative tensor (SlimServe's uint4 recipe): 16 tokens 17.7 ms vs
+  GEMV 3.8; 512 tokens 58 ms vs 30. One K=32 matmul2d per group plus the scale
+  pass is far too fine-grained once compute-bound (SlimServe's win was
+  bandwidth-bound decode). `char` is rejected by MPP; `int8_t` compiles.
+- fp16 dense weights in a tile-major [k][64] layout, strict precision:
+  2048x1 0.93x. K step 32/64/128: no difference.
+- fp16 activation copies for the GEMM (+1 dispatch): no gain over fp32
+  device operands (512x1 13.2 vs 13.6 ms), so activations stay fp32.
+- The winner differs from the above only in row-major weights read as a
+  transposed operand plus `relaxed_precision`: 2048x1 1.32x, 512x1 2.24x.
+- A routing bug (the BF16 PLE projection falling to `g2_mm`; 32..39-token
+  waves sending every weight to the old tile kernel) briefly looked like a GEMM
+  regression; ablation found both.
+
+Concurrency (engine, `EI_BENCH_STREAMS`, separate queue + workspace per
+stream, same route): aggregate scaling for 2 / 3 streams was 1.75x / 2.00x at
+1x1, 1.82x / 2.05x at 32x4, 1.38x / 1.37x at 32x16, 1.04x / 1.06x at 512x4.
+Independent command buffers overlap on the GPU when they share no written
+resources, exactly SlimServe's in-flight lesson; small latency-bound waves gain
+most. This motivated `--pipeline-slots`: per-slot clones of the Metal context
+(shared device, pipelines, weights), N backend threads in the inference
+service, and media on its own context so text waves skip the global lock.
+
+Correctness with `FUSED,TENSOR2,FLASH2`:
+`EI_GEMMA2_ROUTE_FLAGS=FUSED,TENSOR2,FLASH2 make test-gemma2-metal-routes`
+passes (text 1..8192 >= 0.999991682; packed self-parity >= 0.999947736;
+vision >= 0.999999157; audio >= 0.999999075). `make test-gemma2-metal` with the
+flags passes; goldens unchanged (text 0.999720429, vision 0.999815995, audio
+0.999738334). A 3-slot server matched a 1-slot server on 64 concurrent texts
+and an image to 0.999999676.
+
+### Follow-ups the same day
+
+- fp16 K/V written by `g2_qkv_post` when FLASH2 runs (drops two conversion
+  dispatches per layer): 512x4 31.5 -> 30.6 ms, 2048x1 42.1 -> 40.8 ms. Kept.
+- Rejected: folding each post-norm/residual into the next GEMV's prologue
+  (8 dispatches/layer instead of 11, ping-pong residual buffers). 1x1 2.33 ->
+  2.38 ms; 8..39 tokens 2-3.7x slower: every simdgroup rebuilt its inputs with
+  scalar loads and per-element weight-type switches. Removing 72 dispatches
+  also bought nothing at T=1, so the earlier "~7 us per dispatch" ablation
+  over-attributed launch cost; the short kernels themselves dominate.
+- `--pipeline-slots`: a fix was needed first (a backend thread could claim a
+  slot after its wave-collection wait while others had taken them all; the
+  out-of-range slot fell back to slot 0 and two waves shared a context:
+  `EmbeddingGemma 2 Metal: (null)` at 8 tokens x c32). Interleaved A/B on one
+  binary (1,3,3,1 slots per shape, 4 s each):
+
+  | ~tokens | c4 | c16 | c32 |
+  |---:|---:|---:|---:|
+  | 4 | 0.84x | 0.72x | 0.67x |
+  | 30 | 1.01x | 0.72x | 0.85x |
+  | 128 | 1.02x | 0.99x | 1.05x |
+  | 512 | 1.01x | 0.99x | 1.02x |
+
+  The single-slot collector already packs every waiting request into one
+  wave; packing four tiny sequences costs about one, while overlapping waves
+  only recovers latency (engine overlap 1.75x). Separate HTTP matrix runs are
+  not comparable across time on this busy host (the 1-slot 128 x c32 dip to
+  327 emb/s did not reproduce: 547 emb/s in a direct run). Kept opt-in;
+  the hypothesis left is mixed traffic (short requests behind long waves),
+  which needs an admission rule and a mixed-load benchmark.
+
+HTTP, 1 slot, `FUSED,TENSOR2,FLASH2` (`perf/results/gemma2-2026-10-09/
+new-stack-slots1`, both orders, llama.cpp as context): emb/s
+
+| tokens | c1 | c4 | c16 | c32 |
+|---:|---:|---:|---:|---:|
+| 8 | 256.6 | 527.1 | 1,638.2 | 2,731.3 |
+| 32 | 181.0 | 428.6 | 1,145.3 | 1,678.9 |
+| 128 | 165.2 | 318.7 | 453.8 | 326.9 |
+| 512 | 90.5 | 104.1 | 109.1 | 90.2 |
+| 2,048 | 22.0 | 20.1 | 18.4 | 14.3 |
+
+Default path at 8/32 tokens x c16 was 164.6 / 42.9 emb/s (10x / 27x).
+Geomean 1.35x llama.cpp, range 0.97x-1.78x (the 0.97x is the 128 x c32 cell
+above).
+
+## 2026-10-09: EmbeddingGemma 2 CPU fast path and pool spin
+
+`EI_GEMMA2_CPU_FAST=1` (`src/gemma2_fast.c`), `EI_POOL_SPIN_US`. M5 Max,
+18 threads, user builds running; `make bench-gemma2-cpu`, median of 5, ms:
+
+| case | reference | fast | + short width 6 | + spin 50 us |
+|---|---:|---:|---:|---:|
+| 1x1 | 21.1 | 20.1 | 5.9 | 1.45 |
+| 8x1 | 40.2 | 25.6 | 10.2 | 4.9 |
+| 32x1 | 93.4 | 32.0 | 36.0 | 8.4 |
+| 32x16 | 1504 | 148.5 | 146 | 89 |
+
+Findings:
+
+- Short waves were thread-wake bound: 168 GEMM calls per forward each woke
+  up to 17 workers through per-worker condition variables (~100 us per call).
+  Fewer tasks (6) and then spinning workers fixed it. The spin pool needed
+  generation and participant count published as one 64-bit ticket: a worker
+  that sat out one call could otherwise pair its generation with the next
+  call's participant count and steal a completion (observed hang).
+- GELU `tanhf` was 25M scalar calls at 512 tokens; a NEON exp-based tanh
+  took row kernels 40.6 -> 29.9 ms there.
+- The PLE projection converted BF16 per element through a type switch;
+  NEON widening is small at 1 token (19.4 -> 17.6 ms before the width fix).
+- Accuracy: both CPU graphs quantize activations to Q8, so on BOS-less text
+  windows each sits 0.98-0.999 from the FP32 Metal path, and from each other;
+  the fast path tracks Metal as closely as the reference (`metal-fast` vs
+  `metal-ref` within +-0.005 at 1-64 tokens; bit-identical at 1 token).
+  Random ids exaggerate this (0.93). Goldens: text 0.999733 (fast) vs
+  0.999720 (reference Metal); `make test-gemma2` passes with the fast path,
+  with and without spin; `make test` (300M CPU) passes with and without spin.
+- Remaining CPU work: the Q8 GEMM runs ~1.5 TOPS at 512 tokens against a
+  ~4.5 TOPS `sdot` estimate; next are i8mm (`smmla`) with load-time
+  interleaved weights, then an SME2 experiment, then attention tiling.
+
+## 2026-10-09 (evening): second round, media, and new defaults
+
+Engine A/Bs, M5 Max, one process, median of 5-7 (`make bench-gemma2-metal`):
+
+- Metal RoPE tables in `g2_qkv_post` (two bases, 8192 positions, ~24 MB):
+  ~2-3% at 512x4/2048x1, at the noise edge; kept (removes ~38M
+  transcendentals per 2048-token forward).
+- GEMM epilogues on the wide route: FFN up/gate interleaved per 64-row tile
+  so `gelu(gate)*up` is written from the tile (threadgroup staging), and the
+  PLE gate fused into `inp_gate`: 512x4 29.6 -> 27.0 ms (1.10x), 2048x1 39.8
+  -> 37.1 ms (1.07x), short waves neutral to +4%.
+- Flash tile sweep (`EI_GEMMA2_METAL_FLASH2_TILE`): 32 queries x 128 keys
+  1.06x (512x4), 1.10x (2048x1), 1.16x (8192x1) over 32x64; 64x64 on 8
+  simdgroups 0.98-1.02x; 64x128 needs 49.9 KB threadgroup memory (> 32 KB).
+  32x128 is the default. Cumulative: 512x4 30.5 -> 25.4 ms (81k tok/s), 2048x1
+  40.7 -> 33.6 ms (61k tok/s).
+- Rejected: folding `post_add` into the GEMV prologue (earlier entry); a
+  full-row (N = 512) GEMM tile to fold `post_add` into the wide GEMM was not
+  built: it spills (128 floats/thread at TM 32) or exceeds threadgroup memory.
+- MPP also offers `reduce_rows` and `get_left_input_cooperative_tensor`
+  (destination -> left operand), which would allow a register-resident flash
+  attention without the S/P threadgroup round trip; not yet tried.
+
+Media (`build-dev/probe/media.c`, per call, ms):
+
+| | default | 10-07 TENSOR+FLASH | new stack |
+|---|---:|---:|---:|
+| vision 432x432 (81 tokens) | 642 | 27 | 12.5 |
+| vision 768x768 (256 tokens) | 2,676 | 81 | 59 |
+| audio 30 s (750 tokens) | 1,136 | 52 | 23.5 |
+
+- Before the fixes the new stack was 3-10x slower than the 10-07 routes on
+  vision: width-64 attention fell back to the scalar kernel and projector
+  weights to the old tile GEMM. Projector weights now get fp16 copies at
+  first use (audio 46 -> 24 ms); width-64 attention uses the simdgroup flash
+  kernel because every `g2t_flash<64, ...>` instantiation (32x128 and 32x64)
+  crashes the driver at first dispatch (`AGX::RayPayloadSizeAlignImpl::
+  merge`, EXC_BAD_ACCESS, macOS 26.6.2).
+- The media HTTP path held the global inference lock for JSON parsing,
+  base64/image decoding, resizing and log-mel; the lock now covers only the
+  engine calls. 768x768 PNG at c8: 16.0 img/s (62 ms/image), i.e. GPU-bound.
+- An earlier probe sweep reporting identical media times for every flag set
+  was a harness error (flags not applied); disregard it.
+
+CPU (`make bench-gemma2-cpu`, spin 50 us, ms):
+
+| case | reference | sdot | + i8mm | + f32 tile, attention tiles |
+|---|---:|---:|---:|---:|
+| 1x1 | 21.1 | 1.40 | - | 1.34 |
+| 8x1 | 40.2 | 4.51 | 3.29 | 3.0 |
+| 32x4 | 359 | 25.0 | 18.3 | 15.2 |
+| 32x16 | 1,504 | 88.8 | 64.6 | 54 |
+| 512x1 | 1,059 | 158.5 | 133.2 | 81 |
+
+- `smmla` on row-pair-interleaved weights: Q8 GEMM ~1.5 -> ~4.4 TOPS at 512
+  tokens (31.7 ms). Activations are paired per call.
+- The BF16 PLE projection, one dot per (row, token): 12.5 -> 4.3 ms with a
+  4x4 register tile.
+- Attention: 8-query blocks per head with 4x4 Q.K^T register tiles and P.V
+  in registers across the key loop: 512x1 72 -> 28 ms, 2048x1 655 -> 284 ms.
+
+Defaults (end of day): Metal FUSED, TENSOR2, FLASH2 on (TENSOR2/FLASH2 where
+Metal 4 is available); CPU fast graph and i8mm on; the gemma2 CPU pool spins
+50 us (the 300M pool is unchanged). Validation with no flags set:
+`make test-gemma2-metal`, `make test-gemma2-metal-routes` (default stack vs
+all off: text 1..8192 >= 0.99998, packed >= 0.99996, vision >= 0.9999987,
+audio >= 0.999999), `make test-gemma2` (CPU), `make test` (300M CPU),
+`make test-metal test-http-metal` (300M Metal packed parity 0.999956071, as
+before). With FUSED/TENSOR2/FLASH2 = 0 the goldens equal the 10-07 values to
+9 digits.
+
+HTTP with the shipped defaults, no flags (`perf/results/gemma2-2026-10-09/
+defaults`, both orders; llama.cpp as context): emb/s
+
+| tokens | c1 | c4 | c16 | c32 |
+|---:|---:|---:|---:|---:|
+| 8 | 256.3 | 528.8 | 1,692.0 | 2,760.5 |
+| 32 | 185.1 | 449.2 | 1,178.4 | 1,804.0 |
+| 128 | 176.9 | 349.4 | 602.1 | 641.5 |
+| 512 | 103.5 | 98.6 | 94.4 | 74.7 |
+| 2,048 | 21.6 | 14.7 | 18.8 | 17.5 |
+
+1.00x-1.90x llama.cpp, geomean 1.46x (no cell below 1.00x). Against the
+default path of the morning: 8 tokens x c16 164.6 -> 1,692 (10.3x), 32 x c16
+42.9 -> 1,178 (27.5x).
+
+Sustained versus burst: at 512 tokens x c16 the service forms 15-sequence
+(7,173-token) waves plus a lone 16th request. In a 20 s continuous engine
+loop the 15-sequence wave takes 98-145 ms against 88.5 ms in a short burst,
+recovering after idle (GPU clocks and contention on this shared host, not a
+leak). The HTTP rows at 512+ tokens reflect that sustained rate; the lone
+tail wave costs ~3% and was left alone.
+
+## 2026-10-09 (night): EmbeddingGemma 2 on CUDA (RTX 5090)
+
+Host `eric-5090`: RTX 5090 (sm_120, 32 GB), driver 595.91, CUDA 13.3, gcc 15.
+The user's vLLM service (`slimserve-affine-king`) was stopped for this work.
+New `src/gemma2_cuda.cu` (text tower; media towers still run on the CPU pool):
+
+- fp16 row-major copies of every text GEMM weight (Q/K/V and up/gate
+  concatenated), cuBLAS `GemmEx` fp16 x fp16 -> fp32 at every wave size, fused
+  row kernels writing fp16 GEMM inputs (embed, PLE norm, RMS, q/k/v norm +
+  RoPE table, post-norm sandwich, GeGLU, PLE gate, pool), CUDA graphs keyed by
+  (tokens, sequences) with bounds/positions in device buffers.
+- Attention: varlen flash on raw `mma.sync.m16n8k16` (FlashAttention-2 style:
+  per-row online softmax in registers, S accumulators reused as the P.V A
+  operand, K row-major and V transposed in shared memory). Final shape: 8
+  warps (128 queries per K/V tile) x 32 keys, Q fragments from global/L1,
+  width 512 split into two 256-wide output halves.
+  `EI_GEMMA2_CUDA_MMA_ATTN=0` selects the CUDA-core kernel.
+
+`make bench-gemma2-cuda`-style harness (`build/bench_gemma2_cuda`, natural-text
+windows, median of 9, ms):
+
+| wave | CUDA-core attn | mma 4w/2w | mma 8w (final) | tok/s (final) |
+|---|---:|---:|---:|---:|
+| 1x1 | 0.69 | 0.76 | 0.76 | 1.3k |
+| 32x16 | 2.07 | 2.10 | ~2.1 | ~245k |
+| 128x16 | 8.57 | 6.09 | 5.64 | 363k |
+| 512x16 | 69.9 | 32.9 | 24.7 | 332k |
+| 2048x1 | 39.4 | 18.1 | 11.6 | 176k |
+| 8192x1 | 308.6 | 153.2 | 59.5 | 138k |
+
+Route parity (mma vs CUDA-core attention, same process): >= 0.99997 at
+1..8192 tokens; packed vs single >= 0.99995. `make test-gemma2-cuda`
+(goldens + HTTP, CPU media towers): text 0.999725, vision embedding 0.999858,
+audio embedding 0.999765, HTTP suite passed. 300M `make test-cuda` passes on
+sm_120.
+
+Sweep notes: 4 warps x 64 keys with staged Q exceeded the ~99 KB shared
+limit (the first attempt also called `cudaFuncSetAttribute` inside graph
+capture, which broke the capture: cuBLAS status 14); width 512 at 2 warps was
+5.7x a width-256 layer for 2x the FLOPs; 8 warps with Q from L1 fixed it.
+At 512x16 the per-forward profile is GEMMs ~8.8 ms (near tensor-core peak),
+attention ~5.0, post_add 1.9, GeGLU 1.3, qkv_post 0.8.
+
+HTTP (`perf/loadgen.c`, keep-alive, default server flags, 5 s per cell):
+
+| tokens | c1 req/s | c16 req/s | c64 req/s | c64 tok/s |
+|---:|---:|---:|---:|---:|
+| 10 | 1,066 | 8,334 | 15,408 | 154k |
+| 38 | 815 | 3,634 | 5,891 | 224k |
+| 158 | 414 | 1,229 | 1,418 | 224k |
+| 733 | 134 | 257 | 280 | 205k |
+
+Linux portability caught on the box: `clock_gettime` under `-std=c11` needs
+`_POSIX_C_SOURCE` on glibc (now set on Linux only; on macOS it hides
+`_SC_NPROCESSORS_ONLN` and BSD types); `gguf.h` lacks `extern "C"` guards, so
+C++ users include it inside one.
+
+Pending for CUDA: vision/audio towers on the GPU (the CPU pool runs them;
+x86 has no AVX2 path in the fast CPU graph yet), RTX 3090 (sm_86) validation.
+
+### CUDA media towers (same night)
+
+Vision and audio towers ported from the Metal graphs into `gemma2_cuda.cu`:
+projector weights converted to fp16 (GEMM) / fp32 (norms, convs, position
+tables) on first use, audio clamps fused into the fp16 conversion before each
+GEMM and applied after it, width-generic row kernels, the `mma.sync` flash
+kernel generalized to a head count (vision: 12 heads x 64, one sequence), a
+warp-per-(token, head) kernel for the 12-key causal relative attention with
+the 50 tanh soft cap, and the per-layer relative position projection computed
+once. HTTP on the 5090, one request at a time: 768x768 image 5,472 -> 20.6
+ms, 30 s audio 3,538 -> 84 ms (including CPU log-mel); 8 concurrent image
+clients 81 img/s. Goldens: vision tower 0.999140, vision embedding 0.999817,
+audio tower 0.999920, audio embedding 0.999736.
+
+Bug found on the way: outputs varied run to run (vision tower cosine 0.74 to
+0.94). Weight uploads used `cudaMemcpy` from pageable memory, which may return
+before its DMA lands, on the legacy default stream, which does not order with
+the engine's non-blocking stream; lazily uploaded projector weights raced the
+kernels reading them. Uploads now go through `cudaMemcpyAsync` on the engine
+stream followed by a stream synchronize. Inserting diagnostic synchronizes hid
+the race, which is how it was located.
+
+### CUDA portability (3090 / 5090 without per-GPU tuning)
+
+One source for sm_80+ GPUs; nothing assumes the 5090. `mma.sync m16n8k16` is
+compiled only for sm_80+ (fat builds also cover sm_75); tensor-core attention
+is enabled from queried device properties (compute capability >= 8 and opt-in
+shared memory >= the largest flash tile, ~54 KB, within the 3090's 99 KB),
+otherwise a generic CUDA-core kernel (any head count, optional bounds, widths
+64/256/512) serves text and vision. Verified on the 5090: the default fat
+build compiles for sm_75..sm_121 + PTX; `EI_GEMMA2_CUDA_MMA_ATTN=0` passes all
+goldens and the HTTP suite (vision tower 0.999131 through the generic width-64
+kernel). Running sm_86 code on the 5090 through PTX JIT was not possible:
+driver 595.91 (CUDA 13.2) rejects PTX from the 13.3 toolchain ("unsupported
+toolchain"), so 3090 execution itself remains unverified here.

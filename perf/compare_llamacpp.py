@@ -278,9 +278,12 @@ def generate_exact_prompts(endpoint: Endpoint, token_counts: list[int],
     return prompts
 
 
+REQUEST_MODEL = "embeddinggemma-300m"
+
+
 def request_body(api: str, prompt: str, encoding_format: str) -> bytes:
     body: dict[str, object] = {
-        "model": "embeddinggemma-300m",
+        "model": REQUEST_MODEL,
         "input": prompt,
         "encoding_format": encoding_format,
     }
@@ -517,8 +520,22 @@ def main() -> int:
                         help="seconds to settle between the two engines within "
                              "a cell so the second is not measured on a hot "
                              "host; also inserted between A/B passes")
+    parser.add_argument("--request-model", default="embeddinggemma-300m",
+                        help="model name sent in request bodies, e.g. "
+                             "embeddinggemma-2")
+    parser.add_argument("--max-model-tokens", type=int, default=2048,
+                        help="longest request the model accepts (8192 for "
+                             "embeddinggemma-2)")
+    parser.add_argument("--record-losses", action="store_true",
+                        help="record cells llama.cpp wins instead of "
+                             "re-measuring and aborting; for baselines")
+    parser.add_argument("--embeddinggemma-args", default="",
+                        help="extra space-separated server arguments, e.g. "
+                             "'--pipeline-slots 3'")
     parser.add_argument("--out-dir", type=Path)
     args = parser.parse_args()
+    global REQUEST_MODEL
+    REQUEST_MODEL = args.request_model
     if args.target_seconds <= 0 or args.min_rounds <= 0 or args.max_rounds < args.min_rounds:
         parser.error("invalid timing or round limits")
     if (args.quiet_cpu_percent <= 0 or args.quiet_memory_percent <= 0 or
@@ -526,8 +543,8 @@ def main() -> int:
         parser.error("invalid quiet-host thresholds")
     if max(args.concurrency) > 32:
         parser.error("this comparison configures llama.cpp with 32 slots")
-    if max(args.token_counts) > 2048:
-        parser.error("EmbeddingGemma supports at most 2048 tokens")
+    if max(args.token_counts) > args.max_model_tokens:
+        parser.error(f"the model supports at most {args.max_model_tokens} tokens")
     if args.llama_batch_tokens < max(args.token_counts):
         parser.error("llama.cpp's batch must fit the longest embedding request")
     if args.llama_context_tokens < max(args.token_counts):
@@ -563,7 +580,7 @@ def main() -> int:
         str(embeddinggemma_bin), "--model", str(model), "--bind", "127.0.0.1",
         "--port", str(embeddinggemma_endpoint.port), "--workers", "64",
         "--cache-entries", "0", "--response-cache-mb", "0",
-    ]
+    ] + args.embeddinggemma_args.split()
 
     embeddinggemma_rows: list[dict[str, int | float | str]] = []
     llamacpp_rows: list[dict[str, int | float | str]] = []
@@ -645,7 +662,7 @@ def main() -> int:
             }
             ours = float(final["embeddinggemma.c"]["embeddings_per_s"])
             llama = float(final["llama.cpp"]["embeddings_per_s"])
-            if llama > ours:
+            if llama > ours and not args.record_losses:
                 loss_attempts += 1
                 if loss_attempts >= args.loss_retries:
                     raise RuntimeError(

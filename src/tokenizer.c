@@ -246,6 +246,25 @@ void ei_tokenizer_init(ei_tokenizer *tok, const ei_model *model) {
             special_push(tok, id, attr);
         }
     }
+    if (model->embeddinggemma2) {
+        const ei_kv *merges = ei_gguf_kv(&model->gguf, "tokenizer.ggml.merges", true);
+        tok->merges_cap = next_pow2((size_t)merges->arr_n * 2);
+        tok->merges = xcalloc(tok->merges_cap, sizeof(*tok->merges));
+        for (uint64_t i = 0; i < merges->arr_n; ++i) {
+            ei_str key;
+            ei_gguf_arr_str(merges, i, &key);
+            uint64_t h = hash_bytes(key.str, key.len);
+            size_t at = h & (tok->merges_cap - 1);
+            while (tok->merges[at].key) {
+                if (tok->merges[at].len == key.len &&
+                    !memcmp(tok->merges[at].key, key.str, key.len))
+                    break;
+                at = (at + 1) & (tok->merges_cap - 1);
+            }
+            if (!tok->merges[at].key)
+                tok->merges[at] = (ei_vocab_slot){key.str, key.len, h, (int32_t)i, -(float)i};
+        }
+    }
     qsort(tok->specials, tok->special_n, sizeof(ei_special_token), special_cmp);
 }
 
@@ -254,6 +273,7 @@ void ei_tokenizer_free(ei_tokenizer *tok) {
     free(tok->owned_keys);
     free(tok->specials);
     free(tok->vocab);
+    free(tok->merges);
     memset(tok, 0, sizeof *tok);
 }
 
@@ -423,7 +443,27 @@ static void try_add_bigram(spm_session *s, int left, int right) {
     spm_symbol *ls = &s->symbols[left];
     spm_symbol *rs = &s->symbols[right];
     size_t len = ls->n + rs->n;
-    const ei_vocab_slot *slot = vocab_lookup(s->tok, ls->text, len);
+    const ei_vocab_slot *slot = NULL;
+    if (s->tok->merges) {
+        if (memchr(ls->text, '\n', len)) return;
+        char *key = xmalloc(len + 1);
+        memcpy(key, ls->text, ls->n);
+        key[ls->n] = ' ';
+        memcpy(key + ls->n + 1, rs->text, rs->n);
+        uint64_t h = hash_bytes(key, len + 1);
+        size_t at = h & (s->tok->merges_cap - 1);
+        while (s->tok->merges[at].key) {
+            const ei_vocab_slot *candidate = &s->tok->merges[at];
+            if (candidate->hash == h && candidate->len == len + 1 &&
+                !memcmp(candidate->key, key, len + 1)) {
+                slot = candidate;
+                break;
+            }
+            at = (at + 1) & (s->tok->merges_cap - 1);
+        }
+        free(key);
+    } else
+        slot = vocab_lookup(s->tok, ls->text, len);
     if (!slot) return;
     heap_push(&s->heap, (spm_bigram){ left, right, slot->score, len });
     rev_put(&s->rev, ls->text, len, left, right);
@@ -559,7 +599,23 @@ void ei_tokenize_spm(const ei_tokenizer *tok, const char *text, size_t len,
             char *escaped = escape_whitespace(text + f.off, f.len,
                                               tok->model->add_space_prefix && is_prev_special,
                                               &esc_len);
-            spm_tokenize_escaped(tok, escaped, esc_len, &ids);
+            if (tok->merges) {
+                size_t start = 0;
+                while (start < esc_len) {
+                    bool newline = escaped[start] == '\n';
+                    size_t end = start + 1;
+                    while (end < esc_len && (escaped[end] == '\n') == newline)
+                        ++end;
+                    int32_t id =
+                        newline ? ei_tokenizer_text_to_id(tok, escaped + start, end - start) : -1;
+                    if (id >= 0)
+                        ids_push(&ids, id);
+                    else
+                        spm_tokenize_escaped(tok, escaped + start, end - start, &ids);
+                    start = end;
+                }
+            } else
+                spm_tokenize_escaped(tok, escaped, esc_len, &ids);
             free(escaped);
             is_prev_special = false;
         }

@@ -1,7 +1,17 @@
 # Agent guide for embeddinggemma.c
 
-A tiny, model-specialized EmbeddingGemma-300M server with hand-tuned inference
-kernels per accelerator (CPU, Metal, CUDA, ROCm, XPU/SYCL). Model-specialization
+A model-specialized server with two startup profiles. `embeddinggemma-2` is
+the default and supports text, images, mono 16 kHz WAV audio, sampled video
+frames, and mixed inputs using native CPU and Metal inference. `embeddinggemma-300m`
+retains the original hand-tuned CPU, Metal, CUDA, ROCm, and XPU/SYCL kernels.
+The new profile does not link llama.cpp or ggml. `README.md` documents its
+content-object API; `EXTRACTION.md` records its reference graph and goldens.
+`make test-gemma2` exercises the new tokenizer, graph, media, and HTTP paths.
+`make test-gemma2-metal` tests the default Metal path;
+`make test-gemma2-metal-routes` tests Metal 4 routes and packed sequence isolation.
+Gemma 2 runs on CUDA (`src/gemma2_cuda.cu`: text, vision and audio towers,
+validated on an RTX 5090); ROCm/XPU remain pending.
+The performance lessons below apply to the original 300M profile. Model-specialization
 is the whole edge over llama.cpp — a generic engine can't fuse or specialize the
 way this one does. Build/test/env-var reference is in `CONTRIBUTING.md`; the full
 retained/rejected experiment log with numbers is in
@@ -45,6 +55,41 @@ established the ceiling:
   (`--persistent-cache-path`) turns repeat/re-index/eval workloads into cache
   hits (∞x on a hit) — that's where a production embedding server's real
   multiplier lives. Do caching before chasing more kernel percent.
+
+## EmbeddingGemma 2 (Metal + CPU, 2026-10-09)
+
+Design and numbers: `perf/gemma2_kernel_design.md`, `perf/optimization_status.md`.
+The target is the hardware ceiling under many concurrent requests (SlimServe
+`~/SlimServe` is the reference design), not llama.cpp.
+
+- **The lever was GPU-level batching.** The original `g2_mm` had no weight
+  reuse across tokens, so packing requests bought nothing. Weight-stationary
+  GEMV (short waves) plus `matmul2d` GEMMs (wide waves) made packed waves
+  cheap; the HTTP throughput gain at c16 was 10-27x.
+- **`matmul2d` on M5:** row-major fp16 weights (dequantized at load) as a
+  transposed operand with `relaxed_precision` reaches ~37 TFLOPS. The int8
+  operand + per-32-group scale recipe lost ~3x once compute-bound; tile-major
+  layouts and strict precision lost too. Fuse epilogues (GeGLU, PLE) in it.
+- **Several waves in flight did not help** uniform loads (`--pipeline-slots`):
+  one packed wave beats overlapping small ones. Keep it opt-in.
+- **Every `matmul2d` flash instantiation at head width 64 crashes the M5
+  driver** at first dispatch; vision uses the simdgroup flash kernel.
+- **Dispatch count is not the short-wave bottleneck:** folding post-norms into
+  GEMV prologues removed 72 dispatches and gained nothing.
+- **CPU short waves were thread-wake bound** (condvar per call). The spin pool
+  must publish generation and participant count as one atomic ticket (a split
+  publish hung). `smmla` doubles `sdot`; attention needs register tiles.
+- **CPU numerics:** both CPU graphs quantize activations to Q8, ~0.98-0.999
+  from the FP32 Metal path on fragment inputs; random token ids exaggerate it.
+  Gate CPU work on goldens and natural text, not random ids.
+- **CUDA uploads must be on the engine stream.** A pageable `cudaMemcpy` can
+  return before its DMA lands, and the legacy default stream does not order
+  with a non-blocking stream: lazily uploaded weights raced their first kernels
+  (nondeterministic vision outputs). Use `cudaMemcpyAsync` on the engine stream.
+  Never call `cudaFuncSetAttribute` inside graph capture.
+- **This host is shared** (user builds, a VM): compare configurations
+  back-to-back in one process (`make bench-gemma2-metal`, `EI_BENCH_BASE`) or
+  interleaved; separate HTTP runs are not comparable across time.
 
 ## How to do kernel / perf work here
 
@@ -90,6 +135,10 @@ machine.
 
 Remote backend boxes (repos cloned at `~/embeddinggemma-bench` on each):
 
+- **CUDA (5090)** — `ssh eric-5090` — RTX 5090 (SM 12.0), CUDA 13.3, repo at
+  `~/embeddinggemma.c` (rsync'd working tree). Its vLLM is the systemd unit
+  `slimserve-affine-king`; stop it only with the user's OK and say so
+  (`sudo systemctl start slimserve-affine-king` restores it).
 - **CUDA** — `ssh quixi-3090-02` — RTX 3090 (SM 8.6). GPU 0 runs a foreign vLLM:
   NEVER touch it, always `CUDA_VISIBLE_DEVICES=1`. `nvcc` at `/usr/local/cuda/bin`
   (not in PATH).

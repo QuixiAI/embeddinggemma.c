@@ -63,6 +63,7 @@ endif
 
 # Compile the portable Metal 3.1 kernels and Metal 4 fast paths separately,
 # then embed both libraries into each self-contained Metal executable.
+METAL_ENGINE_OBJS = $(BUILD)/engine_metal.o $(BUILD)/gemma2_metal.o
 METAL_FLAGS ?= -std=metal3.1 -O2 -Wall -Wextra -fno-fast-math
 METAL4_FLAGS ?= -std=metal4.0 -O2 -Wall -Wextra -fno-fast-math
 METAL_INCLUDE_DIR := src/metal/include
@@ -73,12 +74,15 @@ METAL_SOURCES := \
 	src/metal/kernels/rope.metal \
 	src/metal/kernels/attention.metal \
 	src/metal/kernels/elementwise.metal \
-	src/metal/kernels/pool.metal
+	src/metal/kernels/pool.metal \
+	src/metal/kernels/gemma2.metal
 METAL_HEADERS := $(wildcard $(METAL_INCLUDE_DIR)/*.metal)
 METALLIB := $(BUILD)/embeddinggemma.metallib
 METAL4_SOURCES := \
 	src/metal4/kernels/tensor_qgemm.metal \
-	src/metal4/kernels/flash_attention.metal
+	src/metal4/kernels/flash_attention.metal \
+	src/metal4/kernels/gemma2_tensor.metal \
+	src/metal4/kernels/gemma2_flash.metal
 METAL4_METALLIB := $(BUILD)/embeddinggemma-metal4.metallib
 METAL_LIBRARIES := $(METALLIB) $(METAL4_METALLIB)
 METALLIB_LDFLAGS := \
@@ -88,17 +92,18 @@ OBJC ?= clang
 OBJCFLAGS ?= -O2 -Wall -Wextra -Werror -fobjc-arc
 METAL_FRAMEWORKS := -framework Foundation -framework Metal
 
+HDRS_NATIVE := $(wildcard src/*.h src/vendor/*.h)
 SRCS_CORE := src/gguf.c
 SRCS_MODEL := $(SRCS_CORE) src/model.c
 SRCS_TOKENIZER := $(SRCS_MODEL) src/tokenizer.c
-SRCS_ENGINE := $(SRCS_TOKENIZER) src/quants.c src/kernels.c src/parallel.c src/engine.c
+SRCS_ENGINE := $(SRCS_TOKENIZER) src/quants.c src/kernels.c src/parallel.c src/engine.c src/gemma2.c src/gemma2_fast.c src/media.c
 SRCS_SERVICE := src/inference_service.c
 SRCS_SERVER := src/server.c src/response_cache.c src/float_format.c
 
 CUDA_CORE_OBJS := $(patsubst src/%.c,$(BUILD)/cuda/%.o,$(SRCS_ENGINE))
 CUDA_SERVICE_OBJS := $(patsubst src/%.c,$(BUILD)/cuda/%.o,$(SRCS_SERVICE))
 CUDA_SERVER_OBJS := $(patsubst src/%.c,$(BUILD)/cuda/%.o,$(SRCS_SERVER))
-CUDA_ENGINE_OBJ := $(BUILD)/cuda/engine_cuda.o
+CUDA_ENGINE_OBJ := $(BUILD)/cuda/engine_cuda.o $(BUILD)/cuda/gemma2_cuda.o
 ROCM_CORE_OBJS := $(patsubst src/%.c,$(BUILD)/rocm/%.o,$(SRCS_ENGINE))
 ROCM_SERVICE_OBJS := $(patsubst src/%.c,$(BUILD)/rocm/%.o,$(SRCS_SERVICE))
 ROCM_SERVER_OBJS := $(patsubst src/%.c,$(BUILD)/rocm/%.o,$(SRCS_SERVER))
@@ -164,55 +169,58 @@ $(XPU_DEPS_STAMP): scripts/fetch-xpu-deps.sh
 	./scripts/fetch-xpu-deps.sh $(XPU_DEPS_DIR)
 	@touch $@
 
-$(BUILD)/test_gguf: src/test_gguf.c $(SRCS_CORE) src/*.h | $(BUILD)
+$(BUILD)/test_gguf: src/test_gguf.c $(SRCS_CORE) $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_gguf.c $(SRCS_CORE) $(LDLIBS)
 
-$(BUILD)/test_tokenizer: src/test_tokenizer.c $(SRCS_TOKENIZER) src/*.h | $(BUILD)
+$(BUILD)/test_tokenizer: src/test_tokenizer.c $(SRCS_TOKENIZER) $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_tokenizer.c $(SRCS_TOKENIZER) $(LDLIBS)
 
-$(BUILD)/test_embed: src/test_embed.c $(SRCS_ENGINE) src/*.h | $(BUILD)
+$(BUILD)/test_embed: src/test_embed.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_embed.c $(SRCS_ENGINE) $(LDLIBS)
 
-$(BUILD)/test_batch: src/test_batch.c $(SRCS_ENGINE) src/*.h | $(BUILD)
+$(BUILD)/test_batch: src/test_batch.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_batch.c $(SRCS_ENGINE) $(LDLIBS)
 
-$(BUILD)/test_kernels: src/test_kernels.c src/quants.c src/kernels.c src/gguf.c src/*.h | $(BUILD)
+$(BUILD)/test_kernels: src/test_kernels.c src/quants.c src/kernels.c src/gguf.c $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_kernels.c src/quants.c src/kernels.c src/gguf.c $(LDLIBS)
 
-$(BUILD)/embeddinggemma: $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) src/*.h | $(BUILD)
+$(BUILD)/embeddinggemma: $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(LDLIBS)
 
-$(BUILD)/test_inference_service: src/test_inference_service.c $(SRCS_SERVICE) src/tokenizer.c src/gguf.c src/*.h | $(BUILD)
+$(BUILD)/test_inference_service: src/test_inference_service.c $(SRCS_SERVICE) src/tokenizer.c src/gguf.c $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_inference_service.c $(SRCS_SERVICE) src/tokenizer.c src/gguf.c $(LDLIBS)
 
-$(BUILD)/test_response_cache: src/test_response_cache.c src/response_cache.c src/*.h | $(BUILD)
+$(BUILD)/test_response_cache: src/test_response_cache.c src/response_cache.c $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_response_cache.c src/response_cache.c src/gguf.c $(LDLIBS)
 
 $(BUILD)/test_float_format: src/test_float_format.c src/float_format.c src/float_format.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_float_format.c src/float_format.c $(LDLIBS)
 
-$(BUILD)/cuda/%.o: src/%.c src/*.h | $(BUILD)/cuda
+$(BUILD)/cuda/%.o: src/%.c $(HDRS_NATIVE) | $(BUILD)/cuda
 	$(CC) $(CFLAGS) -DEI_ENABLE_CUDA -Isrc -c -o $@ $<
 
-$(CUDA_ENGINE_OBJ): src/engine_cuda.cu src/engine_cuda.h src/model.h src/gguf.h | $(BUILD)/cuda
+$(BUILD)/cuda/engine_cuda.o: src/engine_cuda.cu src/engine_cuda.h src/model.h src/gguf.h | $(BUILD)/cuda
 	$(NVCC) $(NVCCFLAGS) $(CUDA_GENCODE) -Xptxas=-warn-spills -Isrc -c -o $@ $<
 
-$(BUILD)/cuda/test_embed.o: src/test_embed.c src/*.h | $(BUILD)/cuda
+$(BUILD)/cuda/gemma2_cuda.o: src/gemma2_cuda.cu src/gemma2_cuda.h src/gguf.h src/kernels.h | $(BUILD)/cuda
+	$(NVCC) $(NVCCFLAGS) $(CUDA_GENCODE) -Xptxas=-warn-spills -Isrc -c -o $@ $<
+
+$(BUILD)/cuda/test_embed.o: src/test_embed.c $(HDRS_NATIVE) | $(BUILD)/cuda
 	$(CC) $(CFLAGS) -DEI_ENABLE_CUDA -Isrc -c -o $@ $<
 
-$(BUILD)/cuda/test_batch.o: src/test_batch.c src/*.h | $(BUILD)/cuda
+$(BUILD)/cuda/test_batch.o: src/test_batch.c $(HDRS_NATIVE) | $(BUILD)/cuda
 	$(CC) $(CFLAGS) -DEI_ENABLE_CUDA -Isrc -c -o $@ $<
 
-$(BUILD)/cuda/test_cuda.o: src/test_cuda.c src/*.h | $(BUILD)/cuda
+$(BUILD)/cuda/test_cuda.o: src/test_cuda.c $(HDRS_NATIVE) | $(BUILD)/cuda
 	$(CC) $(CFLAGS) -DEI_ENABLE_CUDA -Isrc -c -o $@ $<
 
-$(BUILD)/cuda/perf_engine.o: perf/harness/bench_engine.c src/*.h | $(BUILD)/cuda
+$(BUILD)/cuda/perf_engine.o: perf/harness/bench_engine.c $(HDRS_NATIVE) | $(BUILD)/cuda
 	$(CC) $(CFLAGS) -DEI_ENABLE_CUDA -Isrc -c -o $@ $<
 
-$(BUILD)/cuda/perf_batch.o: perf/harness/bench_batch.c src/*.h | $(BUILD)/cuda
+$(BUILD)/cuda/perf_batch.o: perf/harness/bench_batch.c $(HDRS_NATIVE) | $(BUILD)/cuda
 	$(CC) $(CFLAGS) -DEI_ENABLE_CUDA -Isrc -c -o $@ $<
 
-$(BUILD)/cuda/perf_concurrency.o: perf/harness/bench_concurrency.c src/*.h | $(BUILD)/cuda
+$(BUILD)/cuda/perf_concurrency.o: perf/harness/bench_concurrency.c $(HDRS_NATIVE) | $(BUILD)/cuda
 	$(CC) $(CFLAGS) -DEI_ENABLE_CUDA -Isrc -c -o $@ $<
 
 $(BUILD)/embeddinggemma-cuda: $(CUDA_SERVER_OBJS) $(CUDA_CORE_OBJS) $(CUDA_SERVICE_OBJS) $(CUDA_ENGINE_OBJ) | $(BUILD)
@@ -237,28 +245,28 @@ $(BUILD)/perf_batch_cuda: $(BUILD)/cuda/perf_batch.o $(CUDA_CORE_OBJS) $(CUDA_EN
 $(BUILD)/perf_concurrency_cuda: $(BUILD)/cuda/perf_concurrency.o $(CUDA_CORE_OBJS) $(CUDA_SERVICE_OBJS) $(CUDA_ENGINE_OBJ) | $(BUILD)
 	$(CXX) -o $@ $^ $(LDLIBS) $(CUDA_LDLIBS)
 
-$(BUILD)/rocm/%.o: src/%.c src/*.h | $(BUILD)/rocm
+$(BUILD)/rocm/%.o: src/%.c $(HDRS_NATIVE) | $(BUILD)/rocm
 	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
 
 $(ROCM_ENGINE_OBJ): src/engine_rocm.hip src/engine_rocm.h src/model.h src/gguf.h | $(BUILD)/rocm
 	$(HIPCC) $(HIPFLAGS) $(ROCM_GENCODE) -Isrc -c -o $@ $<
 
-$(BUILD)/rocm/test_embed.o: src/test_embed.c src/*.h | $(BUILD)/rocm
+$(BUILD)/rocm/test_embed.o: src/test_embed.c $(HDRS_NATIVE) | $(BUILD)/rocm
 	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
 
-$(BUILD)/rocm/test_batch.o: src/test_batch.c src/*.h | $(BUILD)/rocm
+$(BUILD)/rocm/test_batch.o: src/test_batch.c $(HDRS_NATIVE) | $(BUILD)/rocm
 	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
 
-$(BUILD)/rocm/test_rocm.o: src/test_rocm.c src/*.h | $(BUILD)/rocm
+$(BUILD)/rocm/test_rocm.o: src/test_rocm.c $(HDRS_NATIVE) | $(BUILD)/rocm
 	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
 
-$(BUILD)/rocm/perf_engine.o: perf/harness/bench_engine.c src/*.h | $(BUILD)/rocm
+$(BUILD)/rocm/perf_engine.o: perf/harness/bench_engine.c $(HDRS_NATIVE) | $(BUILD)/rocm
 	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
 
-$(BUILD)/rocm/perf_batch.o: perf/harness/bench_batch.c src/*.h | $(BUILD)/rocm
+$(BUILD)/rocm/perf_batch.o: perf/harness/bench_batch.c $(HDRS_NATIVE) | $(BUILD)/rocm
 	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
 
-$(BUILD)/rocm/perf_concurrency.o: perf/harness/bench_concurrency.c src/*.h | $(BUILD)/rocm
+$(BUILD)/rocm/perf_concurrency.o: perf/harness/bench_concurrency.c $(HDRS_NATIVE) | $(BUILD)/rocm
 	$(CC) $(CFLAGS) -DEI_ENABLE_ROCM -Isrc -c -o $@ $<
 
 $(BUILD)/embeddinggemma-rocm: $(ROCM_SERVER_OBJS) $(ROCM_CORE_OBJS) $(ROCM_SERVICE_OBJS) $(ROCM_ENGINE_OBJ) | $(BUILD)
@@ -282,7 +290,7 @@ $(BUILD)/perf_batch_rocm: $(BUILD)/rocm/perf_batch.o $(ROCM_CORE_OBJS) $(ROCM_EN
 $(BUILD)/perf_concurrency_rocm: $(BUILD)/rocm/perf_concurrency.o $(ROCM_CORE_OBJS) $(ROCM_SERVICE_OBJS) $(ROCM_ENGINE_OBJ) | $(BUILD)
 	$(HIPCC) -o $@ $^ $(LDLIBS) $(ROCM_LDLIBS)
 
-$(BUILD)/xpu/%.o: src/%.c src/*.h | $(BUILD)/xpu
+$(BUILD)/xpu/%.o: src/%.c $(HDRS_NATIVE) | $(BUILD)/xpu
 	$(CC) $(CFLAGS) -DEI_ENABLE_XPU -Isrc -c -o $@ $<
 
 $(XPU_ENGINE_OBJ): src/engine_xpu.cpp src/engine_xpu.h src/model.h src/gguf.h | $(BUILD)/xpu
@@ -303,22 +311,22 @@ $(BUILD)/test_xpu_w4: $(BUILD)/xpu/test_xpu_w4.o $(BUILD)/xpu/engine_xpu_w4.o $(
 $(BUILD)/xpu/engine_xpu_onednn.o: src/engine_xpu_onednn.cpp src/engine_xpu_onednn.h | $(BUILD)/xpu
 	$(SYCL_CXX) $(SYCLFLAGS) $(XPU_ENGINE_TARGET_FLAGS) -DEI_XPU_ONEDNN -Isrc -c -o $@ $<
 
-$(BUILD)/xpu/test_embed.o: src/test_embed.c src/*.h | $(BUILD)/xpu
+$(BUILD)/xpu/test_embed.o: src/test_embed.c $(HDRS_NATIVE) | $(BUILD)/xpu
 	$(CC) $(CFLAGS) -DEI_ENABLE_XPU -Isrc -c -o $@ $<
 
-$(BUILD)/xpu/test_batch.o: src/test_batch.c src/*.h | $(BUILD)/xpu
+$(BUILD)/xpu/test_batch.o: src/test_batch.c $(HDRS_NATIVE) | $(BUILD)/xpu
 	$(CC) $(CFLAGS) -DEI_ENABLE_XPU -Isrc -c -o $@ $<
 
-$(XPU_TEST_OBJ): src/test_xpu.c src/*.h | $(BUILD)/xpu
+$(XPU_TEST_OBJ): src/test_xpu.c $(HDRS_NATIVE) | $(BUILD)/xpu
 	$(CC) $(CFLAGS) -DEI_ENABLE_XPU $(XPU_ENGINE_DEFS) -Isrc -c -o $@ $<
 
-$(BUILD)/xpu/perf_engine.o: perf/harness/bench_engine.c src/*.h | $(BUILD)/xpu
+$(BUILD)/xpu/perf_engine.o: perf/harness/bench_engine.c $(HDRS_NATIVE) | $(BUILD)/xpu
 	$(CC) $(CFLAGS) -DEI_ENABLE_XPU -Isrc -c -o $@ $<
 
-$(BUILD)/xpu/perf_batch.o: perf/harness/bench_batch.c src/*.h | $(BUILD)/xpu
+$(BUILD)/xpu/perf_batch.o: perf/harness/bench_batch.c $(HDRS_NATIVE) | $(BUILD)/xpu
 	$(CC) $(CFLAGS) -DEI_ENABLE_XPU -Isrc -c -o $@ $<
 
-$(BUILD)/xpu/perf_concurrency.o: perf/harness/bench_concurrency.c src/*.h | $(BUILD)/xpu
+$(BUILD)/xpu/perf_concurrency.o: perf/harness/bench_concurrency.c $(HDRS_NATIVE) | $(BUILD)/xpu
 	$(CC) $(CFLAGS) -DEI_ENABLE_XPU -Isrc -c -o $@ $<
 
 $(BUILD)/embeddinggemma-xpu: $(XPU_SERVER_OBJS) $(XPU_CORE_OBJS) $(XPU_SERVICE_OBJS) $(XPU_ENGINE_OBJS) FORCE_XPU_LINK | $(BUILD)
@@ -346,49 +354,49 @@ $(BUILD)/perf_concurrency_xpu: $(BUILD)/xpu/perf_concurrency.o $(XPU_CORE_OBJS) 
 $(BUILD)/engine_metal.o: src/engine_metal.m src/engine_metal.h src/model.h src/gguf.h | $(BUILD)
 	$(OBJC) $(OBJCFLAGS) -Isrc -c -o $@ $<
 
-$(BUILD)/embeddinggemma-metal: $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
+$(BUILD)/embeddinggemma-metal: $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(METAL_ENGINE_OBJS) $(HDRS_NATIVE) $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ $(SRCS_SERVER) $(SRCS_ENGINE) \
-		$(SRCS_SERVICE) $(BUILD)/engine_metal.o $(LDLIBS) \
+		$(SRCS_SERVICE) $(METAL_ENGINE_OBJS) $(LDLIBS) \
 		$(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
-$(BUILD)/test_embed_metal: src/test_embed.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
+$(BUILD)/test_embed_metal: src/test_embed.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(HDRS_NATIVE) $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/test_embed.c $(SRCS_ENGINE) \
-		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
+		$(METAL_ENGINE_OBJS) $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
-$(BUILD)/test_backend_parity_metal: src/test_backend_parity.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
+$(BUILD)/test_backend_parity_metal: src/test_backend_parity.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(HDRS_NATIVE) $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/test_backend_parity.c $(SRCS_ENGINE) \
-		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
+		$(METAL_ENGINE_OBJS) $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
-$(BUILD)/test_batch_metal: src/test_batch.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
+$(BUILD)/test_batch_metal: src/test_batch.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(HDRS_NATIVE) $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/test_batch.c $(SRCS_ENGINE) \
-		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
+		$(METAL_ENGINE_OBJS) $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
-$(BUILD)/perf_kernels: perf/harness/bench_kernels.c src/quants.c src/kernels.c src/gguf.c src/*.h | $(BUILD)
+$(BUILD)/perf_kernels: perf/harness/bench_kernels.c src/quants.c src/kernels.c src/gguf.c $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_kernels.c src/quants.c src/kernels.c src/gguf.c $(LDLIBS)
 
-$(BUILD)/perf_engine: perf/harness/bench_engine.c $(SRCS_ENGINE) src/*.h | $(BUILD)
+$(BUILD)/perf_engine: perf/harness/bench_engine.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_engine.c $(SRCS_ENGINE) $(LDLIBS)
 
-$(BUILD)/perf_engine_metal: perf/harness/bench_engine.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
+$(BUILD)/perf_engine_metal: perf/harness/bench_engine.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(HDRS_NATIVE) $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -Isrc -o $@ perf/harness/bench_engine.c $(SRCS_ENGINE) \
-		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
+		$(METAL_ENGINE_OBJS) $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
-$(BUILD)/perf_concurrency: perf/harness/bench_concurrency.c $(SRCS_ENGINE) $(SRCS_SERVICE) src/*.h | $(BUILD)
+$(BUILD)/perf_concurrency: perf/harness/bench_concurrency.c $(SRCS_ENGINE) $(SRCS_SERVICE) $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_concurrency.c $(SRCS_ENGINE) $(SRCS_SERVICE) $(LDLIBS)
 
-$(BUILD)/perf_concurrency_metal: perf/harness/bench_concurrency.c $(SRCS_ENGINE) $(SRCS_SERVICE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
+$(BUILD)/perf_concurrency_metal: perf/harness/bench_concurrency.c $(SRCS_ENGINE) $(SRCS_SERVICE) $(METAL_ENGINE_OBJS) $(HDRS_NATIVE) $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -Isrc -o $@ perf/harness/bench_concurrency.c $(SRCS_ENGINE) \
-		$(SRCS_SERVICE) $(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) \
+		$(SRCS_SERVICE) $(METAL_ENGINE_OBJS) $(LDLIBS) $(METALLIB_LDFLAGS) \
 		$(METAL_FRAMEWORKS)
 
-$(BUILD)/perf_batch: perf/harness/bench_batch.c $(SRCS_ENGINE) src/*.h | $(BUILD)
+$(BUILD)/perf_batch: perf/harness/bench_batch.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_batch.c $(SRCS_ENGINE) $(LDLIBS)
 
-$(BUILD)/perf_batch_metal: perf/harness/bench_batch.c $(SRCS_ENGINE) $(BUILD)/engine_metal.o src/*.h $(METAL_LIBRARIES) | $(BUILD)
+$(BUILD)/perf_batch_metal: perf/harness/bench_batch.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(HDRS_NATIVE) $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -Isrc -o $@ perf/harness/bench_batch.c $(SRCS_ENGINE) \
-		$(BUILD)/engine_metal.o $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
+		$(METAL_ENGINE_OBJS) $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
 
-$(BUILD)/perf_tokenization: perf/harness/bench_tokenization.c $(SRCS_TOKENIZER) $(SRCS_SERVICE) src/*.h | $(BUILD)
+$(BUILD)/perf_tokenization: perf/harness/bench_tokenization.c $(SRCS_TOKENIZER) $(SRCS_SERVICE) $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ perf/harness/bench_tokenization.c $(SRCS_TOKENIZER) \
 		$(SRCS_SERVICE) $(LDLIBS)
 
@@ -571,7 +579,7 @@ clean-cpu:
 	rm -f $(BUILD)/embeddinggemma
 
 clean-metal:
-	rm -f $(METAL_LIBRARIES) $(BUILD)/engine_metal.o $(BUILD)/*metal $(BUILD)/*metal.o
+	rm -f $(METAL_LIBRARIES) $(METAL_ENGINE_OBJS) $(BUILD)/*metal $(BUILD)/*metal.o
 
 clean-cuda:
 	rm -rf $(BUILD)/cuda
@@ -647,7 +655,10 @@ help:
 	@printf '%s\n' \
 		'make | metal | cuda | rocm | xpu  Build a server backend' \
 		'make check                         Run model-free unit and script checks' \
-		'make test | test-BACKEND          Run correctness and HTTP tests' \
+		'make test | test-BACKEND          Run original-profile correctness and HTTP tests' \
+		'make test-gemma2                  Run native multimodal profile parity and HTTP tests' \
+		'make test-gemma2-metal            Run Metal multimodal parity and HTTP tests' \
+		'make test-gemma2-metal-routes     Validate Metal 4 routes and packed batches' \
 		'make perf-*                       Run kernel, engine, batch, or concurrency benchmarks' \
 		'make perf-servers                 Benchmark a running embedding HTTP server' \
 		'make perf-compare-llamacpp        Compare Metal HTTP throughput with llama.cpp' \
@@ -659,3 +670,58 @@ help:
 
 clean:
 	rm -rf $(BUILD) $(DIST)
+
+# The legacy golden suite keeps MODEL; the second profile has its own fixtures.
+GEMMA2_MODEL ?= model/embeddinggemma-2-Q8_0.gguf
+GEMMA2_MMPROJ ?= model/mmproj-embeddinggemma-2-Q8_0.gguf
+$(BUILD)/test_gemma2: src/test_gemma2.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/test_gemma2.c $(SRCS_ENGINE) $(LDLIBS)
+
+.PHONY: test-gemma2
+test-gemma2: $(BUILD)/test_gemma2 $(BUILD)/embeddinggemma
+	python3 testdata/test_gemma2.py --binary $(BUILD)/test_gemma2 \
+		--server $(BUILD)/embeddinggemma --model $(GEMMA2_MODEL) --mmproj $(GEMMA2_MMPROJ)
+
+$(BUILD)/gemma2_metal.o: src/gemma2_metal.m $(HDRS_NATIVE) | $(BUILD)
+	$(OBJC) $(OBJCFLAGS) -Isrc -c -o $@ $<
+
+$(BUILD)/test_gemma2_cuda: $(BUILD)/cuda/test_gemma2.o $(CUDA_CORE_OBJS) $(CUDA_ENGINE_OBJ) | $(BUILD)
+	$(CXX) -o $@ $^ $(LDLIBS) $(CUDA_LDLIBS)
+
+$(BUILD)/bench_gemma2_cuda: $(BUILD)/cuda/bench_gemma2_cuda.o $(CUDA_CORE_OBJS) $(CUDA_ENGINE_OBJ) | $(BUILD)
+	$(CXX) -o $@ $^ $(LDLIBS) $(CUDA_LDLIBS)
+
+.PHONY: test-gemma2-cuda
+test-gemma2-cuda: $(BUILD)/test_gemma2_cuda $(BUILD)/embeddinggemma-cuda
+	EI_BACKEND=cuda python3 testdata/test_gemma2.py --binary $(BUILD)/test_gemma2_cuda --server $(BUILD)/embeddinggemma-cuda --model $(GEMMA2_MODEL) --mmproj $(GEMMA2_MMPROJ)
+
+$(BUILD)/test_gemma2_metal: src/test_gemma2.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(HDRS_NATIVE) $(METAL_LIBRARIES) | $(BUILD)
+	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/test_gemma2.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
+
+.PHONY: test-gemma2-metal
+test-gemma2-metal: $(BUILD)/test_gemma2_metal $(BUILD)/embeddinggemma-metal
+	EI_BACKEND=metal python3 testdata/test_gemma2.py --binary $(BUILD)/test_gemma2_metal --server $(BUILD)/embeddinggemma-metal --model $(GEMMA2_MODEL) --mmproj $(GEMMA2_MMPROJ)
+
+$(BUILD)/test_gemma2_metal_routes: src/test_gemma2_metal.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(HDRS_NATIVE) $(METAL_LIBRARIES) | $(BUILD)
+	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/test_gemma2_metal.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
+
+.PHONY: test-gemma2-metal-routes
+test-gemma2-metal-routes: $(BUILD)/test_gemma2_metal_routes
+	./$(BUILD)/test_gemma2_metal_routes $(GEMMA2_MODEL) $(GEMMA2_MMPROJ)
+
+$(BUILD)/bench_gemma2_cpu: src/bench_gemma2_cpu.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/bench_gemma2_cpu.c $(SRCS_ENGINE) $(LDLIBS)
+
+# Compare/time the fast CPU graph against the reference: make bench-gemma2-cpu [CASES="1x1 32x16"]
+.PHONY: bench-gemma2-cpu
+bench-gemma2-cpu: $(BUILD)/bench_gemma2_cpu
+	./$(BUILD)/bench_gemma2_cpu $(GEMMA2_MODEL) $(CASES)
+
+$(BUILD)/bench_gemma2_metal: src/bench_gemma2_metal.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(HDRS_NATIVE) $(METAL_LIBRARIES) | $(BUILD)
+	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/bench_gemma2_metal.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
+
+# Compare/time a gemma2 Metal route: make bench-gemma2-metal ROUTE=GEMV=1 [CASES="32x4 512x1"]
+ROUTE ?= TENSOR=1,FLASH=1
+.PHONY: bench-gemma2-metal
+bench-gemma2-metal: $(BUILD)/bench_gemma2_metal
+	./$(BUILD)/bench_gemma2_metal $(GEMMA2_MODEL) "$(ROUTE)" $(CASES)

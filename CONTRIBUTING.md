@@ -1,7 +1,8 @@
 # Contributing
 
 Contributions should preserve the project's narrow scope: standalone inference
-and serving for `embeddinggemma-300M-qat-Q4_0.gguf` on CPU, Metal, CUDA, ROCm,
+and serving for two fixed profiles: native CPU/Metal EmbeddingGemma 2 with text,
+vision and audio towers, and EmbeddingGemma 300M on CPU, Metal, CUDA, ROCm,
 and Intel XPU SYCL.
 
 ## Before Starting
@@ -25,8 +26,13 @@ repository and remain subject to the model provider's terms.
 The default model path is:
 
 ```text
-${XDG_CACHE_HOME:-$HOME/.cache}/embeddinggemma.c/embeddinggemma-300M-qat-Q4_0.gguf
+${XDG_CACHE_HOME:-$HOME/.cache}/embeddinggemma.c/embeddinggemma-2-Q8_0.gguf
 ```
+
+The combined `mmproj-embeddinggemma-2-Q8_0.gguf` projector is resolved beside
+the new text model, or selected with `--mmproj`. `--profile embeddinggemma-300m`
+selects the original model. The Metal binary selects Metal for both profiles. New-profile CUDA/ROCm/XPU
+graphs are not implemented yet; select CPU explicitly on those builds.
 
 The server can populate that cache with `curl` or `wget`. Tests use `MODEL`, so
 an existing file can be selected explicitly:
@@ -50,6 +56,11 @@ Run `make help` for the current build, test, performance, and release targets.
 
 ## Code Map
 
+- `src/gemma2.c`, `src/media.c`: native second-profile text/vision/audio graphs,
+  image decoding/resizing, and WAV/log-mel preprocessing.
+- `src/gemma2_metal.m`, `src/metal/kernels/gemma2.metal`, and
+  `src/metal4/kernels/gemma2_*.metal`: second-profile Metal graphs and kernels.
+- `src/profiles.h`: startup profiles and pinned new-model download URLs.
 - `src/engine.c` and `src/kernels.c`: portable CPU graph and kernels.
 - `src/engine_metal.m` and `src/metal/`: Metal host code and kernel families.
 - `src/engine_cuda.cu`: CUDA engine and kernels.
@@ -164,6 +175,7 @@ CPU changes must pass:
 ```sh
 make clean-cpu
 make test
+make test-gemma2  # requires both new GGUF files in model/
 ```
 
 Backend changes must pass the complete suite on matching hardware:
@@ -178,6 +190,10 @@ make test-xpu XPU_XE2_FLASH=1 SYCL_CXX=icpx
 
 Architecture overrides above are for fast local validation. Release builds
 must use the portable architecture sets in `RELEASE.md`.
+
+New-profile validation uses `testdata/gemma2-goldens.json`; reference provenance
+and regeneration are recorded in `EXTRACTION.md`. The new CPU path must meet
+cosine >= 0.999 for both encoder outputs and final text/media embeddings.
 
 Every inference change must retain:
 
@@ -247,6 +263,101 @@ Diagnostic controls:
 - `EI_METAL_FUSED_UP_GATE_GELU=1`: enable the rejected fused FFN experiment.
 - `EI_METAL_FUSED_UP_GATE_ROWS=2|4`: select its row grouping.
 - `EI_METAL_TRIPLE_QKV_GEMV=1`: enable the rejected short QKV experiment.
+
+EmbeddingGemma 2 uses resident Q8/BF16/F32 weights, reusable activation buffers,
+GPU text/vision/audio graphs, and block-diagonal packed text batches. Its direct
+FP32 path runs on Metal 3.1. Optional routes require a Metal 4 GPU:
+
+- `EI_GEMMA2_METAL_TENSOR=1`: 64x64 matrix tiles from 32 tokens; packed Q8/BF16
+  weights are decoded to FP16 tiles, with FP32 activations and accumulation.
+- `EI_GEMMA2_METAL_FLASH=1`: 8-query/32-key tiled attention from 128 tokens;
+  separate 64/256/512-wide kernels, FP16 Q/K/V, FP32 softmax/accumulation.
+- `EI_GEMMA2_METAL_PROFILE=1`: print CPU encoding, GPU, and total graph times.
+
+The batched-serving stack (2026-10-09, `perf/gemma2_kernel_design.md`). Since
+the end of that day FUSED, TENSOR2 and FLASH2 are on by default (TENSOR2 and
+FLASH2 only where Metal 4 is available); set a flag to `0` to turn a route
+off, `1` to require it. All three at `0` reproduce the 10-07 direct path
+exactly (goldens identical to 9 digits):
+
+- `EI_GEMMA2_METAL_GEMV=1`: weight-stationary GEMV; each lane decodes 16 weights
+  of 4 rows once and applies them to 8 tokens (Q8/BF16/F16/F32). Metal 3.1.
+- `EI_GEMMA2_METAL_FUSED=1`: fused text layer, 11 dispatches instead of 25:
+  QKV and up/gate+GeGLU and inp_gate+PLE GEMVs, q/k/v norm + RoPE in one pass,
+  post-norm + residual + next pre-norm in one pass. Implies `GEMV`. Metal 3.1.
+- `EI_GEMMA2_METAL_TENSOR2=1`: from 40 tokens, `matmul2d` against fp16
+  row-major copies of the Q8/BF16 text weights (and the F32/BF16 projector
+  weights) made at load, relaxed precision, FP32 activations/accumulation;
+  32-token tiles, 64 from 256. FFN up/gate are interleaved per tile so GeGLU,
+  and the PLE gate, run in the GEMM epilogue (`EI_GEMMA2_METAL_NOEPI=1`
+  disables the epilogues).
+  `EI_GEMMA2_METAL_TENSOR2_MIN_TOKENS` / `_WIDE_TOKENS` move the crossovers.
+- `EI_GEMMA2_METAL_FLASH2=1`: from 16 tokens, `matmul2d` flash attention for
+  head widths 256/512: 32 queries x 128 keys (`EI_GEMMA2_METAL_FLASH2_TILE=k64`
+  for 64 keys), per-row packed-sequence and window masks, tile key ranges
+  clipped to the visible span; fp16 K/V written by the q/k/v norm pass. Vision
+  (width 64) uses the simdgroup flash kernel: any `matmul2d` flash at width 64
+  crashes the M5 driver. `EI_GEMMA2_METAL_FLASH2_MIN_TOKENS` moves the
+  threshold.
+- `EI_GEMMA2_METAL_SKIP=attn,mm,qkv,geglu,ple,post,qknorm`: diagnostic only;
+  drops those dispatches to size their GPU share. Output is invalid.
+- `--pipeline-slots N` (server, 1..8): N text waves in flight on separate
+  queues/workspaces sharing the weights; media gets its own context, so text
+  waves no longer take the global inference lock. 1 is the old behaviour.
+  Measured no gain on uniform loads (0.67-0.85x for tiny requests at c4-c32,
+  neutral above ~128 tokens): one packed wave beats overlapping small ones.
+  `EI_WAVE_LOG=1` prints each wave (slot, sequences, tokens, execute time,
+  idle gap) to stderr.
+
+EmbeddingGemma 2 CPU (default on since 2026-10-09; `EI_GEMMA2_CPU_FAST=0`
+selects the unchanged reference graph):
+
+- `EI_GEMMA2_CPU_FAST`: packed-batch text graph (`src/gemma2_fast.c`):
+  per-sequence RoPE/attention bounds, activations quantized once per
+  normalized input, 4-row x 4-token NEON `sdot` Q8 tiles, threaded SIMD row
+  kernels with a vector GELU, cached RoPE tables, persistent workspace. Media
+  soft tokens use it too, so content-object text matches plain text.
+- `EI_GEMMA2_CPU_I8MM` (default on where `FEAT_I8MM`): `smmla` Q8 GEMM on
+  row-pair-interleaved weights (repacked at first use) for waves of 4+ tokens.
+- `EI_GEMMA2_CPU_SHORT_THREADS=N` (default 6): tasks per GEMM for waves of at
+  most 8 tokens; short waves are wake-up bound.
+- `EI_GEMMA2_CPU_PROFILE=1`: per-call GEMM/row/attention wall time.
+- `EI_POOL_SPIN_US=N`: pool workers spin N us on a published
+  generation/participant ticket before parking, so back-to-back parallel
+  calls skip the condition-variable wake. The EmbeddingGemma 2 CPU pool
+  defaults to 50; the 300M pool keeps 0 (the original condvar pool).
+
+`make bench-gemma2-cpu CASES="1x1 32x16"` times the fast graph against the
+reference on natural-text token windows (`EI_BENCH_RANDOM_IDS=1` for random
+ids, which exaggerate Q8 activation rounding; `EI_BENCH_FAST_ONLY=1` skips the
+slow reference).
+
+Validate the default and each stack you change:
+
+```sh
+make test-gemma2-metal
+EI_GEMMA2_METAL_FUSED=0 EI_GEMMA2_METAL_TENSOR2=0 EI_GEMMA2_METAL_FLASH2=0 EI_GEMMA2_METAL_TENSOR=1 EI_GEMMA2_METAL_FLASH=1 make test-gemma2-metal
+EI_GEMMA2_METAL_FUSED=0 EI_GEMMA2_METAL_TENSOR2=0 EI_GEMMA2_METAL_FLASH2=0 make test-gemma2-metal
+make test-gemma2-metal-routes   # default stack vs every route off
+EI_GEMMA2_ROUTE_FLAGS=TENSOR,FLASH make test-gemma2-metal-routes
+```
+
+EmbeddingGemma 2 on CUDA (`src/gemma2_cuda.cu`: text, vision and audio towers): build with `make CUDA_ARCHS=120 cuda` (86 for the 3090),
+validate with `make test-gemma2-cuda`, time with `build/bench_gemma2_cuda
+MODEL [TxB ...]` (reports packed-vs-single and mma-vs-CUDA-core parity).
+`EI_GEMMA2_CUDA_MMA_ATTN=0` selects the CUDA-core attention kernel,
+`EI_GEMMA2_CUDA_GRAPHS=0` disables graph capture (for nsys per-kernel
+profiles), `EI_CUDA_DEVICE` picks the GPU. `perf/loadgen.c` is a minimal
+keep-alive HTTP load generator for hosts without wrk/hey.
+
+`make bench-gemma2-metal ROUTE=FUSED=1,TENSOR2=1,FLASH2=1 CASES="1x1 32x16"`
+times a route against the default path (`EI_BENCH_BASE=` names another
+baseline; `EI_BENCH_STREAMS=N` measures N concurrent waves on separate queues).
+Cases are `TOKENSxSEQUENCES` packed into one wave.
+
+The route test requires Metal 4. It covers thresholds, 8192 tokens, packed
+sequence isolation, larger images, and audio spanning the projection threshold.
+The ordinary Metal suite supports older GPUs without selecting these routes.
 
 ### CUDA
 

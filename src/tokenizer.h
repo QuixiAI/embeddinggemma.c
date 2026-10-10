@@ -1,4 +1,4 @@
-/* SentencePiece tokenizer for the single supported embeddinggemma GGUF. */
+/* SentencePiece for EmbeddingGemma 300M; ranked Gemma4 BPE for profile 2. */
 #ifndef EI_TOKENIZER_H
 #define EI_TOKENIZER_H
 
@@ -24,6 +24,8 @@ typedef struct {
 
     ei_vocab_slot *vocab;
     size_t         vocab_cap;
+    ei_vocab_slot *merges;
+    size_t         merges_cap;
 
     int32_t byte_id[256];
 

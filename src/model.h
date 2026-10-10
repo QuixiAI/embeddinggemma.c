@@ -1,5 +1,5 @@
-/* Typed view of embeddinggemma-300M-qat-Q4_0.gguf: hyperparameters and
- * per-layer tensor pointers, resolved and validated at load. */
+/* Shared GGUF/tokenizer metadata and the original profile's typed tensors.
+ * EmbeddingGemma 2 resolves its specialized graph in gemma2.c. */
 #ifndef EI_MODEL_H
 #define EI_MODEL_H
 
@@ -34,6 +34,7 @@ typedef struct {
 
 typedef struct {
     ei_gguf gguf;
+    bool embeddinggemma2;
 
     /* hparams read from the file (validated against the EI_* constants) */
     float    rms_eps;

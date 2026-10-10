@@ -9,10 +9,16 @@ https://github.com/QuixiAI/QuixiCore
 https://github.com/QuixiAI/QuixiCore-Metal
 
 `embeddinggemma` is a tiny, model-specialized embeddings server for
-EmbeddingGemma 300M. It runs on CPU, Apple Metal, NVIDIA CUDA, AMD ROCm, and
-Intel XPU SYCL from a single native executable per platform.
+EmbeddingGemma 2 and EmbeddingGemma 300M. The default `embeddinggemma-2` profile
+embeds text, images, audio, sampled video frames, and combinations of these
+with standalone native CPU and Metal inference. The original `embeddinggemma-300m` profile retains
+its CPU, Apple Metal, NVIDIA CUDA, AMD ROCm, and Intel XPU SYCL backends.
+Neither profile links llama.cpp or ggml.
 
-It is fast as fuck, and the CPU binary is about 100 KiB.
+EmbeddingGemma 2 has separate native text, vision, and audio graphs. The Metal
+build selects Metal by default and keeps learned inference on the GPU. Image
+decoding/resizing and WAV/mel preprocessing run on the CPU. CUDA, ROCm, and XPU
+support for the new profile is still pending.
 
 - Hand-tuned inference kernels for every supported accelerator family.
 - Dynamic batching, bounded queues, duplicate singleflight, and exact-result
@@ -20,7 +26,7 @@ It is fast as fuck, and the CPU binary is about 100 KiB.
 - Matryoshka embeddings at 768, 512, 256, and 128 dimensions.
 - Automatic model download and a built-in HTTP server on port `42666`.
 
-## Faster than llama.cpp
+## EmbeddingGemma 300M performance
 
 Measured over HTTP against llama.cpp build b8981 (`llama-server`, Metal) on
 an Apple M5 Max: identical GGUF, exact token counts, 768-float outputs, all
@@ -45,14 +51,27 @@ documented in [`perf/`](perf/).
 
 ## Basic Usage
 
-Start the server. The correct backend is built into each platform binary and
-selected automatically:
+Start the server with the default EmbeddingGemma 2 profile:
 
 ```sh
 embeddinggemma
 ```
 
-The model is downloaded on first run to
+On this Mac, build and run the native Metal server:
+
+```sh
+make metal
+./build/embeddinggemma-metal
+```
+
+EmbeddingGemma 2 serves with a batched stack by default: weight-stationary
+GEMVs and fused layers for short waves, and on Metal 4 GPUs tensor-op GEMMs and
+flash attention for wide packed waves (validated on the M5 Max; route parity
+>= 0.9999 against the reference graph). The CPU build uses a packed-batch
+graph with NEON/i8mm kernels. Each route can be turned off, e.g.
+`EI_GEMMA2_METAL_TENSOR2=0`; `CONTRIBUTING.md` lists every switch.
+
+The text model and combined vision/audio projector are downloaded on first run to
 `${XDG_CACHE_HOME:-$HOME/.cache}/embeddinggemma.c/`.
 
 Create an embedding:
@@ -61,7 +80,7 @@ Create an embedding:
 curl -sS http://127.0.0.1:42666/api/embed \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "embeddinggemma-300m",
+    "model": "embeddinggemma-2",
     "input": ["task: search result | query: what powers the cell"],
     "dimensions": 256
   }'
@@ -80,7 +99,7 @@ SDKs. The original `/api/embed` contract remains supported:
 curl -sS http://127.0.0.1:42666/v1/embeddings \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "embeddinggemma-300m",
+    "model": "embeddinggemma-2",
     "input": ["task: search result | query: what powers the cell"],
     "dimensions": 256
   }'
@@ -102,6 +121,73 @@ instead of JSON float arrays.
 Open [http://127.0.0.1:42666/docs](http://127.0.0.1:42666/docs) for the embedded
 API reference. `GET /healthz` reports readiness, and `--bind`, `--port`, and
 `--model` override the listening address, canonical port, and model path.
+
+## Model profiles and multimodal input
+
+| Profile | Weights | Modalities | Backend |
+|---|---|---|---|
+| `embeddinggemma-2` (default) | `embeddinggemma-2-Q8_0.gguf` + `mmproj-embeddinggemma-2-Q8_0.gguf` | text, image, audio, video frames, mixed | CPU, Metal |
+| `embeddinggemma-300m` | `embeddinggemma-300M-qat-Q4_0.gguf` | text | CPU, Metal, CUDA, ROCm, XPU |
+
+```sh
+make
+./build/embeddinggemma
+# Use existing files; the projector defaults to a sibling of the text model:
+./build/embeddinggemma --model model/embeddinggemma-2-Q8_0.gguf \
+  --mmproj model/mmproj-embeddinggemma-2-Q8_0.gguf
+# Original accelerator profile:
+./build/embeddinggemma-metal --profile embeddinggemma-300m
+```
+
+`--profile` selects a startup profile, not a per-request model router. An explicit
+existing `--model` or `EI_MODEL_PATH` is identified by GGUF architecture for
+compatibility with older scripts. An explicit conflicting `--profile` fails.
+New-profile accelerator requests fail clearly; use `--backend cpu`. Profile 2
+has an 8,192-token combined input limit; the original retains 2,048 tokens.
+Switching profiles changes embedding coordinates: rebuild existing indexes.
+
+Both embedding endpoints accept a content object as one input, or an array
+mixing strings and content objects. Parts are processed in order and produce
+one shared embedding per input object:
+
+```json
+{
+  "model": "embeddinggemma-2",
+  "input": {
+    "content": [
+      {"type": "text", "text": "An image and its soundtrack: "},
+      {"type": "image", "data": "BASE64_IMAGE"},
+      {"type": "audio", "data": "BASE64_WAV"},
+      {"type": "video", "frames": ["BASE64_FRAME_0", "BASE64_FRAME_1"], "fps": 1}
+    ]
+  },
+  "dimensions": 768
+}
+```
+
+- Images: PNG, JPEG, BMP, or PNM, encoded as base64 or a base64 data URL.
+  Images are resized with bicubic filtering and encoded at up to 280 soft tokens;
+  video frames use a 140-token budget. Small inputs are enlarged to the model's
+  minimum vision budget. Decoded images are limited to 16 megapixels.
+- Audio: mono 16 kHz PCM16 or float32 WAV, 21 ms to 300 seconds. The native
+  frontend computes the model's log-mel features and encodes 30-second chunks.
+- Video: provide sampled frames in temporal order, normally at one frame per
+  second. `fps` describes the supplied frame sampling rate (default 1); timestamp
+  text is inserted before each frame. Container decoding (MP4/WebM) and frame
+  extraction happen in the client. At most 114 frames are accepted, subject to
+  the combined token limit.
+- The HTTP body limit is 16 MiB. Content accepts at most 256 parts. Media URLs
+  and local filesystem paths are not fetched by the server.
+
+Text-only requests keep the batching/singleflight/persistent-cache path. Media
+requests serialize access to the native inference engine and use the bounded
+HTTP response cache; token-ID caching cannot represent their media content.
+The original profile rejects structured media input.
+
+Validation: `make test` covers the original profile; `make test-gemma2` checks
+exact new-tokenizer IDs, text/vision/audio reference parity, and HTTP modalities,
+combined inputs, dimensions, concurrency, and context limits. The new profile's
+benchmark performance and accelerator ports are not established yet.
 
 ## Install
 

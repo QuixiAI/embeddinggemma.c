@@ -1,6 +1,13 @@
 # embedding-inference — Port Specification
 
-A minimal inference engine for exactly one model:
+The default startup profile is now `embeddinggemma-2`, with native CPU/Metal text,
+vision and audio inference. See `README.md` for profiles and the structured
+media HTTP contract, and `EXTRACTION.md` for new-graph provenance. The new
+profile uses 512 hidden channels, 768 output channels and an 8,192-token serving
+limit. The fixed shapes and accelerator status below describe only the
+`embeddinggemma-300m` profile.
+
+The original profile specification below remains applicable to:
 `ggml-org/embeddinggemma-300M-qat-q4_0-GGUF`. Hand-ported from the llama.cpp
 reference with no ggml dependency. CPU ARM64/x64, Metal, CUDA, ROCm/HIP, and
 XPU SYCL are implemented. The server exposes the original `/api/embed` HTTP

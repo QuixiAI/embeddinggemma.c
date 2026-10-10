@@ -83,6 +83,7 @@ static uint64_t block_bytes(uint32_t type, const char *name) {
     switch (type) {
         case EI_T_F32:  return 4;   /* per element */
         case EI_T_F16:  return 2;   /* per element */
+        case EI_T_BF16: return 2;
         case EI_T_Q4_0: return 18;  /* per 32 elements */
         case EI_T_Q8_0: return 34;  /* per 32 elements */
         default: ei_die("tensor %s: unsupported ggml type %u", name, type);

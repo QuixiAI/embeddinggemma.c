@@ -17,6 +17,7 @@ enum ei_tensor_type {
     EI_T_F16  = 1,
     EI_T_Q4_0 = 2,
     EI_T_Q8_0 = 8,
+    EI_T_BF16 = 30,
 };
 
 typedef struct {

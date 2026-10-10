@@ -7,6 +7,11 @@ typedef bool (*ei_inference_execute_fn)(void *opaque, const int32_t *ids,
                                         const size_t *offsets, size_t batch_size,
                                         float *out, char *err, size_t err_len);
 
+/* Slot-aware execute: waves on distinct slots may run concurrently. */
+typedef bool (*ei_inference_execute_slot_fn)(void *opaque, size_t slot, const int32_t *ids,
+                                             const size_t *offsets, size_t batch_size,
+                                             float *out, char *err, size_t err_len);
+
 typedef struct {
     size_t cache_entries;
     size_t max_batch_tokens;
@@ -20,6 +25,10 @@ typedef struct {
      * identify the model so a cache from a different model is never served. */
     const char *cache_path;
     uint64_t cache_fingerprint;
+    /* Waves in flight (0 or 1: one, the historical behaviour). With more,
+     * execute_slot must be set; it receives the wave's slot in [0, slots). */
+    size_t pipeline_slots;
+    ei_inference_execute_slot_fn execute_slot;
 } ei_inference_service_config;
 
 typedef struct {

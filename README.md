@@ -192,7 +192,8 @@ one shared embedding per input object:
 - Video: provide sampled frames in temporal order, normally at one frame per
   second. `fps` describes the supplied frame sampling rate (default 1); timestamp
   text is inserted before each frame. Container decoding (MP4/WebM) and frame
-  extraction happen in the client. Frames past the 114th are ignored (114
+  extraction happen in the client. On Metal, same-sized frames run the vision
+  tower as one packed wave. Frames past the 114th are ignored (114
   frames at the 70-token minimum fill the context).
 - Context: text, media soft tokens, media delimiters, and the begin/end tokens
   share 8,192 tokens. When an input runs out of room, text is cut off, an image
@@ -242,6 +243,10 @@ the same time; the scheduler sends each new wave to an idle device first.
   1024) caps a CPU wave so the queue spreads across workers.
 - `--cuda-devices all|0,1,...` loads the weights on each listed GPU.
   `--pipeline-slots` applies to every GPU.
+- `--media-slots N` (default 2) sets how many image/audio/video requests run
+  their towers on the GPU at once; each slot is a separate context, so media
+  never waits on the text waves. On Metal the final text pass of concurrent
+  media requests is packed into one wave.
 - Beside a GPU, CPU workers are overflow capacity. They start a wave only when
   every GPU slot is busy and more work is queued than the GPUs' next waves can
   absorb. They take only requests up to `--cpu-max-sequence-tokens` (default

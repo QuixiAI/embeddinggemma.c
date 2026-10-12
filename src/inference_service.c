@@ -77,6 +77,13 @@ struct ei_inference_service {
     uint64_t batch_hot_until_ns;
     uint64_t batch_hot_window_ns;
     uint64_t batch_wait_cap_ns;
+    /* Requests accepted but still tokenizing. While any are pending, the wave
+     * collector keeps waiting (up to arrival_wait_ns from the start of the
+     * collection) so a wave is not cut just ahead of requests that are about
+     * to queue: at 512 tokens x c16 the 16 clients otherwise phase-lock into
+     * a 15-request wave plus a lone one. */
+    size_t arriving_requests;
+    uint64_t arrival_wait_ns;
     size_t active_requests;
     size_t active_peak;
 
@@ -388,6 +395,7 @@ static size_t expected_wave(const ei_inference_service *service);
 
 static bool should_collect_batch(const ei_inference_service *service) {
     if (service->config.batch_wait_us == 0) return false;
+    if (service->arriving_requests && service->arrival_wait_ns) return true;
     if (!service->adaptive_batch_wait) return true;
     if (service->queue_head && service->queue_head->queue_next) return true;
     if (service->batch_wave &&
@@ -534,6 +542,7 @@ static void *backend_main(void *opaque) {
                 (uint64_t)service->config.batch_wait_us * 1000ull;
             const uint64_t start_ns = monotonic_ns();
             const uint64_t cap_ns = start_ns + service->batch_wait_cap_ns;
+            const uint64_t arrival_ns = start_ns + service->arrival_wait_ns;
             uint64_t deadline_ns = start_ns + wait_ns;
             size_t seen_queued = service->queued_requests;
             while (!service->stopping &&
@@ -543,6 +552,13 @@ static void *backend_main(void *opaque) {
                     seen_queued = service->queued_requests;
                     uint64_t extended = now + wait_ns;
                     if (extended > cap_ns) extended = cap_ns;
+                    if (extended > deadline_ns) deadline_ns = extended;
+                }
+                if (service->arriving_requests && service->arrival_wait_ns) {
+                    // Accepted requests are still tokenizing: hold the wave
+                    // for them, one wait at a time, within the arrival bound.
+                    uint64_t extended = now + wait_ns;
+                    if (extended > arrival_ns) extended = arrival_ns;
                     if (extended > deadline_ns) deadline_ns = extended;
                 }
                 if (now >= deadline_ns) break;
@@ -873,6 +889,9 @@ ei_inference_service *ei_inference_service_create(
                                : (uint64_t)config->batch_wait_us * 4ull;
     if (cap_us < config->batch_wait_us) cap_us = config->batch_wait_us;
     service->batch_wait_cap_ns = cap_us * 1000ull;
+    const char *arrival_wait = getenv("EI_BATCH_ARRIVAL_WAIT_US");
+    service->arrival_wait_ns =
+        (arrival_wait ? strtoull(arrival_wait, NULL, 10) : 5000ull) * 1000ull;
     uint64_t wait_ns = (uint64_t)config->batch_wait_us * 1000ull;
     service->batch_hot_window_ns = wait_ns > 100000ull
         ? wait_ns * 10ull : 1000000ull;
@@ -1006,6 +1025,7 @@ static bool try_execute_solo_locked(ei_inference_service *service,
     if (service->queue_head != entry || entry->queue_next) return false;
     if (service->queued_requests != 1) return false;
     if (expected_wave(service) > 1) return false;
+    if (service->arriving_requests && service->arrival_wait_ns) return false;
     service->queue_head = NULL;
     service->queue_tail = NULL;
     service->queued_requests = 0;
@@ -1113,6 +1133,9 @@ bool ei_inference_service_embed_batch_with_usage(
     }
     ei_tokens *tokens = ei_xcalloc(batch_size, sizeof(*tokens));
     cache_entry **entries = ei_xmalloc(batch_size * sizeof(*entries));
+    pthread_mutex_lock(&service->mutex);
+    service->arriving_requests += batch_size;
+    pthread_mutex_unlock(&service->mutex);
     if (batch_size > 1 && service->tokenizer_thread_count > 0) {
         tokenize_batch batch = {
             .remaining = batch_size, .texts = texts,
@@ -1153,6 +1176,10 @@ bool ei_inference_service_embed_batch_with_usage(
             for (size_t j = 0; j < batch_size; j++) ei_tokens_free(&tokens[j]);
             free(entries);
             free(tokens);
+            pthread_mutex_lock(&service->mutex);
+            service->arriving_requests -= batch_size;
+            pthread_cond_broadcast(&service->queue_ready);
+            pthread_mutex_unlock(&service->mutex);
             set_error(err, err_len, "input produced no tokens");
             return false;
         }
@@ -1165,6 +1192,7 @@ bool ei_inference_service_embed_batch_with_usage(
     }
 
     pthread_mutex_lock(&service->mutex);
+    service->arriving_requests -= batch_size;
     note_active_request_locked(service, batch_size);
     for (size_t i = 0; i < batch_size; i++) {
         entries[i] = submit_tokens_locked(service, tokens[i].ids, tokens[i].n);

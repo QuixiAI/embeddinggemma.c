@@ -57,6 +57,8 @@ kernel void g2_tensor_mm(device const uchar *w [[buffer(0)]], device float *x [[
 // EPI 0 stores y[n][m]. EPI 1 (GeGLU): W interleaves 32 up rows then the 32
 // matching gate rows per 64-row tile; stores gelu(gate) * up into y[n][m / 2].
 // EPI 2 (PLE gate): stores gelu(y) * ple[token][p.layer][row] (buffer 4).
+// EPI 3: as EPI 1 with the vision tower's quick GELU, x * sigmoid(1.702 x).
+// EPI 4: stores clamp(y, p.lo, p.hi) (the audio tower's output clamps).
 template <int TM, int EPI>
 kernel void g2t_gemm_r(device const half *w [[buffer(0)]], device const float *x [[buffer(1)]],
                        device float *y [[buffer(2)]], constant G2P &p [[buffer(3)]],
@@ -82,7 +84,7 @@ kernel void g2t_gemm_r(device const half *w [[buffer(0)]], device const float *x
              array<int32_t, 2>{1, k});
         op.run(A, B, acc);
     }
-    if (EPI == 1) {
+    if (EPI == 1 || EPI == 3) {
         threadgroup float st[TM * 64];
         for (uint16_t i = 0; i < acc.get_capacity(); ++i)
             if (acc.is_valid_element(i)) {
@@ -92,9 +94,12 @@ kernel void g2t_gemm_r(device const half *w [[buffer(0)]], device const float *x
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int i = tid; i < TM * 32; i += 128) {
             int t = i / 32, c = i % 32;
-            if (t0 + t < int(p.n))
+            if (t0 + t < int(p.n)) {
+                float gate = st[t * 64 + 32 + c];
                 y[(size_t)(t0 + t) * (m / 2) + r0 / 2 + c] =
-                    g2gelu_t(st[t * 64 + 32 + c]) * st[t * 64 + c];
+                    (EPI == 3 ? gate / (1 + exp(-1.702f * gate)) : g2gelu_t(gate)) *
+                    st[t * 64 + c];
+            }
         }
         return;
     }
@@ -106,6 +111,8 @@ kernel void g2t_gemm_r(device const half *w [[buffer(0)]], device const float *x
                 float v = acc[i];
                 if (EPI == 2)
                     v = g2gelu_t(v) * ple[((size_t)t * 24 + p.layer) * 512 + r];
+                if (EPI == 4)
+                    v = clamp(v, p.lo, p.hi);
                 y[(size_t)t * m + r] = v;
             }
         }
@@ -120,13 +127,21 @@ G2T_GEMM_R(32, 1, "g2t_gemm_geglu_32")
 G2T_GEMM_R(64, 1, "g2t_gemm_geglu_64")
 G2T_GEMM_R(32, 2, "g2t_gemm_ple_32")
 G2T_GEMM_R(64, 2, "g2t_gemm_ple_64")
+G2T_GEMM_R(32, 3, "g2t_gemm_qgeglu_32")
+G2T_GEMM_R(64, 3, "g2t_gemm_qgeglu_64")
+G2T_GEMM_R(32, 4, "g2t_gemm_clamp_32")
+G2T_GEMM_R(64, 4, "g2t_gemm_clamp_64")
 // Tensor-op flash attention for packed waves. One threadgroup = TQ queries x
 // one head; 64-key blocks. S = Q K^T and O += P V run on matmul2d; the score
 // tile goes through threadgroup memory for the online softmax (one simdgroup
 // per 8 rows). Rows mask keys outside their sequence bounds and, when
 // p.window != 0, outside |t - s| <= window. K/V are fp16, zero-padded to a
 // 64-key multiple past p.n. Q is fp32 [t][heads][D], output fp32 likewise.
-template <int D, int TQ, int TK, int NSG>
+// DQ is the real head width of Q and the output; D is the K/V row width in
+// memory. D > DQ pads K/V rows with zeros (the g2_half_pad layout) so a head
+// width the driver cannot compile directly (64) runs as a 128-wide tile: the
+// pad columns add exact zeros to S and P.V and are never stored.
+template <int D, int DQ, int TQ, int TK, int NSG>
 kernel void g2t_flash(device const float *q [[buffer(0)]], device const half *k [[buffer(1)]],
                       device const half *v [[buffer(2)]], device float *out [[buffer(3)]],
                       constant G2P &p [[buffer(4)]], device const uint2 *bounds [[buffer(5)]],
@@ -140,7 +155,7 @@ kernel void g2t_flash(device const float *q [[buffer(0)]], device const half *k 
     threadgroup float row_max[TQ], row_sum[TQ], row_alpha[TQ];
     const int n = int(p.n), heads = int(p.heads), kvh = int(p.kv), t0 = int(g.x) * TQ;
     const int h = int(g.y), kh = h / (heads / kvh), w = int(p.window);
-    const int qs = heads * D, ks = kvh * D;
+    const int qs = heads * DQ, ks = kvh * D;
     // Key range of the tile: bounds and windows are monotone in t.
     const int tl = min(t0 + TQ, n) - 1;
     // p.layer == 0: one unpacked sequence (vision), no bounds buffer.
@@ -176,8 +191,8 @@ kernel void g2t_flash(device const float *q [[buffer(0)]], device const half *k 
         for (uint16_t i = 0; i < sc.get_capacity(); ++i)
             if (sc.is_valid_element(i))
                 sc[i] = 0;
-        for (int d0 = 0; d0 < D; d0 += DK) {
-            tq A((device float *)(q + (size_t)t0 * qs + h * D + d0), extents<int32_t, DK, TQ>(),
+        for (int d0 = 0; d0 < DQ; d0 += DK) {
+            tq A((device float *)(q + (size_t)t0 * qs + h * DQ + d0), extents<int32_t, DK, TQ>(),
                  array<int32_t, 2>{1, qs});
             tk B((device half *)(k + (size_t)s0 * ks + kh * D + d0), extents<int32_t, DK, TK>(),
                  array<int32_t, 2>{1, ks});
@@ -231,12 +246,12 @@ kernel void g2t_flash(device const float *q [[buffer(0)]], device const half *k 
         if (o.is_valid_element(i)) {
             auto idx = o.get_multidimensional_index(i);
             int t = t0 + idx[1];
-            if (t < n)
-                out[(size_t)t * qs + h * D + idx[0]] = o[i] / row_sum[idx[1]];
+            if (t < n && idx[0] < DQ)
+                out[(size_t)t * qs + h * DQ + idx[0]] = o[i] / row_sum[idx[1]];
         }
 }
-#define G2T_FLASH(D, TQ, TK, NSG, name)                                                        \
-    template [[host_name(name)]] kernel void g2t_flash<D, TQ, TK, NSG>(                       \
+#define G2T_FLASH(D, DQ, TQ, TK, NSG, name)                                                    \
+    template [[host_name(name)]] kernel void g2t_flash<D, DQ, TQ, TK, NSG>(                   \
         device const float *, device const half *, device const half *, device float *,       \
         constant G2P &, device const uint2 *, uint2, ushort, ushort, ushort);
 // 32 queries x 128 keys won the 2026-10-09 sweep (1.06-1.16x over 32x64);
@@ -244,7 +259,29 @@ kernel void g2t_flash(device const float *q [[buffer(0)]], device const half *k 
 // No D=64 instantiation: any g2t_flash<64, ...> crashes the M5 driver at first
 // dispatch (AGX RayPayloadSizeAlignImpl::merge, macOS 26.6.2); vision attention
 // uses g2_flash_64 instead.
-G2T_FLASH(256, 32, 128, 4, "g2t_flash_256")
-G2T_FLASH(512, 32, 128, 4, "g2t_flash_512")
-G2T_FLASH(256, 32, 64, 4, "g2t_flash_256_k64")
-G2T_FLASH(512, 32, 64, 4, "g2t_flash_512_k64")
+G2T_FLASH(256, 256, 32, 128, 4, "g2t_flash_256")
+G2T_FLASH(512, 512, 32, 128, 4, "g2t_flash_512")
+G2T_FLASH(256, 256, 32, 64, 4, "g2t_flash_256_k64")
+G2T_FLASH(512, 512, 32, 64, 4, "g2t_flash_512_k64")
+// Vision: 64-wide heads on 128-wide zero-padded K/V rows (see g2_half_pad).
+G2T_FLASH(128, 64, 32, 128, 4, "g2t_flash_64p")
+// Long-context tile experiments (EI_GEMMA2_METAL_FLASH2_TILE=q16 | q16k256 |
+// n8): fewer rows per threadgroup (smaller O accumulators per lane at head
+// width 512), 256-key blocks (half the softmax passes), 8 simdgroups.
+G2T_FLASH(256, 256, 16, 128, 4, "g2t_flash_256_q16")
+G2T_FLASH(512, 512, 16, 128, 4, "g2t_flash_512_q16")
+G2T_FLASH(256, 256, 16, 256, 4, "g2t_flash_256_q16k256")
+G2T_FLASH(512, 512, 16, 256, 4, "g2t_flash_512_q16k256")
+G2T_FLASH(256, 256, 32, 128, 8, "g2t_flash_256_n8")
+G2T_FLASH(512, 512, 32, 128, 8, "g2t_flash_512_n8")
+G2T_FLASH(256, 256, 16, 128, 8, "g2t_flash_256_q16n8")
+G2T_FLASH(512, 512, 16, 128, 8, "g2t_flash_512_q16n8")
+G2T_FLASH(256, 256, 16, 256, 8, "g2t_flash_256_q16k256n8")
+G2T_FLASH(512, 512, 16, 256, 8, "g2t_flash_512_q16k256n8")
+G2T_FLASH(256, 256, 32, 128, 16, "g2t_flash_256_n16")
+G2T_FLASH(512, 512, 32, 128, 16, "g2t_flash_512_n16")
+// 64 queries x 64 keys: twice the FLOPs per K/V byte of the 32x128 tile.
+G2T_FLASH(256, 256, 64, 64, 8, "g2t_flash_256_q64k64n8")
+G2T_FLASH(512, 512, 64, 64, 8, "g2t_flash_512_q64k64n8")
+G2T_FLASH(256, 256, 64, 64, 16, "g2t_flash_256_q64k64n16")
+G2T_FLASH(512, 512, 64, 64, 16, "g2t_flash_512_q64k64n16")

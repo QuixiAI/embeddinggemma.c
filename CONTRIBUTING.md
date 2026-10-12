@@ -294,14 +294,68 @@ exactly (goldens identical to 9 digits):
   disables the epilogues).
   `EI_GEMMA2_METAL_TENSOR2_MIN_TOKENS` / `_WIDE_TOKENS` move the crossovers.
 - `EI_GEMMA2_METAL_FLASH2=1`: from 16 tokens, `matmul2d` flash attention for
-  head widths 256/512: 32 queries x 128 keys (`EI_GEMMA2_METAL_FLASH2_TILE=k64`
-  for 64 keys), per-row packed-sequence and window masks, tile key ranges
-  clipped to the visible span; fp16 K/V written by the q/k/v norm pass. Vision
-  (width 64) uses the simdgroup flash kernel: any `matmul2d` flash at width 64
-  crashes the M5 driver. `EI_GEMMA2_METAL_FLASH2_MIN_TOKENS` moves the
-  threshold.
+  head widths 256/512: 32 queries x 128 keys on 8 simdgroups
+  (`EI_GEMMA2_METAL_FLASH2_TILE`: `n4` is the former 4-simdgroup tile, same
+  arithmetic, 0.8-0.9x at 2k-8k tokens; `k64`, `q16`, `q16k256`, `n16`,
+  `q16n8`, `q16k256n8` are the other instantiations), per-row packed-sequence
+  and window masks, tile key ranges clipped to the visible span; fp16 K/V written by the q/k/v norm pass. Vision
+  (width 64) uses the padded tensor kernel below (`FLASH64`), else the
+  simdgroup flash kernel: any `matmul2d` flash at width 64 crashes the M5
+  driver. `EI_GEMMA2_METAL_FLASH2_MIN_TOKENS` moves the threshold.
 - `EI_GEMMA2_METAL_SKIP=attn,mm,qkv,geglu,ple,post,qknorm`: diagnostic only;
-  drops those dispatches to size their GPU share. Output is invalid.
+  drops those dispatches to size their GPU share. Output is invalid (`attn`,
+  `mm` and `post` also apply to the media towers).
+
+The media stack (2026-10-10, `perf/optimization_status.md`), on by default
+(FLASH64 and VFUSED where Metal 4 is available); `0` turns a route off:
+
+- `EI_GEMMA2_METAL_FLASH64=1`: vision attention (64-wide heads) on the
+  `matmul2d` flash kernel over 128-wide zero-padded fp16 K/V rows
+  (`g2t_flash_64p`, `g2_half_pad`): the pad columns add exact zeros to Q.K^T
+  and P.V and are never stored, which sidesteps the driver crash of every
+  64-wide instantiation. Attention FLOPs are 1.5x but run on tensor ops.
+- `EI_GEMMA2_METAL_VFUSED=1`: fused vision layer: q/k/v norms + 2-D RoPE +
+  padded fp16 K/V in one pass (`g2_vqkv_post`), up/gate interleaved per tile
+  with the quick-GELU in the GEMM epilogue (`g2t_gemm_qgeglu_*`), post-norm +
+  residual + next pre-norm in one pass (`g2_post_add_768`). 10 dispatches per
+  layer instead of 17.
+- `EI_GEMMA2_METAL_AFUSED=1`: audio clamps folded into their producers (norm,
+  SiLU, attention, post-add) and the GEMM epilogue (`g2t_gemm_clamp_*`), and
+  the Gemma sandwiches in `g2_post_add_1024`; the 18 clamp passes per layer
+  are gone. The patch embedding (as [768][768]) and every 2-D `a.*` projector
+  weight now have fp16 copies too (the audio pre-encode and input projection
+  were on the tile route).
+- `--media-slots N` (server, 1..8, default 2): GPU media contexts. Each media
+  request runs its towers on the least-loaded slot under that slot's lock, so
+  media requests overlap on the GPU and never take the global inference lock
+  (the CPU backend still shares the engine pool under it). 1 is the old
+  behaviour minus the global lock.
+- Media finishes (the text pass over a media request's assembled rows) queue
+  to one thread that packs every waiting finish into a wave on its own
+  context (`ei_gemma2_metal_batch_inputs`); `EI_MEDIA_FINISH_BATCH=0` runs
+  them one by one as before. Metal only.
+- Video frames decode and resize in parallel (up to 8 threads), then on Metal
+  runs of same-sized frames go through one packed vision wave
+  (`ei_gemma2_metal_vision_frames`: tokens laid out frame after frame, per-frame
+  kernels index `t % p.k`, attention and RoPE take per-token bounds; at most
+  10,080 patch tokens per wave) and commit in stream order.
+  `EI_GEMMA2_VIDEO_BATCH=0` runs one frame per wave. On macOS PNG IDAT
+  streams inflate through libcompression (`EI_PNG_INFLATE=0` restores stb's
+  inflate; output is identical) and base64 decodes through a table (18x).
+  `EI_MEDIA_TIMING=1`
+  prints each media request's stage times (base64, decode, resize, tower,
+  log-mel, finish) on stderr. Parity with single-frame
+  towers >= 0.999999 on every attention route (exact on `g2_attention`); the
+  wave is 1.08x at 4 and 1.11x at 8 432x432 frames, the tower being
+  compute-bound already at 729 patches. The log-mel front end tabulates FFT
+  twiddles and uses the sparse filter ranges (identical values, 3-4x less CPU).
+- `make bench-gemma2-media [ITEMS="v768 a30 v960x960 video4 v432x432x8"]
+  [EI_BENCH_STREAMS=N] [EI_BENCH_REPEAT=N]` times the towers (`vWxHxF` is a
+  packed F-frame wave) and the mixed-input text pass, repeating the list
+  round-robin with `EI_BENCH_REPEAT` so configurations interleave on this
+  noisy host; `perf/loadgen_media.c` posts a content-object body
+  (`perf/media_fixtures.py` writes image/audio/video fixtures) at a given
+  concurrency.
 - `--pipeline-slots N` (server, 1..8): N text waves in flight on separate
   queues/workspaces sharing the weights; media gets its own context, so text
   waves no longer take the global inference lock. 1 is the old behaviour.
@@ -521,6 +575,13 @@ Important production controls:
   scheduler tracks the peak number of concurrently in-flight requests since
   the previous dispatch and both keeps collecting while more clients are in
   flight than queued and dispatches the moment the queue reaches that peak.
+- `EI_BATCH_ARRIVAL_WAIT_US=N` (default 5000, 0 disables): while accepted
+  requests are still tokenizing, the collector keeps extending its deadline
+  (one `--batch-wait-us` at a time, at most N us from the start of the
+  collection) and solo inline execution yields, so a wave is not cut just
+  ahead of requests about to queue. At 512 tokens x c16 the 16 clients
+  otherwise phase-lock into a 15-request wave plus a lone one; with it every
+  wave carries 16 (wave log) and the c16 p99 drops from ~2 waves to ~1.
 - `EI_BATCH_WAIT_MAX_US=N`: cap the extended collection deadline. New arrivals
   during collection extend the base `--batch-wait-us` deadline, bounded by
   this cap; the default is four times the base delay.

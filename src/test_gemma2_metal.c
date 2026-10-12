@@ -27,7 +27,8 @@ int main(int argc, char **argv) {
     // The fast route is EI_GEMMA2_ROUTE_FLAGS (comma-separated EI_GEMMA2_METAL_*
     // names; the rest stay "0"), default FUSED,TENSOR2,FLASH2, the shipped
     // default. The reference route has every flag off.
-    const char *all[] = {"TENSOR", "FLASH", "GEMV", "FUSED", "TENSOR2", "FLASH2"};
+    const char *all[] = {"TENSOR", "FLASH",   "GEMV",   "FUSED", "TENSOR2",
+                         "FLASH2", "FLASH64", "VFUSED", "AFUSED"};
     char name[64];
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) {
         snprintf(name, sizeof name, "EI_GEMMA2_METAL_%s", all[i]);
@@ -36,12 +37,13 @@ int main(int argc, char **argv) {
     ei_engine e;
     ei_engine_load_backend(&e, argv[1], "metal");
     const char *route = getenv("EI_GEMMA2_ROUTE_FLAGS");
-    char *flags = strdup(route && *route ? route : "FUSED,TENSOR2,FLASH2"), *save = NULL;
+    char *flags = strdup(route && *route ? route : "FUSED,TENSOR2,FLASH2,FLASH64,VFUSED,AFUSED"),
+         *save = NULL;
     for (char *f = strtok_r(flags, ",", &save); f; f = strtok_r(NULL, ",", &save)) {
         snprintf(name, sizeof name, "EI_GEMMA2_METAL_%s", f);
         setenv(name, "1", 1);
     }
-    printf("fast route: %s\n", route && *route ? route : "FUSED,TENSOR2,FLASH2");
+    printf("fast route: %s\n", route && *route ? route : "FUSED,TENSOR2,FLASH2,FLASH64,VFUSED,AFUSED");
     free(flags);
     char err[512];
     void *fast = ei_gemma2_metal_create(&e.model.gguf, err, sizeof err);

@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L /* clock_gettime */
 #if defined(EI_ENABLE_METAL)
 #include "gemma2_metal.h"
 #endif
@@ -5,8 +6,49 @@
 #include "gemma2_cuda.h"
 #endif
 #include "media.h"
+#include <pthread.h>
 #include <math.h>
 #include <limits.h>
+#if defined(__APPLE__)
+/* PNG IDAT inflate through libcompression (several times stb's inflate on a
+ * 768x768 photo); stb's own path remains for the zlib header checks it does
+ * not do, for output sizes other than the exact raw length (interlaced files)
+ * and when EI_PNG_INFLATE=0. Output bytes are identical: inflate is exact. */
+#include <compression.h>
+static char *stb_zlib_fallback(const char *buffer, int len, int initial_size, int *outlen,
+                               int parse_header);
+static char *ei_png_inflate(const char *buffer, int len, int initial_size, int *outlen,
+                            int parse_header) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("EI_PNG_INFLATE");
+        enabled = !(e && !strcmp(e, "0"));
+    }
+    const unsigned char *src = (const unsigned char *)buffer;
+    size_t src_len = (size_t)len;
+    if (enabled && parse_header && len > 6) {
+        unsigned cmf = src[0], flg = src[1];
+        /* deflate method, no preset dictionary, header check. */
+        if ((cmf & 15) == 8 && !(flg & 32) && (cmf * 256 + flg) % 31 == 0) {
+            src += 2;
+            src_len -= 6; /* header and adler32 trailer */
+            size_t guess = (size_t)initial_size, cap = guess + 64;
+            char *dst = malloc(cap);
+            if (dst) {
+                size_t got = compression_decode_buffer((uint8_t *)dst, cap, src, src_len, NULL,
+                                                       COMPRESSION_ZLIB);
+                if (got == guess) {
+                    *outlen = (int)got;
+                    return dst;
+                }
+                free(dst);
+            }
+        }
+    }
+    return stb_zlib_fallback(buffer, len, initial_size, outlen, parse_header);
+}
+#define STBI_ZLIB_DECODE_HOOK ei_png_inflate
+#endif
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_STDIO
 #define STBI_ONLY_JPEG
@@ -15,6 +57,36 @@
 #define STBI_ONLY_PNM
 #define STBI_MAX_DIMENSIONS 8192
 #include "vendor/stb_image.h"
+#if defined(__APPLE__)
+static char *stb_zlib_fallback(const char *buffer, int len, int initial_size, int *outlen,
+                               int parse_header) {
+    return stbi_zlib_decode_malloc_guesssize_headerflag(buffer, len, initial_size, outlen,
+                                                        parse_header);
+}
+#endif
+#include <time.h>
+/* EI_MEDIA_TIMING=1: per-stage wall times of the media front ends on stderr. */
+static bool media_timing(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("EI_MEDIA_TIMING");
+        on = e && strcmp(e, "0") != 0;
+    }
+    return on;
+}
+static double media_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+#define MEDIA_STAGE(label, since)                                                              \
+    do {                                                                                      \
+        if (media_timing()) {                                                                 \
+            double now_ = media_now_ms();                                                     \
+            fprintf(stderr, "media %-10s %7.2f ms\n", label, now_ - (since));               \
+            (since) = now_;                                                                   \
+        }                                                                                     \
+    } while (0)
 
 #define MEDIA_CONTEXT 8192
 static bool fail(char *err, size_t n, const char *message) {
@@ -86,7 +158,36 @@ static uint8_t *decode(const char *data, size_t len, size_t *size) {
         return NULL;
     uint8_t *out = ei_xmalloc(len / 4 * 3);
     size_t n = 0;
-    for (size_t i = 0; i < len; i += 4) {
+    /* Every quad but the last holds no padding: a 256-entry table decodes
+     * them 4 at a time with one validity check per quad (invalid bytes and
+     * '=' map to 0xFF). The last quad takes the padding rules below. */
+    static uint8_t table[256];
+    static bool table_ready = false;
+    if (!table_ready) {
+        memset(table, 0xFF, sizeof table);
+        for (int c = 0; c < 256; ++c) {
+            int v = b64digit((unsigned char)c);
+            if (v >= 0)
+                table[c] = (uint8_t)v;
+        }
+        table_ready = true;
+    }
+    size_t i = 0, fast = len - 4;
+    const uint8_t *in = (const uint8_t *)data;
+    for (; i < fast; i += 4) {
+        uint8_t a = table[in[i]], b = table[in[i + 1]], c = table[in[i + 2]],
+                d = table[in[i + 3]];
+        if ((a | b | c | d) & 0xC0) {
+            free(out);
+            return NULL;
+        }
+        uint32_t v = (uint32_t)a << 18 | (uint32_t)b << 12 | (uint32_t)c << 6 | d;
+        out[n] = (uint8_t)(v >> 16);
+        out[n + 1] = (uint8_t)(v >> 8);
+        out[n + 2] = (uint8_t)v;
+        n += 3;
+    }
+    for (; i < len; i += 4) {
         int a = b64digit(data[i]), b = b64digit(data[i + 1]);
         int c = data[i + 2] == '=' ? 0 : b64digit(data[i + 2]),
             d = data[i + 3] == '=' ? 0 : b64digit(data[i + 3]);
@@ -115,6 +216,12 @@ static double cubic(double x) {
 }
 /* Separable antialiased Pillow-compatible bicubic filter, rounded after each axis. */
 static uint8_t *resize_axis(const uint8_t *src, int width, int height, int target, bool vertical) {
+    if (target == (vertical ? height : width)) {
+        size_t bytes = (size_t)width * height * 3;
+        uint8_t *copy = ei_xmalloc(bytes);
+        memcpy(copy, src, bytes);
+        return copy;
+    }
     int before = vertical ? height : width, lines = vertical ? width : height;
     uint8_t *out = ei_xmalloc((size_t)target * lines * 3);
     double scale = (double)before / target, filter = fmax(1, scale), support = 2 * filter;
@@ -163,7 +270,9 @@ static void append_soft(ei_media_input *m, const float *soft, size_t n, int star
 bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budget, char *err,
                     size_t err_len) {
     size_t size = 0;
+    double t0 = media_timing() ? media_now_ms() : 0;
     uint8_t *bytes = decode(base64, len, &size);
+    MEDIA_STAGE("base64", t0);
     if (!bytes)
         return fail(err, err_len, "invalid image base64");
     int w, h, c;
@@ -181,6 +290,7 @@ bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budge
     }
     uint8_t *rgb = stbi_load_from_memory(bytes, (int)size, &w, &h, &c, 3);
     free(bytes);
+    MEDIA_STAGE("decode", t0);
     if (!rgb)
         return fail(err, err_len, "cannot decode image (expected PNG, JPEG, BMP, or PNM)");
     int tw = (int)fmax(48, round(w / 48.0) * 48), th = (int)fmax(48, round(h / 48.0) * 48);
@@ -215,6 +325,7 @@ bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budge
         memcpy(canvas + ((size_t)(y + oy) * tw + ox) * 3, resized + (size_t)y * rw * 3,
                (size_t)rw * 3);
     free(resized);
+    MEDIA_STAGE("resize", t0);
     float *soft = NULL;
     size_t n = 0;
     bool ok;
@@ -231,6 +342,180 @@ bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budge
     ok = ei_gemma2_vision(m->projector, m->pool, canvas, tw, th, &soft, &n, err, err_len);
     if (m->lock)
         pthread_mutex_unlock(m->lock);
+    MEDIA_STAGE("vision", t0);
+    free(canvas);
+    if (ok && n + 2 <= avail(m))
+        append_soft(m, soft, n, 255999, 258882);
+    free(soft);
+    return ok;
+}
+/* Decode and resize for `budget` soft tokens (no room check: the stream
+ * position is only known at commit). */
+void ei_media_image_prepare(const ei_media_input *m, const char *base64, size_t len, int budget,
+                            ei_media_frame *frame) {
+    (void)m;
+    *frame = (ei_media_frame){.budget = budget, .ok = true};
+    size_t size = 0;
+    uint8_t *bytes = decode(base64, len, &size);
+    if (!bytes) {
+        frame->ok = false;
+        snprintf(frame->err, sizeof frame->err, "invalid image base64");
+        return;
+    }
+    int w, h, c;
+    if (!stbi_info_from_memory(bytes, (int)size, &w, &h, &c) || w < 1 || h < 1 ||
+        (size_t)w * h > 16 * 1024 * 1024) {
+        free(bytes);
+        frame->ok = false;
+        snprintf(frame->err, sizeof frame->err, "unsupported image or image exceeds 16 megapixels");
+        return;
+    }
+    if (budget < 70) {
+        free(bytes);
+        return;
+    }
+    uint8_t *rgb = stbi_load_from_memory(bytes, (int)size, &w, &h, &c, 3);
+    free(bytes);
+    if (!rgb) {
+        frame->ok = false;
+        snprintf(frame->err, sizeof frame->err,
+                 "cannot decode image (expected PNG, JPEG, BMP, or PNM)");
+        return;
+    }
+    int tw = (int)fmax(48, round(w / 48.0) * 48), th = (int)fmax(48, round(h / 48.0) * 48);
+    double area = (double)tw * th, max = (double)budget * 48 * 48, min = 70.0 * 48 * 48;
+    if (area > max) {
+        double scale = sqrt(max / ((double)w * h));
+        tw = (int)fmax(48, floor(w * scale / 48) * 48);
+        th = (int)fmax(48, floor(h * scale / 48) * 48);
+    } else if (area < min) {
+        double scale = sqrt(min / ((double)w * h));
+        tw = (int)ceil(w * scale / 48) * 48;
+        th = (int)ceil(h * scale / 48) * 48;
+    }
+    /* Preserve aspect ratio within the aligned canvas, center-pad with black. */
+    double scale = fmin((double)tw / w, (double)th / h);
+    int rw = (int)ceil(w * scale), rh = (int)ceil(h * scale);
+    if (rw > tw)
+        rw = tw;
+    if (rh > th)
+        rh = th;
+    uint8_t *horizontal = resize_axis(rgb, w, h, rw, false);
+    stbi_image_free(rgb);
+    uint8_t *resized = resize_axis(horizontal, rw, h, rh, true);
+    free(horizontal);
+    uint8_t *canvas = ei_xcalloc((size_t)tw * th, 3);
+    int ox = (tw - rw) / 2, oy = (th - rh) / 2;
+    for (int y = 0; y < rh; ++y)
+        memcpy(canvas + ((size_t)(y + oy) * tw + ox) * 3, resized + (size_t)y * rw * 3,
+               (size_t)rw * 3);
+    free(resized);
+    frame->canvas = canvas;
+    frame->width = tw;
+    frame->height = th;
+}
+void ei_media_frame_free(ei_media_frame *frame) {
+    free(frame->canvas);
+    free(frame->soft);
+    frame->canvas = NULL;
+    frame->soft = NULL;
+}
+void ei_media_frames_encode(ei_media_input *m, ei_media_frame *frames, size_t n) {
+#if defined(EI_ENABLE_METAL)
+    const char *flag = getenv("EI_GEMMA2_VIDEO_BATCH");
+    if (!m->metal || (flag && !strcmp(flag, "0")))
+        return;
+    for (size_t i = 0; i < n;) {
+        ei_media_frame *f = &frames[i];
+        if (!f->ok || !f->canvas) {
+            i++;
+            continue;
+        }
+        /* The run of same-sized frames that fits one wave. */
+        size_t per = (size_t)f->width * f->height / 256, count = 1;
+        while (i + count < n && frames[i + count].ok && frames[i + count].canvas &&
+               frames[i + count].width == f->width && frames[i + count].height == f->height &&
+               per * (count + 1) <= EI_GEMMA2_VISION_WAVE_TOKENS)
+            count++;
+        const uint8_t *rgb[64];
+        size_t batch = count < 64 ? count : 64;
+        for (size_t j = 0; j < batch; j++)
+            rgb[j] = frames[i + j].canvas;
+        float *soft = NULL;
+        size_t total = 0;
+        char err[160];
+        if (m->lock)
+            pthread_mutex_lock(m->lock);
+        bool ok = ei_gemma2_metal_vision_frames(m->metal, m->projector, rgb, (int)batch, f->width,
+                                                f->height, &soft, &total, err, sizeof err);
+        if (m->lock)
+            pthread_mutex_unlock(m->lock);
+        if (ok) {
+            size_t each = total / batch;
+            for (size_t j = 0; j < batch; j++) {
+                frames[i + j].soft = ei_xmalloc(each * 512 * sizeof *soft);
+                memcpy(frames[i + j].soft, soft + j * each * 512, each * 512 * sizeof *soft);
+                frames[i + j].tokens = each;
+            }
+        } else
+            for (size_t j = 0; j < batch; j++) {
+                frames[i + j].ok = false;
+                snprintf(frames[i + j].err, sizeof frames[i + j].err, "%s", err);
+            }
+        free(soft);
+        i += batch;
+    }
+#else
+    (void)m;
+    (void)frames;
+    (void)n;
+#endif
+}
+/* Run the tower on a prepared canvas (or take the rows ei_media_frames_encode
+ * produced) and append its soft tokens. When the stream no longer has room for
+ * the prepared budget, the image is re-prepared at the room left (the
+ * sequential path's exact behaviour). */
+bool ei_media_image_commit(ei_media_input *m, ei_media_frame *frame, const char *base64,
+                           size_t len, char *err, size_t err_len) {
+    bool ok = frame->ok;
+    if (!ok)
+        snprintf(err, err_len, "%s", frame->err);
+    uint8_t *canvas = frame->canvas;
+    float *soft = frame->soft;
+    frame->canvas = NULL;
+    frame->soft = NULL;
+    if (!ok || !canvas) {
+        free(canvas);
+        free(soft);
+        return ok;
+    }
+    if ((size_t)frame->budget + 2 > avail(m) ||
+        (size_t)frame->width * frame->height / 2304 + 2 > avail(m)) {
+        free(canvas);
+        free(soft);
+        return ei_media_image(m, base64, len, frame->budget, err, err_len);
+    }
+    if (soft) {
+        free(canvas);
+        if (frame->tokens + 2 <= avail(m))
+            append_soft(m, soft, frame->tokens, 255999, 258882);
+        free(soft);
+        return true;
+    }
+    size_t n = 0;
+    if (m->lock)
+        pthread_mutex_lock(m->lock);
+#if defined(EI_ENABLE_METAL)
+    if (m->metal) ok = ei_gemma2_metal_vision(m->metal, m->projector, canvas, frame->width, frame->height, &soft, &n, err, err_len);
+    else
+#endif
+#if defined(EI_ENABLE_CUDA)
+    if (m->cuda) ok = ei_gemma2_cuda_vision(m->cuda, m->projector, canvas, frame->width, frame->height, &soft, &n, err, err_len);
+    else
+#endif
+    ok = ei_gemma2_vision(m->projector, m->pool, canvas, frame->width, frame->height, &soft, &n, err, err_len);
+    if (m->lock)
+        pthread_mutex_unlock(m->lock);
     free(canvas);
     if (ok && n + 2 <= avail(m))
         append_soft(m, soft, n, 255999, 258882);
@@ -243,8 +528,21 @@ static uint32_t u32(const uint8_t *p) {
 static uint16_t u16(const uint8_t *p) {
     return (uint16_t)p[0] | (uint16_t)p[1] << 8;
 }
-/* Radix-2 FFT, unnormalized, for the model's 512-point STFT. */
+/* Radix-2 FFT, unnormalized, for the model's 512-point STFT. Twiddles are
+ * tabulated once with the same expression the butterflies used to evaluate
+ * per call (2,304 cosf/sinf pairs per frame), so results are unchanged. */
+static float fft_cos[512], fft_sin[512];
+static pthread_once_t fft_once = PTHREAD_ONCE_INIT;
+static void fft_tables(void) {
+    for (int width = 2; width <= 512; width *= 2)
+        for (int j = 0; j < width / 2; ++j) {
+            float theta = -6.283185307179586f * j / width;
+            fft_cos[width / 2 + j] = cosf(theta);
+            fft_sin[width / 2 + j] = sinf(theta);
+        }
+}
 static void fft(float re[512], float im[512]) {
+    pthread_once(&fft_once, fft_tables);
     for (int i = 1, j = 0; i < 512; ++i) {
         int bit = 256;
         while (j & bit) {
@@ -261,7 +559,7 @@ static void fft(float re[512], float im[512]) {
     for (int width = 2; width <= 512; width *= 2)
         for (int start = 0; start < 512; start += width)
             for (int j = 0; j < width / 2; ++j) {
-                float theta = -6.283185307179586f * j / width, co = cosf(theta), si = sinf(theta);
+                float co = fft_cos[width / 2 + j], si = fft_sin[width / 2 + j];
                 int a = start + j, b = a + width / 2;
                 float r = co * re[b] - si * im[b], v = si * re[b] + co * im[b];
                 re[b] = re[a] - r;
@@ -272,7 +570,9 @@ static void fft(float re[512], float im[512]) {
 }
 bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err, size_t err_len) {
     size_t size = 0;
+    double t0 = media_timing() ? media_now_ms() : 0;
     uint8_t *bytes = decode(base64, len, &size);
+    MEDIA_STAGE("base64", t0);
     if (!bytes || size < 12 || memcmp(bytes, "RIFF", 4) || memcmp(bytes + 8, "WAVE", 4)) {
         free(bytes);
         return fail(err, err_len, "audio must be a base64 WAV file");
@@ -330,16 +630,24 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
     }
     free(bytes);
     float filters[128][257], edges[130];
+    int first[128], last[128];
     float maxmel = 2595.0f * log10f(1 + 8000.0f / 700);
     for (int i = 0; i < 130; ++i)
         edges[i] = 700 * (powf(10, maxmel * i / 129 / 2595) - 1);
-    for (int bin = 0; bin < 128; ++bin)
+    for (int bin = 0; bin < 128; ++bin) {
+        first[bin] = 257;
+        last[bin] = -1;
         for (int f = 0; f < 257; ++f) {
             float hz = f * 31.25f;
             filters[bin][f] =
                 fmaxf(0, fminf((hz - edges[bin]) / (edges[bin + 1] - edges[bin]),
                                (edges[bin + 2] - hz) / (edges[bin + 2] - edges[bin + 1])));
+            if (filters[bin][f] != 0) {
+                if (f < first[bin]) first[bin] = f;
+                last[bin] = f;
+            }
         }
+    }
     token(m, 256000);
     bool ok = true;
     for (size_t offset = 0; ok && offset < samples; offset += 480000) {
@@ -349,6 +657,7 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
         int frames = ((int)count - 161) / 160 + 1;
         /* A sub-frame tail still carries signal; pad it to one analysis frame. */
         if (frames < 1) frames = 1;
+        MEDIA_STAGE("wav", t0);
         float *mel = ei_xcalloc((size_t)frames * 128, sizeof(float));
         for (int t = 0; t < frames; ++t) {
             float re[512] = {0}, im[512] = {0}, mag[257];
@@ -362,11 +671,12 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
                 mag[f] = sqrtf(re[f] * re[f] + im[f] * im[f]);
             for (int bin = 0; bin < 128; ++bin) {
                 double sum = 0;
-                for (int f = 0; f < 257; ++f)
+                for (int f = first[bin]; f <= last[bin]; ++f)
                     sum += mag[f] * filters[bin][f];
                 mel[(size_t)t * 128 + bin] = logf(fmaxf(0.001f, (float)sum));
             }
         }
+        MEDIA_STAGE("logmel", t0);
         float *soft = NULL;
         size_t n = 0;
         if (m->lock)
@@ -382,6 +692,7 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
         ok = ei_gemma2_audio(m->projector, m->pool, mel, frames, &soft, &n, err, err_len);
         if (m->lock)
             pthread_mutex_unlock(m->lock);
+        MEDIA_STAGE("audio", t0);
         free(mel);
         if (ok) {
             /* Per-chunk rounding can overshoot the estimate; keep the end marker's slot. */
@@ -399,11 +710,19 @@ static bool finish_text(ei_media_input *m, float out[768], char *err, size_t err
 bool ei_media_finish(ei_media_input *m, float out[768], char *err, size_t err_len) {
     if (m->tokenizer->model->add_eos)
         token(m, m->tokenizer->model->eos_id);
-    if (m->lock)
-        pthread_mutex_lock(m->lock);
-    bool ok = finish_text(m, out, err, err_len);
-    if (m->lock)
-        pthread_mutex_unlock(m->lock);
+    double t0 = media_timing() ? media_now_ms() : 0;
+    bool ok;
+    if (m->finish)
+        ok = m->finish(m->finish_ctx, m->inputs, m->n, out, err, err_len);
+    else {
+        if (m->lock)
+            pthread_mutex_lock(m->lock);
+        ok = finish_text(m, out, err, err_len);
+        if (m->lock)
+            pthread_mutex_unlock(m->lock);
+    }
+    if (media_timing())
+        fprintf(stderr, "media finish     %7.2f ms (%zu rows)\n", media_now_ms() - t0, m->n);
     return ok;
 }
 static bool finish_text(ei_media_input *m, float out[768], char *err, size_t err_len) {

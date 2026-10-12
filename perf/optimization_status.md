@@ -3324,3 +3324,399 @@ nothing, and retried without waiting, holding the service mutex, so the GPU
 thread could never release its slot (server at 100% CPU, GPU idle). Both now
 use one `in_backlog` rule, an empty take waits on the condvar, and
 `test_inference_service` reproduces the boundary (it hangs the old code 3/3).
+
+## 2026-10-10: EmbeddingGemma 2 Metal media pass (text, image, audio, video; c1-c64)
+
+Host: M5 Max, macOS 26.6.2, **on battery (83-70%, discharging)** with a
+resident VM and user builds; engine A/Bs are back-to-back in one process
+(`make bench-gemma2-media`, median of 5 after 2 warmups), HTTP cells are the
+same script and binary before/after (`perf/loadgen.c`, `perf/loadgen_media.c`
+with `perf/media_fixtures.py` fixtures, 5 s per cell, response cache off).
+Flags land default-on (`FLASH64`, `VFUSED` where Metal 4; `AFUSED`;
+`--media-slots 2`; media finish batching); every route is `0`-able and the
+route test compares the defaults against every route off.
+
+Where the media time went (ablation with `EI_GEMMA2_METAL_SKIP`, 768x768
+image = 2,304 patches): GEMMs 18.5 ms at ~37 TFLOPS (the ceiling), attention
+40 ms on the simdgroup kernel (261 GFLOP at ~6.5 TFLOPS), 7 ms of norms,
+rotary and elementwise passes. 30 s audio: GEMMs 12 ms, 9.4 ms of elementwise
+passes (two clamps per GEMM, 46 dispatches per layer), attention 1.5 ms.
+
+Engine, ms per call (defaults before -> after; tokens are soft tokens):
+
+| item | before | after | speedup |
+|---|---:|---:|---:|
+| vision 432x432 (81) | 12.4 | 8.6 | 1.44x |
+| vision 768x768 (256) | 58.8 | 33.3 | 1.77x |
+| vision 960x960 (400) | 120.8 | 64.7 | 1.87x |
+| audio 10 s (250) | 14.7 | 9.4 | 1.56x |
+| audio 30 s (750) | 29.3 | 19.4 | 1.51x |
+
+Steps, each measured against the one before:
+
+- Vision attention on tensor ops: every `g2t_flash<64, ...>` crashes the
+  driver, so K/V are written as 128-wide zero-padded fp16 rows and a
+  `<D=128, DQ=64>` instantiation reads 64-wide Q and stores 64 columns. Exact
+  (pad columns add zeros). 768x768 58.8 -> 40.0 ms, 960x960 120.8 -> 73.8.
+- Fused vision layer (`g2_vqkv_post`: q/k/v norms + 2-D RoPE + padded fp16
+  K/V; quick-GELU up/gate epilogue on an interleaved weight; `g2_post_add_768`
+  sandwiches): 17 -> 10 dispatches per layer. 768x768 40.0 -> 33.3 ms, 432x432
+  10.7 -> 8.6. Remaining: GEMMs ~19 ms at the ceiling, attention ~14 ms (1.5x
+  the FLOPs of a 64-wide kernel), ~1 ms other.
+- fp16 copies for the F32 patch embedding (as [768][768]) and every 2-D `a.*`
+  projector weight: the audio pre-encode (1024x1536 Q8) and input projection
+  (F32) had been on the per-tile decode GEMM. Audio 10 s 14.7 -> 10.8 ms.
+- Audio clamps folded into producers and the GEMM epilogue, Gemma sandwiches
+  in `g2_post_add_1024`: 10 s 11.0 -> 9.4 ms, 30 s 23.4 -> 19.4.
+- Media slots (`--media-slots`, default 2; per-slot context and lock; text
+  waves no longer take the global lock either) and packing the media text
+  finishes into one wave on a dedicated context: image432 c8 63.6 -> 75.6
+  (slots) -> 103 req/s (finish batching); 4 slots was no better than 2.
+- CPU front ends: log-mel twiddle tables and sparse mel filters (bit-identical,
+  10 s audio HTTP c1 38.9 -> 24.2 ms), identity resize short-cut, video frames
+  decoded in parallel (video c1 62 -> 50 ms).
+
+Rejected:
+
+- 16 tokens per GEMV decode for 16-39-token waves: 16x1 4.3 -> 5.6 ms, 32x1
+  5.3 -> 7.1 (every case 1.3x slower). The short-wave GEMV is bound by its
+  per-token inner work, not by re-reading weights.
+- Register-resident flash attention via `get_left_input_cooperative_tensor` /
+  `reduce_rows`: the MPP header static-asserts a single-simdgroup scope for
+  cooperative-tensor inputs, so the 32x128 tile shared by 4 simdgroups cannot
+  be kept; per-simdgroup 8-row tiles would need 128+ accumulators per lane at
+  width 512. Not built.
+- 4 media slots: image432 c16 71 vs 77 req/s with 2; audio c8 69 vs 74.
+
+Observed, not changed: at 512 tokens x c16 the text service settles into a
+15-request wave (7,596 tokens, 101 ms) followed by a lone 1-request wave
+(10.8 ms) although all 16 fit in 8,192 tokens; merging them is worth ~5%.
+8,170-word requests spend ~50 ms of a 318 ms c1 round trip outside the GPU
+(tokenizing and JSON).
+
+Correctness: `make test-gemma2-metal-routes` (defaults vs all off: text
+1..8192 >= 0.99996 packed, vision >= 0.9999986, audio >= 0.999999),
+`make test-gemma2-metal` (goldens: text 0.999720428, vision 0.999815593,
+audio 0.999738422), `make test-metal test-http-metal` (300M, packed parity
+0.999964714 as before), `make test-gemma2` (CPU profile, shares media.c).
+CUDA builds of the media-slot code compile only on the CUDA boxes and were not
+run there (the finish batcher is Metal-only).
+
+HTTP (same script before/after, req/s; p50 in ms for c1):
+
+| cell | before | after | speedup | c1 p50 before -> after |
+|---|---:|---:|---:|---|
+| image768 c1 / c8 / c16 / c32 / c64 | 11.8 / 13.4 / 13.0 / 13.0 / 16.4 | 18.4 / 22.6 / 20.4 / 22.6 / 30.0 | 1.56x / 1.69x / 1.57x / 1.74x / 1.83x | 84.6 -> 53.1 ms |
+| image432 c1 / c8 / c16 / c32 / c64 | 42.2 / 50.6 / 51.6 / 50.6 / 61.8 | 55.0 / 85.0 / 73.2 / 76.6 / 87.2 | 1.30x / 1.68x / 1.42x / 1.51x / 1.41x | 23.6 -> 18.1 ms |
+| audio10s c1 / c8 / c16 / c32 / c64 | 25.6 / 48.6 / 49.6 / 53.6 / 62.4 | 43.6 / 79.8 / 68.8 / 77.2 / 84.0 | 1.70x / 1.64x / 1.39x / 1.44x / 1.35x | 38.9 -> 22.8 ms |
+| video4 c1 / c8 / c16 / c32 / c64 | 12.2 / 15.8 / 16.0 / 19.2 / 25.6 | 19.4 / 21.2 / 19.2 / 24.0 / 25.6 | 1.59x / 1.34x / 1.20x / 1.25x / 1.00x | 82.0 -> 51.5 ms |
+| text20 c1 / c8 / c16 / c32 / c64 | 278 / 884 / 1,649 / 2,272 / 2,433 | 275 / 877 / 1,538 / 1,927 / 2,180 | see note | 5.0 -> 5.0 ms |
+| text500 c1 / c8 / c16 / c32 / c64 | 104 / 131 / 122 / 125 / 138 | 104 / 128 / 108 / 112 / 125 | see note | 9.6 -> 9.6 ms |
+| text2036 c1 / c16; text8170 c1 / c8 | 24.2 / 51.2; 3.2 / 7.8 | 22.4 / 48.0; 3.4 / 8.2 | see note | 42.2 -> 44.9; 318 -> 300 ms |
+
+Before any media request was served at one GPU call at a time, so media
+throughput was flat from c1 to c64; it now rises with concurrency until the
+towers saturate the GPU (image768 c64 30 req/s = 7,680 soft tokens/s).
+
+Text note: the text path is unchanged by this pass (text waves merely stop
+taking the global lock). The matrix ran on a battery draining from 83% to 36%
+over 10 minutes and the text cells at c16+ read 0.85-0.93x; an interleaved
+A/B of the pre-change and new binaries right after (text500 c16: 124.8 vs
+131.2 then 134.4 vs 140.2 req/s; text20 c32: 2,287 vs 2,357 then 2,402 vs
+2,391) shows the new binary equal or ahead. The dip is host drift, as the
+10-09 entry warned.
+
+Open follow-ups: feed media finishes through the text service so they pack
+with text waves; the 15+1 wave split at 512 x c16.
+
+### Same day: video frames as one vision wave, CUDA build fix
+
+**Packed video wave** (`ei_gemma2_metal_vision_frames`, default on,
+`EI_GEMMA2_VIDEO_BATCH=0` off). Frames of one size are laid out frame after
+frame; `g2_patch`, `g2_position`, `g2_spatial_pool` and the fused
+`g2_vqkv_post` RoPE index `t % p.k` (p.k = tokens per frame), and attention
+and `g2_rope` take the per-token bounds buffer every route already honours
+(the tensor kernel's tile key range is `bounds[t0].x .. bounds[tl].y`, so a
+32-query tile straddling two frames scans two frames, no more). The HTTP
+video path encodes all prepared frames first (runs of same-sized frames up
+to 10,080 patch tokens per wave) and commits them in stream order with the
+same room checks as before; a frame without room is re-encoded at the room
+left, exactly as the sequential path did. Parity against one frame per wave,
+min cosine over frames (`scratchpad/vbatch_parity`):
+
+| route | 4 x 432x432 | notes |
+|---|---:|---|
+| default (FLASH64 tensor flash) | 0.999999448 | tiles straddle frames: online-softmax block order differs |
+| VFUSED=0 (`g2_rope` bounds) | 0.999999343 | |
+| FLASH64=0 (simdgroup flash bounds) | 0.999999425 | |
+| FLASH2=0 (`g2_attention`) | 1.000000000 | exact |
+| 3 x 768x480 (tiles never straddle) | 1.000000000 | exact |
+
+Engine, median of 5, `EI_BENCH_REPEAT=4` round-robin (ms per wave vs the
+single-frame tower times the frame count):
+
+| frames | one per wave | packed | gain |
+|---|---:|---:|---:|
+| 4 x 432x432 (81 tokens each) | 34.6 | 32.0 | 1.08x |
+| 8 x 432x432 | 69.2 | 62.2 | 1.11x |
+| 8 x 384x384 (64 tokens) | 59.2 | 47.5 | 1.25x |
+| 16 x 240x240 (25 tokens) | 74.4 | 52.1 | 1.43x |
+
+The tower is compute-bound already at 729 patches (two concurrent streams of
+v432 add only 15%), so the 140-token default frames gain ~10% and the gain
+grows as frames shrink. HTTP video4 (4 x 432 frames) interleaved A/B of the
+flag on the same binary, two passes: off 19.8/26.8/29.6 then 19.4/25.6/25.6
+req/s at c1/c8/c32, on 20.6/26.6/30.6 then 19.2/22.6/27.6: within the host's
+noise either way (c1 p50 50.0 -> 48.2 ms in pass 1). Kept on: it is exact,
+removes a command buffer round trip per frame, and the gain is real for
+small frames (`vision_tokens` near 70) and on any GPU the per-frame wave
+does not fill.
+
+**Host noise.** The first scaling runs read 8 frames at 151 and 106 ms
+against 62 ms minutes later, and `FLASH64=0` single frames at 12.9 ms with
+or without attention; the same binary read 62.2 +- 0.2 ms over four
+round-robin passes once the host settled. Long sequential item lists drift
+on this battery-powered shared host; `EI_BENCH_REPEAT` interleaves them.
+
+**CUDA build.** GCC on the 5090 rejected the media slot picker
+(`-Wstringop-overflow`: it cannot prove the slot index stays inside the
+array when `media_slot_count` is unbounded) and caught a real
+use-after-free in the new frame commit path (the canvas freed before the
+fallback tower call) that clang on the Mac did not. Both fixed;
+`make test-gemma2-cuda` on the RTX 5090 passes with the default two media
+slots (text 0.999724540, vision 0.999817210, audio 0.999735540, HTTP suite).
+
+## 2026-10-10 (evening): EmbeddingGemma 2 Metal, third pass (AC power)
+
+Host: M5 Max on AC at 100%, but shared with a user build at ~98% CPU, a
+browser renderer at ~55% and WindowServer at ~43% (GPU compositing), a VM and
+Docker. Identical configurations drifted 10-20% between back-to-back runs and
+once 2x inside one process (a packed 2048x4 wave read 294-340 ms, then 129 ms
+minutes later). Every number below is from an interleaved A/B or an in-process
+base/route pair; absolute values differ between tables for that reason.
+
+### Where the time goes (engine, default routes)
+
+Text forward, median ms, with `EI_GEMMA2_METAL_SKIP` ablations:
+
+| tokens | total | attention | GEMMs (`mm`) | `post` (48 post-add norms) |
+|---:|---:|---:|---:|---:|
+| 1 | 2.2 | 0.1 | 0.4 | 0.6 |
+| 20 | 4.4 | 0.55 | 1.05 | 0.7 |
+| 256 | 7.0 | 0.85 | 3.3 | 0.7 |
+| 2048 | 33.6 | 14 | 8 | - |
+| 4096 | 83.5 | 43 | 17 | - |
+| 8192 | 224 | 145 | 27 | - |
+
+- The one-token forward is a latency chain, not launch- or bandwidth-bound: a
+  chain of 240 dependent trivial dispatches costs 0.2-0.8 ms on this GPU
+  (`scratchpad/dispatch_floor.m`, 1-3 us each), yet the 48 single-row
+  post-add norms cost 12 us each and the small GEMVs 8 us each: a few
+  dependent memory round trips and barriers per kernel, times ~240 kernels.
+  Fusing kernels only helps if it removes round trips (the 10-09 post-norm
+  folding removed dispatches, not round trips, and gained nothing).
+- Long context is attention-bound: 65% at 8192 tokens. With 4 heads of width
+  512 on the 4 global layers and 4 heads of width 256 with a 512 window on
+  the other 20, the attention FLOPs at 8192 are ~2.9 TFLOP, so the flash
+  kernel ran at ~20 TFLOPS against the ~37 TFLOPS the GEMMs reach.
+- Media over HTTP at c1 (`EI_MEDIA_TIMING=1`): image432 = base64 0.8 + PNG
+  1.4 + tower 9.2 + finish 5.3 ms of 18.6; image768 = 2.7 + 4.7 + 33.3 + 7.5
+  of 55.5; audio10s = base64 1.1 + log-mel 2.05 + tower 9.8 + finish 7.4 of
+  23.6. The finish pass costs what a text request of the same length costs;
+  the finish batcher adds nothing at c1 (7.51 vs 7.57 ms with it off).
+
+### Landed
+
+**Flash tile on 8 simdgroups** (`g2t_flash_{256,512}_n8`, default; the former
+tile is `EI_GEMMA2_METAL_FLASH2_TILE=n4`). Same 32 x 128 tile, same
+arithmetic (cosine 1.000000000 against the 4-simdgroup tile; goldens
+unchanged), twice the threads per threadgroup so the 32 x 512 fp32 output
+accumulator is 64 floats per lane instead of 128. In-process base/route:
+
+| case | n4 -> n8 | q16 | q16k256 | n16 | q16n8 | q16k256n8 |
+|---|---:|---:|---:|---:|---:|---:|
+| 2048x1 | 1.10x | 1.08x | 1.07x | 1.05x | 1.08x | 1.17x |
+| 4096x1 | 1.04-1.12x | 1.13x | 1.15x | 1.00x | 1.05x | 1.19x |
+| 8192x1 | 1.21-1.27x | 1.08x | 1.16x | 1.16x | 1.11x | 1.25x |
+| 512x16 | 1.01-1.03x | 1.06x | 1.07x | 0.96x | 1.02x | 1.08x |
+| 1024x8 | 1.04x | 1.04x | 1.06x | 1.00x | 0.89x | 1.08x |
+| 16x1 / 64x1 / 256x1 / 128x8 | 1.05 / 1.04 / 1.04 / 1.02x | | | | | |
+
+`q16k256n8` (16 queries, 256-key blocks, 8 simdgroups) is as fast or faster
+on average but swung from 1.08x to 0.72x on 512x16 between runs and changes
+the block order (cosine 0.9999995); `n8` is exact and never below 1.0, so it
+is the default and the others stay selectable. `k64` is 0.90-0.99x. Old vs
+new binary over HTTP, two interleaved passes (req/s, c1 p50):
+
+| cell | old | new |
+|---|---|---|
+| text8170 c1 | 3.8 / 2.8 (292 / 364 ms) | 5.5 / 4.8 (189 / 216 ms) |
+| text8170 c8 | 9.0 / 7.5 | 12.8 / 11.2 |
+| text2036 c1 | 27.5 / 26.2 (36.8 / 38.4 ms) | 30.0 / 25.0 (33.4 / 40.0 ms) |
+| text2036 c16 | 59.2 / 54.8 | 64.5 / 51.8 |
+| text500 c16 | 140.0 / 119.2 | 137.8 / 130.2 |
+| text20 c1 | 245.8 / 241.2 | 254.5 / 246.5 |
+| text20 c16 | 1,806 / 1,764 | 2,059 / 1,806 |
+
+**Arrival-aware wave collection** (`EI_BATCH_ARRIVAL_WAIT_US`, default 5000,
+0 disables). A request only counted as active once tokenized, so at 512
+tokens x c16 the collector could not see the 15 requests still tokenizing
+after a wave and cut the next wave at its 800 us cap: the 16 clients
+phase-locked into a 15-request wave (101 ms) plus a lone one (10.8 ms). The
+service now counts requests from acceptance; while any are still tokenizing
+the collector keeps extending its deadline one `--batch-wait-us` at a time
+(at most 5 ms from the start of the collection) and solo inline execution
+yields. Wave log at text500 c16: before `15 1 15 16 1 15 14 16 1 ...`, after
+`16 16 16 ...` (every wave). Throughput: four interleaved passes read off
+81.5 / 91.5 / 108.0 / 112.2 vs on 85.2 / 105.8 / 105.2 / 113.8 req/s at c16
+while the c8 control moved the same +5%, so the throughput effect is inside
+the drift; the c16 p99 fell from 347 / 190 / 163 / 158 ms to 208 / 178 /
+166 / 171 (one wave instead of two). Kept for the tail and the verified
+mechanism.
+
+**Video frames in one wave** and the CUDA build fixes are in the entry above.
+
+### Rejected or deferred (measured)
+
+- Wide GEMM route below 40 tokens (`TENSOR2_MIN_TOKENS` 16/24/32): 0.84-0.97x
+  at 16-32 tokens, 1.04x at 39. 40 stays.
+- Packing sequences above the 1024-token cutoff: 2048x4 is 1.04x over four
+  single waves, 4096x2 1.02x, 1024x8 equal; attention dominates these waves,
+  so packing multiplies latency for nothing. Cutoff stays.
+- Keep-alive cap at c64 (`--keepalive-connections 63` vs the default 32 of
+  64 workers): text20 c64 2,565 / 2,514 -> 2,629 / 2,821 req/s, but c32 moved
+  the same way (2,562 / 2,661 -> 2,681 / 2,845) and it cannot be affected, so
+  it is drift. Not changed.
+- Shaving the one-token latency chain (2.2 ms + ~0.1 ms per token) needs
+  fewer dependent memory round trips per layer (register/threadgroup-resident
+  norm -> GEMV -> residual), not fewer dispatches; sized at ~15% of text c1
+  and ~5% of media c1. Not built this pass.
+
+Correctness: `make test-gemma2-metal-routes` (defaults vs all off, text
+>= 0.9999995, vision >= 0.9999986, audio >= 0.999999), `make test-gemma2-metal`
+(goldens unchanged: text 0.999720428, vision 0.999815593, audio 0.999738422),
+`make test-metal test-http-metal`, `make test-gemma2` (CPU), and
+`make test-gemma2-cuda` on the RTX 5090 (the scheduler change is shared).
+
+### Reference matrix and verification
+
+Full HTTP matrix on AC power at the start of the pass (req/s; c1 p50 in
+parentheses; `scratchpad/http_matrix.sh`, 5 s per cell, media fixtures from
+`perf/media_fixtures.py`), i.e. the state after the two earlier 10-10 passes
+and before this one:
+
+| cell | c1 | c8 | c16 | c32 | c64 |
+|---|---:|---:|---:|---:|---:|
+| text20 | 277.6 (4.99 ms) | 893.6 | 1668.6 | 2464.6 | 2313.4 |
+| text500 | 103.8 (9.61 ms) | 128.0 | 123.6 | 131.2 | 134.6 |
+| image768 | 18.2 (55.53 ms) | 24.0 | 22.4 | 26.8 | 32.4 |
+| image432 | 53.4 (18.63 ms) | 91.8 | 94.6 | 89.8 | 90.6 |
+| audio10s | 42.0 (23.63 ms) | 85.8 | 85.8 | 84.8 | 88.8 |
+| video4 | 19.0 (52.32 ms) | 23.4 | 22.8 | 27.2 | 32.6 |
+| text2036 c1 / c16 | 22.6 (44.09 ms) / 49.0 | | | | |
+| text8170 c1 / c8 | 3.4 (319.76 ms) / 8.0 | | | | |
+
+The same matrix re-run with the new defaults an hour later read 0.76-0.89x in
+every cell, including the untouched media towers, while a user build held a
+core at 98%; the towers in isolation still timed 8.74 / 9.43 ms (v432 / a10,
+unchanged). The same binary with every new behaviour switched off by env
+(`FLASH2_TILE=n4`, `EI_BATCH_ARRIVAL_WAIT_US=0`, `EI_GEMMA2_VIDEO_BATCH=0`)
+against its defaults, two interleaved passes, settles it:
+
+| cell | old behaviour | new defaults |
+|---|---|---|
+| text20 c32 | 2,458 / 2,755 | 2,764 / 2,804 |
+| text500 c64 | 148.2 / 152.2 | 156.2 / 152.0 |
+| image432 c8 | 90.0 / 91.2 | 92.5 / 95.0 |
+| audio10s c32 | 92.2 / 92.5 | 92.8 / 92.5 |
+| text8170 c1 | 4.0 / 3.0 (259 / 342 ms) | 5.2 / 5.0 (197 / 208 ms) |
+
+Media at c16-c64 is at the tower ceiling (image432 ~92 req/s = 8.7 ms per
+tower with two slots sharing the GPU); the text cells at c8-c64 are at the
+packed-wave ceiling measured on 10-09. The remaining single-request levers
+are the one-token latency chain (text c1, every media finish) and PNG decode
+(4.7 ms of image768's 55 ms).
+
+## 2026-10-11: EmbeddingGemma 2 Metal, fourth pass (front ends, attention, short-wave floor)
+
+Host: battery, a user build at 98-100% of a core throughout; in-process
+base/route pairs and interleaved runs only.
+
+### Landed
+
+**Table base64 decoder** (`src/media.c decode`). Every quad but the last goes
+through a 256-entry table with one validity check per quad; the last quad
+keeps the padding rules, so acceptance is unchanged (invalid bytes and '='
+inside the stream still reject). image768 base64 2.66 -> 0.15 ms, image432
+0.81 -> 0.05, audio10s 1.09 -> 0.07 (`EI_MEDIA_TIMING=1`, median of 5).
+
+**PNG inflate through libcompression** (macOS; `EI_PNG_INFLATE=0` restores
+stb's inflate). `src/vendor/stb_image.h` gained a one-line hook
+(`STBI_ZLIB_DECODE_HOOK`) at its IDAT inflate call; the hook checks the zlib
+header (deflate, no preset dictionary, FCHECK), inflates the raw stream with
+`compression_decode_buffer` into a buffer of the exact expected raw length
+plus 64 bytes of slack, and accepts the result only when the output length
+equals the expected length (interlaced files and anything odd fall back to
+stb). Inflate is exact, and the embeddings of all four fixtures are
+byte-identical with the hook on and off (`cmp` of the HTTP responses).
+image768 PNG decode 4.23 -> 2.51 ms, image432 1.33 -> 0.81; the remainder is
+stb's unfiltering and 3-channel conversion. Old vs new binary over HTTP,
+first (clean) interleaved pass, c1 p50: image768 51.7 -> 50.6 ms, image432
+17.8 -> 16.7, audio10s 22.2 -> 21.4, video4 47.1 -> 49.3 (second pass
+drifted 10-20% for both binaries alike). Linux builds are untouched
+(`__APPLE__` only; `-lcompression` added to the Darwin `LDLIBS`).
+
+### Rejected (measured)
+
+- **GQA K/V sharing in the flash kernel.** Sharing one K/V block across two
+  query heads has the same K/V bytes per FLOP as a 64-query tile, so the
+  64 x 64 tiles (`q64k64n8`, `q64k64n16`) stand in for it: 0.69-0.80x of the
+  n8 tile at 2k-8k tokens, 0.86-0.90x at 512x16. The kernel is not
+  K/V-bandwidth-bound; halving K/V traffic cannot help. fp16 Q staging (Q is
+  ~20% of the tile's bytes) is ruled out by the same measurement.
+- **16-query, 256-key, 8-simdgroup tile retest** against n8: +1-6% in one
+  pass, 0.90-1.07x in the next (64x1 .. 8192x1). Inside the drift; n8 stays.
+- **Short-wave fusions.** The ablations bound what removing one round trip
+  per layer can give: folding q/k norm + RoPE into the short attention
+  kernel (`SKIP=qknorm`) is at most 8% at 1 token and 2.5% at 20; split-K on
+  the three 512-row GEMVs (`SKIP=mm`) at most 9% / 2%. Both change
+  arithmetic order and fall under the 8-10% bar for that complexity. The
+  post-add kernel itself is minimal (one simdgroup, two reductions): its
+  12 us is the dependent round trip, not the kernel.
+
+### Deferred: persistent per-layer kernel
+
+The only way to cut the 11 dependent round trips per layer is a persistent
+cooperative kernel that keeps the residual row in threadgroup memory and
+synchronizes stages with device atomics. Metal guarantees neither
+co-residency nor forward progress across threadgroups, so viability has to
+be measured (barrier cost, co-resident threadgroup count) before any kernel
+is written. The probe written for that (`scratchpad/grid_barrier.m`) had a
+spin cap large enough that the non-resident configurations ran for minutes,
+and when the host process was killed its command buffer kept the GPU at
+100% device utilization for a long time afterwards: orphaned GPU work
+survives its process on macOS. Lesson recorded in `AGENTS.md`; the probe
+needs a cap of ~10^5 spins and small group counts before it is run again.
+
+Run again with those caps once the GPU drained (24 barriers, 256-thread
+groups, device atomic counter, each group doing a little work per stage):
+
+| co-resident groups | us per barrier |
+|---:|---:|
+| 20 | 1.83 |
+| 40 | 1.92 |
+| 80 | 2.23 |
+| 160 | 3.88 |
+
+160 groups never hit the cap, so a persistent layer kernel on 80-160
+threadgroups is viable here: 11 stage barriers x ~2.5 us = ~28 us per layer
+against ~90 us of dependent dispatches today, i.e. the one-token forward
+could fall from 2.2 ms towards ~0.8 ms plus the weight-bandwidth floor
+(~0.3 ms). Design requirements before building it: a startup probe with a
+timeout that enables the route only when the chosen group count rendezvous
+on this device, a bounded spin in the production kernel that marks the wave
+failed instead of hanging (the host then re-runs it on the dispatch route),
+and group counts chosen from the probe, never from the dispatch size. The
+kernel itself is the GEMV / attention / norm sequence of
+`text_layer_fused` with the residual row in threadgroup memory and the
+512-row projections split across groups. Not started this pass.

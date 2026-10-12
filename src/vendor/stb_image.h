@@ -5204,7 +5204,13 @@ static int stbi__parse_png_file(stbi__png *z, int scan, int req_comp)
             // initial guess for decoded data size to avoid unnecessary reallocs
             bpl = (s->img_x * z->depth + 7) / 8; // bytes per line, per component
             raw_len = bpl * s->img_y * s->img_n /* pixels */ + s->img_y /* filter mode per row */;
+            // embeddinggemma.c: STBI_ZLIB_DECODE_HOOK lets the host inflate IDAT itself
+            // (same signature; it falls back to the function below).
+#ifdef STBI_ZLIB_DECODE_HOOK
+            z->expanded = (stbi_uc *) STBI_ZLIB_DECODE_HOOK((char *) z->idata, ioff, raw_len, (int *) &raw_len, !is_iphone);
+#else
             z->expanded = (stbi_uc *) stbi_zlib_decode_malloc_guesssize_headerflag((char *) z->idata, ioff, raw_len, (int *) &raw_len, !is_iphone);
+#endif
             if (z->expanded == NULL) return 0; // zlib should set error
             STBI_FREE(z->idata); z->idata = NULL;
             if ((req_comp == s->img_n+1 && req_comp != 3 && !pal_img_n) || has_trans)

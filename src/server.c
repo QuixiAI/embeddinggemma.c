@@ -3,6 +3,12 @@
 #include "engine.h"
 #include "profiles.h"
 #include "media.h"
+#if defined(EI_ENABLE_METAL)
+#include "gemma2_metal.h"
+#endif
+#if defined(EI_ENABLE_CUDA)
+#include "gemma2_cuda.h"
+#endif
 #include "float_format.h"
 #include "http_docs.h"
 #include "inference_service.h"
@@ -20,6 +26,7 @@
 #include <netinet/tcp.h>
 #include <sys/uio.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <signal.h>
 #include <spawn.h>
 #include <sys/socket.h>
@@ -29,6 +36,124 @@
 #include <unistd.h>
 
 static pthread_mutex_t inference_mutex = PTHREAD_MUTEX_INITIALIZER;
+// GPU media contexts (vision/audio towers and the mixed-input text forward):
+// each slot is a clone sharing the device, pipelines and weights with its own
+// queue, workspace and lock, so media requests overlap on the GPU instead of
+// serializing on inference_mutex. Text waves never touch these contexts.
+#define EI_MAX_MEDIA_SLOTS 8
+typedef struct {
+    void *metal, *cuda;
+    pthread_mutex_t lock;
+    _Atomic size_t busy; /* requests assigned to this slot */
+} media_slot;
+static media_slot media_slots[EI_MAX_MEDIA_SLOTS];
+static size_t media_slot_count;
+static _Atomic size_t media_slot_next;
+// The least-loaded slot (round robin among ties); release with media_slot_release.
+static media_slot *media_slot_acquire(void) {
+    size_t count = media_slot_count;
+    if (!count || count > EI_MAX_MEDIA_SLOTS) return NULL;
+    size_t start = atomic_fetch_add(&media_slot_next, 1) % count;
+    media_slot *best = &media_slots[start];
+    for (size_t i = 1; i < count; i++) {
+        media_slot *slot = &media_slots[(start + i) % count];
+        if (atomic_load(&slot->busy) < atomic_load(&best->busy)) best = slot;
+    }
+    atomic_fetch_add(&best->busy, 1);
+    return best;
+}
+static void media_slot_release(media_slot *slot) {
+    if (slot) atomic_fetch_sub(&slot->busy, 1);
+}
+#if defined(EI_ENABLE_METAL)
+// Media finishes: the text pass over a media request's assembled input rows.
+// Requests queue here and one thread runs every queued finish as a packed wave
+// on its own context, so concurrent media requests share the per-wave cost
+// instead of each paying a batch-of-1 forward. EI_MEDIA_FINISH_BATCH=0 disables.
+typedef struct media_finish {
+    const float *inputs;
+    size_t n;
+    float *out;
+    bool done, ok;
+    char err[256];
+    struct media_finish *next;
+} media_finish;
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t ready, done;
+    media_finish *head, *tail;
+    void *ctx;
+    bool enabled;
+} media_finisher = {.mu = PTHREAD_MUTEX_INITIALIZER,
+                    .ready = PTHREAD_COND_INITIALIZER,
+                    .done = PTHREAD_COND_INITIALIZER};
+static void *media_finisher_run(void *arg) {
+    (void)arg;
+    size_t cap = 0;
+    float *rows = NULL, *outs = NULL;
+    size_t *offsets = NULL;
+    media_finish **items = NULL;
+    for (;;) {
+        pthread_mutex_lock(&media_finisher.mu);
+        while (!media_finisher.head) pthread_cond_wait(&media_finisher.ready, &media_finisher.mu);
+        size_t batch = 0, tokens = 0;
+        for (media_finish *f = media_finisher.head; f && batch < 64 && tokens + f->n <= 8192;
+             f = f->next) {
+            batch++;
+            tokens += f->n;
+        }
+        if (!batch) { /* one over-long finish runs alone */
+            batch = 1;
+            tokens = media_finisher.head->n;
+        }
+        if (batch > cap) {
+            cap = batch;
+            items = realloc(items, cap * sizeof *items);
+            offsets = realloc(offsets, (cap + 1) * sizeof *offsets);
+            outs = realloc(outs, cap * 768 * sizeof *outs);
+        }
+        for (size_t i = 0; i < batch; i++) {
+            items[i] = media_finisher.head;
+            media_finisher.head = media_finisher.head->next;
+        }
+        if (!media_finisher.head) media_finisher.tail = NULL;
+        pthread_mutex_unlock(&media_finisher.mu);
+        rows = realloc(rows, tokens * 512 * sizeof *rows);
+        offsets[0] = 0;
+        for (size_t i = 0; i < batch; i++) {
+            memcpy(rows + offsets[i] * 512, items[i]->inputs, items[i]->n * 512 * sizeof *rows);
+            offsets[i + 1] = offsets[i] + items[i]->n;
+        }
+        char err[256] = "";
+        bool ok = ei_gemma2_metal_batch_inputs(media_finisher.ctx, rows, offsets, batch, outs, err,
+                                               sizeof err);
+        pthread_mutex_lock(&media_finisher.mu);
+        for (size_t i = 0; i < batch; i++) {
+            if (ok) memcpy(items[i]->out, outs + i * 768, 768 * sizeof *outs);
+            else snprintf(items[i]->err, sizeof items[i]->err, "%s", err);
+            items[i]->ok = ok;
+            items[i]->done = true;
+        }
+        pthread_cond_broadcast(&media_finisher.done);
+        pthread_mutex_unlock(&media_finisher.mu);
+    }
+    return NULL;
+}
+static bool media_finish_submit(void *ctx, const float *inputs, size_t n, float *out, char *err,
+                                size_t err_len) {
+    (void)ctx;
+    media_finish f = {.inputs = inputs, .n = n, .out = out};
+    pthread_mutex_lock(&media_finisher.mu);
+    if (media_finisher.tail) media_finisher.tail->next = &f;
+    else media_finisher.head = &f;
+    media_finisher.tail = &f;
+    pthread_cond_signal(&media_finisher.ready);
+    while (!f.done) pthread_cond_wait(&media_finisher.done, &media_finisher.mu);
+    pthread_mutex_unlock(&media_finisher.mu);
+    if (!f.ok) snprintf(err, err_len, "%s", f.err);
+    return f.ok;
+}
+#endif
 #define EMBEDDINGGEMMA_DEFAULT_PORT 42666
 #define MAX_BODY_BYTES (16u * 1024u * 1024u)
 #define MAX_HEADER_BYTES (64u * 1024u)
@@ -94,6 +219,7 @@ typedef struct {
     size_t max_batch_requests;
     size_t max_batch_sequence_tokens;
     size_t pipeline_slots;
+    size_t media_slots;
     size_t short_bypass_tokens;
     size_t threads;              /* 0: EI_THREADS or the default */
     size_t cpu_workers;          /* 0: none beside a GPU, the engine itself on CPU */
@@ -1302,6 +1428,7 @@ static void usage(const char *argv0) {
             "          [--keepalive-max-requests N] [--keepalive-timeout-ms N]\n"
             "          [--response-cache-mb N] [--persistent-cache-path PATH]\n"
             "          [--pipeline-slots N]  (embeddinggemma-2 GPU waves in flight, 1..8)\n"
+            "          [--media-slots N]  (embeddinggemma-2 GPU media contexts in flight, 1..8; default 2)\n"
             "          [--short-bypass-tokens N]  (short requests bypass long waves; implies 2 slots)\n"
             "          [--threads N]  (CPU inference threads; split across --cpu-workers)\n"
             "          [--cpu-workers N]  (independent CPU executors; beside a GPU they take overflow)\n"
@@ -1346,6 +1473,7 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
     opts->max_batch_requests = 64;
     opts->max_batch_sequence_tokens = 1024;
     opts->pipeline_slots = 1;
+    opts->media_slots = 2;
     opts->threads = 0;
     opts->cpu_workers = 0;
     opts->cpu_max_batch_tokens = 1024;
@@ -1400,6 +1528,8 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
                                 &opts->max_batch_requests)) return false;
         } else if (strcmp(argv[i], "--short-bypass-tokens") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 0, 8192, &opts->short_bypass_tokens)) return false;
+        } else if (strcmp(argv[i], "--media-slots") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, EI_MAX_MEDIA_SLOTS, &opts->media_slots)) return false;
         } else if (strcmp(argv[i], "--pipeline-slots") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 1, EI_MAX_PIPELINE_SLOTS, &opts->pipeline_slots))
                 return false;
@@ -1590,8 +1720,9 @@ static bool execute_engine_batch(void *opaque, const int32_t *ids,
                                  const size_t *offsets, size_t batch_size,
                                  float *out, char *err, size_t err_len) {
     ei_engine *engine = opaque;
-    if (!engine->model.embeddinggemma2)
+    if (!engine->model.embeddinggemma2 || media_slot_count)
         return ei_engine_embed_tokens_batch(engine, ids, offsets, batch_size, out, err, err_len);
+    // CPU backend: media towers share the engine's thread pool with text waves.
     pthread_mutex_lock(&inference_mutex);
     bool ok = ei_engine_embed_tokens_batch(opaque, ids, offsets, batch_size, out, err, err_len);
     pthread_mutex_unlock(&inference_mutex);
@@ -1712,6 +1843,43 @@ int main(int argc, char **argv) {
             ei_die("cannot create executors: %s", reserve_error);
     }
     opts.pipeline_slots = engine.executor_count > 1 ? engine.executor_count : 1;
+    if (second && opts.projector) {
+        char err[256];
+        (void)err; /* used by the GPU builds only */
+        for (size_t i = 0; i < opts.media_slots; i++) {
+            media_slot *slot = &media_slots[i];
+            pthread_mutex_init(&slot->lock, NULL);
+#if defined(EI_ENABLE_METAL)
+            if (engine.gemma2_metal) {
+                slot->metal = i == 0 && engine.gemma2_media
+                                  ? engine.gemma2_media
+                                  : ei_gemma2_metal_clone(engine.gemma2_metal, err, sizeof err);
+                if (!slot->metal) ei_die("media slot %zu: %s", i, err);
+            }
+#endif
+#if defined(EI_ENABLE_CUDA)
+            if (engine.gemma2_cuda) {
+                slot->cuda = i == 0 && engine.gemma2_cuda_media
+                                 ? engine.gemma2_cuda_media
+                                 : ei_gemma2_cuda_clone(engine.gemma2_cuda, false, err, sizeof err);
+                if (!slot->cuda) ei_die("media slot %zu: %s", i, err);
+            }
+#endif
+            if (slot->metal || slot->cuda) media_slot_count = i + 1;
+        }
+#if defined(EI_ENABLE_METAL)
+        const char *finish_batch = getenv("EI_MEDIA_FINISH_BATCH");
+        if (engine.gemma2_metal && media_slot_count && !(finish_batch && !strcmp(finish_batch, "0"))) {
+            media_finisher.ctx = ei_gemma2_metal_clone(engine.gemma2_metal, err, sizeof err);
+            if (!media_finisher.ctx) ei_die("media finish context: %s", err);
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, media_finisher_run, NULL))
+                ei_die("cannot start the media finish thread");
+            pthread_detach(thread);
+            media_finisher.enabled = true;
+        }
+#endif
+    }
     // Each keep-alive connection holds an HTTP worker, so workers cap the
     // requests in flight; give every executor enough to fill its waves.
     if (!opts.workers_explicit && opts.workers < 32 * engine.executor_count) {

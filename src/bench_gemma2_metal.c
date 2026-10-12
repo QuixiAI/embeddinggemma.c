@@ -10,7 +10,9 @@
 #include <string.h>
 #include <time.h>
 
-static const char *route_flags[] = {"TENSOR", "FLASH", "GEMV", "FUSED", "TENSOR2", "FLASH2", "NOEPI", "FLASH2_TILE"};
+static const char *route_flags[] = {"TENSOR", "FLASH",  "GEMV",   "FUSED",  "TENSOR2",
+                                    "FLASH2", "NOEPI", "FLASH64", "VFUSED", "AFUSED",
+                                    "FLASH2_TILE"};
 
 static void set_route(const char *spec) {
     char name[64];

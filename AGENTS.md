@@ -91,6 +91,88 @@ The target is the hardware ceiling under many concurrent requests (SlimServe
   back-to-back in one process (`make bench-gemma2-metal`, `EI_BENCH_BASE`) or
   interleaved; separate HTTP runs are not comparable across time.
 
+## EmbeddingGemma 2 media lessons (2026-10-10)
+
+- **A head width the driver cannot compile can be padded.** No `matmul2d`
+  flash at width 64 compiles, but 64-wide Q against 128-wide zero-padded fp16
+  K/V rows is exact (pad columns contribute zeros, never stored) and runs
+  1.5x the FLOPs on tensor ops: 768x768 vision 59 -> 40 ms alone.
+- **Media was lock-bound, not kernel-bound, under load.** Every tower and the
+  final text pass of every media request serialized on `inference_mutex` on
+  one context, so c1..c64 throughput was flat. Per-request media slots (own
+  queue/workspace/lock) and packing the text finishes into one wave gave
+  image432 c8 51 -> 103 req/s before any kernel work counted.
+- **Check what the tile route still serves.** The F32 patch embedding and the
+  audio pre-encode / input projection never got fp16 copies and ran the old
+  per-tile decode GEMM; packing them was 1.36x on 10 s audio for free.
+- **Elementwise passes are ~20-40% of a media tower.** Vision had 17
+  dispatches per layer, audio 46 (two clamp passes per GEMM): fusing into
+  producers and GEMM epilogues was 1.2x each after the attention fix.
+- **MPP cooperative-tensor inputs are single-simdgroup only**
+  (`get_left_input_cooperative_tensor` static-asserts `execution_simdgroup`),
+  so a register-resident flash (no S/P threadgroup round trip) would need
+  8-row tiles per simdgroup; at head width 512 that is 128+ accumulators per
+  lane. Not pursued.
+- **16 tokens per GEMV decode lost** (16x1 4.3 -> 5.6 ms): the short-wave GEMV
+  is bound by per-token inner work, not weight re-reads. 8 stays.
+- **CPU front ends matter at c1.** Log-mel evaluated 2,304 cosf/sinf per
+  frame and a dense 128x257 filter bank: 24 ms for 10 s of audio, more than
+  the GPU tower. Twiddle tables and sparse filter ranges are bit-identical.
+- **Packing video frames into one wave is worth ~10% at the default budget**
+  (the tower is compute-bound at 729 patches; 1.25-1.43x for 64- and
+  25-token frames). Every attention/RoPE route already took per-token
+  bounds, so the whole change was `t % p.k` in four kernels plus a bounds
+  buffer. Build on a GCC box before calling the Mac build done: GCC caught a
+  use-after-free and an unprovable array bound that clang passed.
+- **Single long bench runs drift 2x on this host.** The same 8-frame wave
+  read 151, 106 and 62 ms in consecutive runs. `EI_BENCH_REPEAT` round-robins
+  the item list; trust only interleaved, repeated numbers. Check `ps -r`
+  first: a user build, a browser renderer and WindowServer compositing were
+  each eating 40-100% of a core (and the GPU) during the 10-10 evening pass.
+
+## EmbeddingGemma 2 text lessons (2026-10-10 evening)
+
+- **The one-token forward (2.2 ms) is a latency chain, not launches or
+  bandwidth.** 240 dependent trivial dispatches cost 0.2-0.8 ms here (1-3 us
+  each); the real kernels cost 8-12 us each because each has a few dependent
+  memory round trips and barriers. Fusion pays only when it removes round
+  trips (keeping norm -> GEMV -> residual resident), which is why folding
+  post-norms into GEMV prologues gained nothing on 10-09.
+- **Long context is attention-bound (65% at 8192 tokens)** and the flash
+  kernel ran at ~20 of ~37 TFLOPS. Doubling the simdgroups per tile (same
+  32x128 tile, 64 instead of 128 accumulator floats per lane at head width
+  512) was 1.1-1.27x at 2k-8k tokens with identical arithmetic; smaller
+  query tiles and 256-key blocks were comparable on average but swung
+  between runs. Name tile variants in the kernel host name and parse the
+  geometry from it so a sweep is an env var.
+- **Count a request as arriving before it is tokenized.** The wave collector
+  only saw queued requests, so at 512 tokens x c16 it phase-locked into
+  15 + 1 waves for the whole run. Verify scheduler changes with the wave log
+  (`EI_WAVE_LOG`), not throughput: the host noise is larger than a 5% wave
+  effect.
+- **Linux needs `_POSIX_C_SOURCE 200809L` before any include** for
+  `clock_gettime`; clang on the Mac does not complain.
+- **Never launch a spinning GPU kernel without a tiny spin cap.** A
+  device-atomic barrier probe with a 2x10^7 spin cap ran for minutes once
+  its groups were not co-resident, and killing the process did not stop it:
+  the command buffer kept the M5 at 100% device utilization long after
+  (`ioreg -l -w0 | grep "Device Utilization"` shows it). Cap spins at ~10^5,
+  start from 20 groups, and run such probes with a short `timeout` plus a
+  check of the utilization counter afterwards.
+- **Device-atomic barriers across threadgroups work on the M5** when the
+  group count is modest: 160 x 256-thread groups rendezvous at 1.8-3.9 us per
+  barrier (`scratchpad/grid_barrier.m`, safe caps). That is the route to the
+  short-wave floor (11 round trips/layer at ~10 us each); gate it behind a
+  startup probe and a bounded spin that fails the wave rather than hangs.
+- **The flash kernel is not K/V-bandwidth-bound.** Doubling queries per K/V
+  byte (64x64 tiles) was 0.7-0.8x, so GQA K/V sharing and fp16 Q staging
+  cannot pay; the 8-simdgroup 32x128 tile stays.
+- **Front-end wins that cost nothing numerically:** table base64 (18x) and
+  libcompression inflate for PNG IDAT (1.65x), both byte-identical. Compare
+  HTTP responses with `cmp`, and send unique bodies: the response cache
+  serves repeats, and curl's `Expect: 100-continue` breaks this server's
+  body read.
+
 ## EmbeddingGemma 2 scaling lessons (2026-10-10)
 
 - **One CPU wave peaks at ~64 threads and collapses past it** (256-thread pool

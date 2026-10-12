@@ -149,19 +149,23 @@ G2_GEMV(G2WBF16, "g2_gemv_bf16")
 G2_GEMV(G2WF16, "g2_gemv_f16")
 G2_GEMV(G2WF32, "g2_gemv_f32")
 // inp_gate with the PLE gate in the epilogue (buffer 4 = ple, p.layer = layer).
-kernel void g2_gemv_ple(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]],
-                        device float *y [[buffer(2)]], constant G2P &p [[buffer(3)]],
-                        device const float *ple [[buffer(4)]],
-                        uint2 g [[threadgroup_position_in_grid]],
-                        uint sg [[simdgroup_index_in_threadgroup]],
-                        uint lane [[thread_index_in_simdgroup]]) {
+template <uint NT>
+kernel void g2_gemv_ple_t(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]],
+                          device float *y [[buffer(2)]], constant G2P &p [[buffer(3)]],
+                          device const float *ple [[buffer(4)]],
+                          uint2 g [[threadgroup_position_in_grid]],
+                          uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
     G2InPlain in{x, p.k};
-    g2_gemv_core<G2WQ8, 4, 8, 1>(w, in, y, p.k, p.m, p.n, (g.x * 4 + sg) * 4, g.y * 8, lane, ple,
-                                 p.layer);
+    g2_gemv_core<G2WQ8, 4, NT, 1>(w, in, y, p.k, p.m, p.n, (g.x * 4 + sg) * 4, g.y * NT, lane, ple,
+                                  p.layer);
 }
+template [[host_name("g2_gemv_ple")]] kernel void g2_gemv_ple_t<8>(
+    device const uchar *, device const float *, device float *, constant G2P &,
+    device const float *, uint2, uint, uint);
 // Q, K and V in one dispatch over the concatenated row space: p.m = Q rows,
 // p.d = K rows (= V rows). Weights in buffers 0/4/5, outputs in 2/6/7.
-template <typename IN>
+template <typename IN, uint NT>
 inline void g2_qkv(device const uchar *wq, device const uchar *wk, device const uchar *wv,
                    thread IN &in, device float *q, device float *k, device float *v,
                    constant G2P &p, uint2 g, uint sg, uint lane) {
@@ -174,27 +178,31 @@ inline void g2_qkv(device const uchar *wq, device const uchar *wk, device const 
     } else if (row >= p.m) {
         w = wk, y = k, m = p.d, row -= p.m;
     }
-    g2_gemv_core<G2WQ8, 4, 8, 0>(w, in, y, p.k, m, p.n, row, g.y * 8, lane, q, 0);
+    g2_gemv_core<G2WQ8, 4, NT, 0>(w, in, y, p.k, m, p.n, row, g.y * NT, lane, q, 0);
 }
-kernel void g2_gemv_qkv(device const uchar *wq [[buffer(0)]], device const float *x [[buffer(1)]],
-                        device float *q [[buffer(2)]], constant G2P &p [[buffer(3)]],
-                        device const uchar *wk [[buffer(4)]], device const uchar *wv [[buffer(5)]],
-                        device float *k [[buffer(6)]], device float *v [[buffer(7)]],
-                        uint2 g [[threadgroup_position_in_grid]],
-                        uint sg [[simdgroup_index_in_threadgroup]],
-                        uint lane [[thread_index_in_simdgroup]]) {
+template <uint NT>
+kernel void g2_gemv_qkv_t(device const uchar *wq [[buffer(0)]], device const float *x [[buffer(1)]],
+                          device float *q [[buffer(2)]], constant G2P &p [[buffer(3)]],
+                          device const uchar *wk [[buffer(4)]], device const uchar *wv [[buffer(5)]],
+                          device float *k [[buffer(6)]], device float *v [[buffer(7)]],
+                          uint2 g [[threadgroup_position_in_grid]],
+                          uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
     G2InPlain in{x, p.k};
-    g2_qkv(wq, wk, wv, in, q, k, v, p, g, sg, lane);
+    g2_qkv<G2InPlain, NT>(wq, wk, wv, in, q, k, v, p, g, sg, lane);
 }
+template [[host_name("g2_gemv_qkv")]] kernel void g2_gemv_qkv_t<8>(
+    device const uchar *, device const float *, device float *, constant G2P &,
+    device const uchar *, device const uchar *, device float *, device float *, uint2, uint, uint);
 // Up and gate rows together; stores gelu_tanh(gate) * up. Weights 0 (up) / 4 (gate).
-template <typename IN>
+template <typename IN, uint NT>
 inline void g2_geglu(device const uchar *wu, device const uchar *wg, thread IN &in, device float *y,
                      constant G2P &p, uint2 g, uint sg, uint lane) {
-    const uint row0 = (g.x * 4 + sg) * 2, t0 = g.y * 8, nt = min(8u, p.n - t0);
+    const uint row0 = (g.x * 4 + sg) * 2, t0 = g.y * NT, nt = min(NT, p.n - t0);
     in.prepare(t0, nt, lane);
-    float au[2][8], ag[2][8];
+    float au[2][NT], ag[2][NT];
     for (uint r = 0; r < 2; ++r)
-        for (uint t = 0; t < 8; ++t)
+        for (uint t = 0; t < NT; ++t)
             au[r][t] = ag[r][t] = 0;
     for (uint e = lane * 16; e < p.k; e += 512) {
         G2WQ8 u[2], gt[2];
@@ -202,7 +210,7 @@ inline void g2_geglu(device const uchar *wu, device const uchar *wg, thread IN &
             u[r].load(wu, (row0 + r) * p.k + e);
             gt[r].load(wg, (row0 + r) * p.k + e);
         }
-        for (uint t = 0; t < 8; ++t) {
+        for (uint t = 0; t < NT; ++t) {
             if (t >= nt)
                 break;
             float4 x0, x1, x2, x3;
@@ -214,21 +222,25 @@ inline void g2_geglu(device const uchar *wu, device const uchar *wg, thread IN &
         }
     }
     for (uint r = 0; r < 2; ++r)
-        for (uint t = 0; t < 8; ++t) {
+        for (uint t = 0; t < NT; ++t) {
             float a = simd_sum(au[r][t]), b = simd_sum(ag[r][t]);
-            if (lane == (r * 8 + t) % 32 && t < nt)
+            if (lane == (r * NT + t) % 32 && t < nt)
                 y[(t0 + t) * p.m + row0 + r] = g2gelu(b) * a;
         }
 }
-kernel void g2_gemv_geglu(device const uchar *wu [[buffer(0)]], device const float *x [[buffer(1)]],
-                          device float *y [[buffer(2)]], constant G2P &p [[buffer(3)]],
-                          device const uchar *wg [[buffer(4)]],
-                          uint2 g [[threadgroup_position_in_grid]],
-                          uint sg [[simdgroup_index_in_threadgroup]],
-                          uint lane [[thread_index_in_simdgroup]]) {
+template <uint NT>
+kernel void g2_gemv_geglu_t(device const uchar *wu [[buffer(0)]], device const float *x [[buffer(1)]],
+                            device float *y [[buffer(2)]], constant G2P &p [[buffer(3)]],
+                            device const uchar *wg [[buffer(4)]],
+                            uint2 g [[threadgroup_position_in_grid]],
+                            uint sg [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
     G2InPlain in{x, p.k};
-    g2_geglu(wu, wg, in, y, p, g, sg, lane);
+    g2_geglu<G2InPlain, NT>(wu, wg, in, y, p, g, sg, lane);
 }
+template [[host_name("g2_gemv_geglu")]] kernel void g2_gemv_geglu_t<8>(
+    device const uchar *, device const float *, device float *, constant G2P &,
+    device const uchar *, uint2, uint, uint);
 kernel void g2_norm(device const float *x [[buffer(0)]], device const uchar *w [[buffer(1)]],
                     device float *y [[buffer(2)]], constant G2P &p [[buffer(3)]],
                     uint row [[threadgroup_position_in_grid]],
@@ -246,7 +258,14 @@ kernel void g2_norm(device const float *x [[buffer(0)]], device const uchar *w [
     float inv = rsqrt(simd_sum(ss) / p.d + 1e-6f);
     for (uint z = lane; z < p.d; z += 32) {
         float v = (x[row * p.d + z] - mean) * inv * (p.mode ? g2w(w, p.type, z) : 1.0f);
-        y[row * p.d + z] = p.mode == 2 ? max(v, 0.0f) : v;
+        if (p.mode == 2)
+            v = max(v, 0.0f);
+        // Audio fusions: SiLU (p.cols) and the next GEMM's input clamp (p.lo < p.hi).
+        if (p.cols)
+            v = v / (1 + exp(-v));
+        if (p.lo < p.hi)
+            v = clamp(v, p.lo, p.hi);
+        y[row * p.d + z] = v;
     }
 }
 kernel void g2_element(device const float *x [[buffer(0)]], device const float *b [[buffer(1)]],
@@ -284,6 +303,8 @@ kernel void g2_element(device const float *x [[buffer(0)]], device const float *
         v = b[(i / 1024) * 2048 + i % 1024] / (1 + exp(-b[(i / 1024) * 2048 + 1024 + i % 1024]));
         break;
     }
+    if (p.mode != 5 && p.lo < p.hi)
+        v = clamp(v, p.lo, p.hi);
     y[i] = v;
 }
 kernel void g2_embed(device const uchar *w [[buffer(0)]], device const int *ids [[buffer(1)]],
@@ -354,8 +375,12 @@ kernel void g2_attention(device const float *q [[buffer(0)]], device const float
             acc[j] = acc[j] * a + b * v[(s * p.kv + kh) * p.d + lane + j * 32];
         mx = next;
     }
-    for (uint j = 0; j < p.d / 32; j++)
-        out[(t * p.heads + h) * p.d + lane + j * 32] = acc[j] / total;
+    for (uint j = 0; j < p.d / 32; j++) {
+        float o = acc[j] / total;
+        if (p.lo < p.hi)
+            o = clamp(o, p.lo, p.hi);
+        out[(t * p.heads + h) * p.d + lane + j * 32] = o;
+    }
 }
 kernel void g2_pool(device const float *x [[buffer(0)]], device float *out [[buffer(1)]],
                     device const uint2 *bounds [[buffer(2)]], constant G2P &p [[buffer(3)]],
@@ -369,20 +394,25 @@ kernel void g2_pool(device const float *x [[buffer(0)]], device float *out [[buf
         sum += x[t * 768 + z] / float(range.y - range.x);
     out[i] = sum;
 }
+// Vision tokens: p.n tokens of p.k per frame (frames of one size packed in
+// order; a frame's pixels are p.k * 768 bytes, its pooled tokens p.k / 9).
 kernel void g2_patch(device const uchar *rgb [[buffer(0)]], device float *patch [[buffer(1)]],
                      constant G2P &p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i >= p.n * 768)
         return;
     uint t = i / 768, z = i % 768, c = z / 256, y = (z % 256) / 16, x = z % 16;
+    uint f = t / p.k;
+    t %= p.k;
     patch[i] = float(half(
-        2.0f * float(rgb[((t / p.cols * 16 + y) * p.cols * 16 + t % p.cols * 16 + x) * 3 + c]) /
+        2.0f * float(rgb[f * p.k * 768 +
+                         ((t / p.cols * 16 + y) * p.cols * 16 + t % p.cols * 16 + x) * 3 + c]) /
             255 -
         1));
 }
 kernel void g2_position(device float *x [[buffer(0)]], device const float *pos [[buffer(1)]],
                         constant G2P &p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i < p.n * 768) {
-        uint t = i / 768, z = i % 768;
+        uint t = i / 768 % p.k, z = i % 768;
         x[i] += pos[(t % p.cols) * 768 + z] + pos[(10240 + t / p.cols) * 768 + z];
     }
 }
@@ -390,7 +420,9 @@ kernel void g2_spatial_pool(device const float *x [[buffer(0)]], device float *y
                             constant G2P &p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i >= p.n * 768)
         return;
-    uint t = i / 768, z = i % 768, cols = p.cols / 3;
+    uint t = i / 768, z = i % 768, cols = p.cols / 3, f = t / p.k;
+    t %= p.k;
+    x += (size_t)f * p.k * 9 * 768;
     float sum = 0;
     for (uint yy = 0; yy < 3; yy++)
         for (uint xx = 0; xx < 3; xx++)
@@ -445,6 +477,15 @@ kernel void g2_half(device const float *x [[buffer(0)]], device half *y [[buffer
                     constant G2P &p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i < p.m * p.d)
         y[i] = i < p.n * p.d ? half(x[i]) : 0.0h;
+}
+// fp16 rows of width p.k from fp32 rows of width p.d (p.k > p.d: zero pad),
+// p.n real rows of p.m total (rows past p.n are zero).
+kernel void g2_half_pad(device const float *x [[buffer(0)]], device half *y [[buffer(1)]],
+                        constant G2P &p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.m * p.k)
+        return;
+    uint row = i / p.k, z = i % p.k;
+    y[i] = row < p.n && z < p.d ? half(x[row * p.d + z]) : 0.0h;
 }
 // Per (token, head slot): weighted RMS of q/k heads, unweighted RMS of v heads,
 // then NEOX RoPE of q/k in registers (pair z, z + d/2 lives in the same lane).
@@ -514,33 +555,110 @@ kernel void g2_qkv_post(device float *q [[buffer(0)]], device float *k [[buffer(
             dst[lane + j * 32] = half(r[j]);
     }
 }
-// Gemma sandwich per token (width 512): x = (x + rms(h) * w_post) * p.scale.
+// Gemma sandwich per token (width D): x = (x + rms(h) * w_post) * p.scale.
 // If p.mode != 0 also y = rms(x) * w_next (type p.mode - 1). Buffers: 0 h,
 // 1 x, 2 y, 3 params, 4 w_post (type p.type), 5 w_next.
-kernel void g2_post_add(device const float *h [[buffer(0)]], device float *x [[buffer(1)]],
-                        device float *y [[buffer(2)]], constant G2P &p [[buffer(3)]],
-                        device const uchar *wp [[buffer(4)]], device const uchar *wn [[buffer(5)]],
-                        uint t [[threadgroup_position_in_grid]],
-                        uint lane [[thread_index_in_simdgroup]]) {
-    device const float *hr = h + t * 512;
-    device float *xr = x + t * 512;
-    float a[16], ss = 0;
-    for (uint j = 0; j < 16; ++j) {
+template <uint D>
+kernel void g2_post_add_t(device const float *h [[buffer(0)]], device float *x [[buffer(1)]],
+                          device float *y [[buffer(2)]], constant G2P &p [[buffer(3)]],
+                          device const uchar *wp [[buffer(4)]], device const uchar *wn [[buffer(5)]],
+                          uint t [[threadgroup_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint ND = D / 32;
+    device const float *hr = h + t * D;
+    device float *xr = x + t * D;
+    float a[ND], ss = 0;
+    for (uint j = 0; j < ND; ++j) {
         a[j] = hr[lane + j * 32];
         ss += a[j] * a[j];
     }
-    float inv = rsqrt(simd_sum(ss) / 512 + 1e-6f), ss2 = 0;
-    for (uint j = 0; j < 16; ++j) {
+    float inv = rsqrt(simd_sum(ss) / D + 1e-6f), ss2 = 0;
+    for (uint j = 0; j < ND; ++j) {
         uint z = lane + j * 32;
-        a[j] = (xr[z] + a[j] * inv * g2w(wp, p.type, z)) * p.scale;
+        float hn = a[j] * inv * g2w(wp, p.type, z);
+        a[j] = p.cols ? xr[z] + hn * p.scale : (xr[z] + hn) * p.scale;
         xr[z] = a[j];
         ss2 += a[j] * a[j];
     }
     if (p.mode) {
-        float inv2 = rsqrt(simd_sum(ss2) / 512 + 1e-6f);
-        for (uint j = 0; j < 16; ++j) {
+        float inv2 = rsqrt(simd_sum(ss2) / D + 1e-6f);
+        for (uint j = 0; j < ND; ++j) {
             uint z = lane + j * 32;
-            y[t * 512 + z] = a[j] * inv2 * g2w(wn, p.mode - 1, z);
+            float v = a[j] * inv2 * g2w(wn, p.mode - 1, z);
+            if (p.lo < p.hi)
+                v = clamp(v, p.lo, p.hi);
+            y[t * D + z] = v;
         }
+    }
+}
+template [[host_name("g2_post_add")]] kernel void g2_post_add_t<512>(
+    device const float *, device float *, device float *, constant G2P &, device const uchar *,
+    device const uchar *, uint, uint);
+template [[host_name("g2_post_add_1024")]] kernel void g2_post_add_t<1024>(
+    device const float *, device float *, device float *, constant G2P &, device const uchar *,
+    device const uchar *, uint, uint);
+template [[host_name("g2_post_add_768")]] kernel void g2_post_add_t<768>(
+    device const float *, device float *, device float *, constant G2P &, device const uchar *,
+    device const uchar *, uint, uint);
+// Vision per (token, head slot), 64-wide heads: weighted RMS of q/k, plain RMS
+// of v, then the 2-D RoPE of g2_rope (axis 0 = column t % cols on dims
+// [0, 32), axis 1 = row t / cols on dims [32, 64); pairs (z, z + 16), base
+// 100) in registers. Slots [0, heads) q (written back fp32), [heads, 2 heads)
+// k and [2 heads, 3 heads) v (p.k tokens per frame for the 2-D RoPE position):
+// p.mode != 0 writes k/v as 128-wide zero-padded
+// fp16 rows (buffers 7/8, p.m rows, rows past p.n zeroed) for g2t_flash_64p;
+// otherwise they are written back fp32. Weights 4 = q norm, 5 = k norm (F32).
+kernel void g2_vqkv_post(device float *q [[buffer(0)]], device float *k [[buffer(1)]],
+                         device float *v [[buffer(2)]], constant G2P &p [[buffer(3)]],
+                         device const float *wq [[buffer(4)]], device const float *wk [[buffer(5)]],
+                         device half *kh [[buffer(7)]], device half *vh [[buffer(8)]],
+                         uint2 g [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    uint t = g.x, slot = g.y, heads = p.heads;
+    if (t >= p.n) {
+        if (slot >= heads) {
+            device half *dst = slot < 2 * heads ? kh + (t * heads + slot - heads) * 128
+                                                : vh + (t * heads + slot - 2 * heads) * 128;
+            for (uint j = 0; j < 4; ++j)
+                dst[lane + j * 32] = 0.0h;
+        }
+        return;
+    }
+    device float *row;
+    device const float *w = nullptr;
+    if (slot < heads) {
+        row = q + (t * heads + slot) * 64;
+        w = wq;
+    } else if (slot < 2 * heads) {
+        row = k + (t * heads + slot - heads) * 64;
+        w = wk;
+    } else
+        row = v + (t * heads + slot - 2 * heads) * 64;
+    float r[2];
+    r[0] = row[lane];
+    r[1] = row[lane + 32];
+    float inv = rsqrt(simd_sum(r[0] * r[0] + r[1] * r[1]) / 64 + 1e-6f);
+    r[0] *= inv * (w ? w[lane] : 1.0f);
+    r[1] *= inv * (w ? w[lane + 32] : 1.0f);
+    if (w) {
+        float z = float(lane & 15), freq = pow(100.0f, -z / 16);
+        uint lt = t % p.k; // position within the frame
+        for (uint axis = 0; axis < 2; ++axis) {
+            float theta = float(axis ? lt / p.cols : lt % p.cols) * freq;
+            float co = cos(theta), si = sin(theta), a = r[axis],
+                  b = simd_shuffle_xor(r[axis], 16);
+            r[axis] = lane & 16 ? b * si + a * co : a * co - b * si;
+        }
+    }
+    if (p.mode && slot >= heads) {
+        device half *dst = slot < 2 * heads ? kh + (t * heads + slot - heads) * 128
+                                            : vh + (t * heads + slot - 2 * heads) * 128;
+        dst[lane] = half(r[0]);
+        dst[lane + 32] = half(r[1]);
+        dst[lane + 64] = 0.0h;
+        dst[lane + 96] = 0.0h;
+    } else {
+        row[lane] = r[0];
+        row[lane + 32] = r[1];
     }
 }

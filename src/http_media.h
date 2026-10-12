@@ -13,6 +13,32 @@ static bool json_expect(const char **p, char ch, char *err, size_t len) {
 static bool string_is(const sv_string *s, const char *z) {
     return s->len == strlen(z) && !memcmp(s->s, z, s->len);
 }
+typedef struct {
+    const ei_media_input *m;
+    const string_list *frames;
+    int budget;
+    ei_media_frame *out;
+    _Atomic size_t next;
+} video_decode_job;
+static void *video_decode_worker(void *arg) {
+    video_decode_job *job = arg;
+    for (size_t i; (i = atomic_fetch_add(&job->next, 1)) < job->frames->n;)
+        ei_media_image_prepare(job->m, job->frames->items[i].s, job->frames->items[i].len,
+                               job->budget, &job->out[i]);
+    return NULL;
+}
+static void video_decode_all(const ei_media_input *m, const string_list *frames, int budget,
+                             ei_media_frame *out) {
+    video_decode_job job = {.m = m, .frames = frames, .budget = budget, .out = out};
+    size_t threads = frames->n < 8 ? frames->n : 8;
+    pthread_t workers[8];
+    size_t started = 0;
+    for (size_t t = 1; t < threads; ++t)
+        if (!pthread_create(&workers[started], NULL, video_decode_worker, &job)) started++;
+    video_decode_worker(&job);
+    for (size_t t = 0; t < started; ++t)
+        pthread_join(workers[t], NULL);
+}
 static bool media_part(const char **p, ei_media_input *m, char *err, size_t len) {
     if (!json_expect(p, '{', err, len))
         return false;
@@ -115,14 +141,23 @@ static bool media_part(const char **p, ei_media_input *m, char *err, size_t len)
         ok = ei_media_audio(m, data.s, data.len, err, len);
     else if (string_is(&type, "video") && (media_fields == 9 || media_fields == 25)) {
         ok = frames.n > 0;
+        // Frames decode and resize in parallel (up to 8 threads), run their
+        // towers as packed waves, then commit in stream order.
+        ei_media_frame *prepared = ei_xcalloc(frames.n, sizeof *prepared);
+        video_decode_all(m, &frames, frame_tokens, prepared);
+        ei_media_frames_encode(m, prepared, frames.n);
         for (size_t i = 0; ok && i < frames.n; ++i) {
             unsigned seconds = (unsigned)(i / fps);
             char stamp[40];
             int n = snprintf(stamp, sizeof stamp, "%s%02u:%02u ", i ? " " : "", seconds / 60,
                              seconds % 60);
             ok = ei_media_text(m, stamp, (size_t)n, err, len) &&
-                 ei_media_image(m, frames.items[i].s, frames.items[i].len, frame_tokens, err, len);
+                 ei_media_image_commit(m, &prepared[i], frames.items[i].s, frames.items[i].len,
+                                       err, len);
         }
+        for (size_t i = 0; i < frames.n; ++i)
+            ei_media_frame_free(&prepared[i]);
+        free(prepared);
     } else
         snprintf(err, len,
                  "content requires text/text, image/data, audio/data, or video/frames with "
@@ -143,11 +178,23 @@ static bool embed_structured(const server_opts *opts, const sv_string *input, fl
     ei_media_input m;
     ei_media_input_init(&m, &opts->engine->model.gguf, &opts->engine->tokenizer, opts->projector,
                         opts->engine->thread_pool);
-    // With pipeline slots, media owns a context separate from every text slot.
-    m.metal = opts->engine->gemma2_media ? opts->engine->gemma2_media : opts->engine->gemma2_metal;
-    m.cuda = opts->engine->gemma2_cuda_media ? opts->engine->gemma2_cuda_media
-                                             : opts->engine->gemma2_cuda;
-    m.lock = &inference_mutex; // engine calls only; parsing and decoding run unlocked
+    // GPU media runs on a slot of the media pool (own context and lock); the
+    // CPU backend shares the engine pool with text waves under inference_mutex.
+    // Locks cover engine calls only; parsing and decoding run unlocked.
+    media_slot *slot = media_slot_acquire();
+    if (slot) {
+        m.metal = slot->metal;
+        m.cuda = slot->cuda;
+        m.lock = &slot->lock;
+#if defined(EI_ENABLE_METAL)
+        if (media_finisher.enabled) m.finish = media_finish_submit;
+#endif
+    } else {
+        m.metal = opts->engine->gemma2_media ? opts->engine->gemma2_media : opts->engine->gemma2_metal;
+        m.cuda = opts->engine->gemma2_cuda_media ? opts->engine->gemma2_cuda_media
+                                                 : opts->engine->gemma2_cuda;
+        m.lock = &inference_mutex;
+    }
     const char *p = input->s;
     bool ok = false;
     sv_string key = {0};
@@ -188,6 +235,7 @@ static bool embed_structured(const server_opts *opts, const sv_string *input, fl
 done:
     free(key.s);
     ei_media_input_free(&m);
+    media_slot_release(slot);
     return ok;
 }
 #endif

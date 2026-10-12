@@ -50,6 +50,8 @@ PERF_SERVER_MODEL ?= embeddinggemma-300m
 ifeq ($(shell uname -s),Darwin)
 MACOSX_DEPLOYMENT_TARGET ?= 14.0
 export MACOSX_DEPLOYMENT_TARGET
+# PNG inflate through libcompression (src/media.c).
+LDLIBS += -lcompression
 endif
 
 # Prefer a full Xcode installation for Metal without requiring a global
@@ -719,6 +721,14 @@ bench-gemma2-cpu: $(BUILD)/bench_gemma2_cpu
 
 $(BUILD)/bench_gemma2_metal: src/bench_gemma2_metal.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(HDRS_NATIVE) $(METAL_LIBRARIES) | $(BUILD)
 	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/bench_gemma2_metal.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
+
+$(BUILD)/bench_gemma2_media: src/bench_gemma2_media.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(HDRS_NATIVE) $(METAL_LIBRARIES) | $(BUILD)
+	$(CC) $(CFLAGS) -DEI_ENABLE_METAL -o $@ src/bench_gemma2_media.c $(SRCS_ENGINE) $(METAL_ENGINE_OBJS) $(LDLIBS) $(METALLIB_LDFLAGS) $(METAL_FRAMEWORKS)
+
+# Time the gemma2 Metal media towers: make bench-gemma2-media [ITEMS="v768 a30"] [EI_BENCH_STREAMS=N]
+.PHONY: bench-gemma2-media
+bench-gemma2-media: $(BUILD)/bench_gemma2_media
+	./$(BUILD)/bench_gemma2_media $(GEMMA2_MODEL) $(GEMMA2_MMPROJ) $(ITEMS)
 
 # Compare/time a gemma2 Metal route: make bench-gemma2-metal ROUTE=GEMV=1 [CASES="32x4 512x1"]
 ROUTE ?= TENSOR=1,FLASH=1

@@ -84,7 +84,8 @@ METAL4_SOURCES := \
 	src/metal4/kernels/tensor_qgemm.metal \
 	src/metal4/kernels/flash_attention.metal \
 	src/metal4/kernels/gemma2_tensor.metal \
-	src/metal4/kernels/gemma2_flash.metal
+	src/metal4/kernels/gemma2_flash.metal \
+	src/metal4/kernels/gemma2_layer.metal
 METAL4_METALLIB := $(BUILD)/embeddinggemma-metal4.metallib
 METAL_LIBRARIES := $(METALLIB) $(METAL4_METALLIB)
 METALLIB_LDFLAGS := \
@@ -98,9 +99,9 @@ HDRS_NATIVE := $(wildcard src/*.h src/vendor/*.h)
 SRCS_CORE := src/gguf.c
 SRCS_MODEL := $(SRCS_CORE) src/model.c
 SRCS_TOKENIZER := $(SRCS_MODEL) src/tokenizer.c
-SRCS_ENGINE := $(SRCS_TOKENIZER) src/quants.c src/kernels.c src/parallel.c src/engine.c src/gemma2.c src/gemma2_fast.c src/gemma2_fast_x86.c src/media.c
+SRCS_ENGINE := $(SRCS_TOKENIZER) src/quants.c src/kernels.c src/parallel.c src/engine.c src/gemma2.c src/gemma2_fast.c src/gemma2_fast_x86.c src/media.c src/response_cache.c
 SRCS_SERVICE := src/inference_service.c
-SRCS_SERVER := src/server.c src/response_cache.c src/float_format.c
+SRCS_SERVER := src/server.c src/float_format.c
 
 CUDA_CORE_OBJS := $(patsubst src/%.c,$(BUILD)/cuda/%.o,$(SRCS_ENGINE))
 CUDA_SERVICE_OBJS := $(patsubst src/%.c,$(BUILD)/cuda/%.o,$(SRCS_SERVICE))
@@ -409,7 +410,7 @@ $(METALLIB): $(METAL_SOURCES) $(METAL_HEADERS) | $(BUILD)
 	}
 	xcrun -sdk macosx metal $(METAL_FLAGS) -I$(METAL_INCLUDE_DIR) $(METAL_SOURCES) -o $@
 
-$(METAL4_METALLIB): $(METAL4_SOURCES) | $(BUILD)
+$(METAL4_METALLIB): $(METAL4_SOURCES) src/metal/kernels/gemma2.metal | $(BUILD)
 	@xcrun --find metal >/dev/null 2>&1 || { \
 		echo "error: Metal compiler not found; install/select full Xcode with xcode-select" >&2; \
 		exit 1; \

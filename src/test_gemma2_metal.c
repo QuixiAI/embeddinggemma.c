@@ -27,8 +27,8 @@ int main(int argc, char **argv) {
     // The fast route is EI_GEMMA2_ROUTE_FLAGS (comma-separated EI_GEMMA2_METAL_*
     // names; the rest stay "0"), default FUSED,TENSOR2,FLASH2, the shipped
     // default. The reference route has every flag off.
-    const char *all[] = {"TENSOR", "FLASH",   "GEMV",   "FUSED", "TENSOR2",
-                         "FLASH2", "FLASH64", "VFUSED", "AFUSED"};
+    const char *all[] = {"TENSOR", "FLASH",   "GEMV",   "FUSED",  "TENSOR2",
+                         "FLASH2", "FLASH64", "VFUSED", "AFUSED", "LAYER"};
     char name[64];
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) {
         snprintf(name, sizeof name, "EI_GEMMA2_METAL_%s", all[i]);
@@ -113,6 +113,38 @@ int main(int argc, char **argv) {
         free(a);
         free(b);
         free(mel);
+    }
+    // Persistent layer kernel (EI_GEMMA2_METAL_LAYER=1): bit-identical to the
+    // GEMV route with scalar attention (FLASH2 off below 40 tokens) on short
+    // waves, single and packed, or it is disabled here (probe failed).
+    {
+        setenv("EI_GEMMA2_METAL_FLASH2_MIN_TOKENS", "40", 1);
+        setenv("EI_GEMMA2_METAL_LAYER", "0", 1);
+        void *ref = ei_gemma2_metal_create(&e.model.gguf, err, sizeof err);
+        setenv("EI_GEMMA2_METAL_LAYER", "1", 1);
+        void *layer = ei_gemma2_metal_create(&e.model.gguf, err, sizeof err);
+        unsetenv("EI_GEMMA2_METAL_FLASH2_MIN_TOKENS");
+        if (!ref || !layer)
+            ei_die("%s", err);
+        const size_t sizes[] = {1, 7, 8, 9, 16, 31, 39};
+        for (size_t i = 0; i < sizeof sizes / sizeof *sizes; i++) {
+            float a[768], b[768];
+            if (!ei_gemma2_metal_embed(ref, ids, NULL, sizes[i], a, err, sizeof err) ||
+                !ei_gemma2_metal_embed(layer, ids, NULL, sizes[i], b, err, sizeof err))
+                ei_die("%s", err);
+            if (memcmp(a, b, sizeof a))
+                ei_die("persistent layer route differs from the GEMV route at %zu tokens", sizes[i]);
+        }
+        const size_t packed[] = {0, 3, 11, 20, 39};
+        float pa[4 * 768], pb[4 * 768];
+        if (!ei_gemma2_metal_batch(ref, ids, packed, 4, pa, err, sizeof err) ||
+            !ei_gemma2_metal_batch(layer, ids, packed, 4, pb, err, sizeof err))
+            ei_die("%s", err);
+        if (memcmp(pa, pb, sizeof pa))
+            ei_die("persistent layer route differs from the GEMV route on a packed wave");
+        ei_gemma2_metal_free(ref);
+        ei_gemma2_metal_free(layer);
+        puts("persistent layer route: bit-identical to the GEMV route (1..39 tokens, packed)");
     }
     free(ids);
     ei_gemma2_metal_free(fast);

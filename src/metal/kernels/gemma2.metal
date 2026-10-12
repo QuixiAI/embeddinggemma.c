@@ -167,18 +167,18 @@ template [[host_name("g2_gemv_ple")]] kernel void g2_gemv_ple_t<8>(
 // p.d = K rows (= V rows). Weights in buffers 0/4/5, outputs in 2/6/7.
 template <typename IN, uint NT>
 inline void g2_qkv(device const uchar *wq, device const uchar *wk, device const uchar *wv,
-                   thread IN &in, device float *q, device float *k, device float *v,
-                   constant G2P &p, uint2 g, uint sg, uint lane) {
+                   thread IN &in, device float *q, device float *k, device float *v, uint pk,
+                   uint pm, uint pd, uint pn, uint2 g, uint sg, uint lane) {
     uint row = (g.x * 4 + sg) * 4;
     device const uchar *w = wq;
     device float *y = q;
-    uint m = p.m;
-    if (row >= p.m + p.d) {
-        w = wv, y = v, m = p.d, row -= p.m + p.d;
-    } else if (row >= p.m) {
-        w = wk, y = k, m = p.d, row -= p.m;
+    uint m = pm;
+    if (row >= pm + pd) {
+        w = wv, y = v, m = pd, row -= pm + pd;
+    } else if (row >= pm) {
+        w = wk, y = k, m = pd, row -= pm;
     }
-    g2_gemv_core<G2WQ8, 4, NT, 0>(w, in, y, p.k, m, p.n, row, g.y * NT, lane, q, 0);
+    g2_gemv_core<G2WQ8, 4, NT, 0>(w, in, y, pk, m, pn, row, g.y * NT, lane, q, 0);
 }
 template <uint NT>
 kernel void g2_gemv_qkv_t(device const uchar *wq [[buffer(0)]], device const float *x [[buffer(1)]],
@@ -189,7 +189,7 @@ kernel void g2_gemv_qkv_t(device const uchar *wq [[buffer(0)]], device const flo
                           uint sg [[simdgroup_index_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]]) {
     G2InPlain in{x, p.k};
-    g2_qkv<G2InPlain, NT>(wq, wk, wv, in, q, k, v, p, g, sg, lane);
+    g2_qkv<G2InPlain, NT>(wq, wk, wv, in, q, k, v, p.k, p.m, p.d, p.n, g, sg, lane);
 }
 template [[host_name("g2_gemv_qkv")]] kernel void g2_gemv_qkv_t<8>(
     device const uchar *, device const float *, device float *, constant G2P &,
@@ -197,18 +197,18 @@ template [[host_name("g2_gemv_qkv")]] kernel void g2_gemv_qkv_t<8>(
 // Up and gate rows together; stores gelu_tanh(gate) * up. Weights 0 (up) / 4 (gate).
 template <typename IN, uint NT>
 inline void g2_geglu(device const uchar *wu, device const uchar *wg, thread IN &in, device float *y,
-                     constant G2P &p, uint2 g, uint sg, uint lane) {
-    const uint row0 = (g.x * 4 + sg) * 2, t0 = g.y * NT, nt = min(NT, p.n - t0);
+                     uint pk, uint pm, uint pn, uint2 g, uint sg, uint lane) {
+    const uint row0 = (g.x * 4 + sg) * 2, t0 = g.y * NT, nt = min(NT, pn - t0);
     in.prepare(t0, nt, lane);
     float au[2][NT], ag[2][NT];
     for (uint r = 0; r < 2; ++r)
         for (uint t = 0; t < NT; ++t)
             au[r][t] = ag[r][t] = 0;
-    for (uint e = lane * 16; e < p.k; e += 512) {
+    for (uint e = lane * 16; e < pk; e += 512) {
         G2WQ8 u[2], gt[2];
         for (uint r = 0; r < 2; ++r) {
-            u[r].load(wu, (row0 + r) * p.k + e);
-            gt[r].load(wg, (row0 + r) * p.k + e);
+            u[r].load(wu, (row0 + r) * pk + e);
+            gt[r].load(wg, (row0 + r) * pk + e);
         }
         for (uint t = 0; t < NT; ++t) {
             if (t >= nt)
@@ -225,7 +225,7 @@ inline void g2_geglu(device const uchar *wu, device const uchar *wg, thread IN &
         for (uint t = 0; t < NT; ++t) {
             float a = simd_sum(au[r][t]), b = simd_sum(ag[r][t]);
             if (lane == (r * NT + t) % 32 && t < nt)
-                y[(t0 + t) * p.m + row0 + r] = g2gelu(b) * a;
+                y[(t0 + t) * pm + row0 + r] = g2gelu(b) * a;
         }
 }
 template <uint NT>
@@ -236,7 +236,7 @@ kernel void g2_gemv_geglu_t(device const uchar *wu [[buffer(0)]], device const f
                             uint sg [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]]) {
     G2InPlain in{x, p.k};
-    g2_geglu<G2InPlain, NT>(wu, wg, in, y, p, g, sg, lane);
+    g2_geglu<G2InPlain, NT>(wu, wg, in, y, p.k, p.m, p.n, g, sg, lane);
 }
 template [[host_name("g2_gemv_geglu")]] kernel void g2_gemv_geglu_t<8>(
     device const uchar *, device const float *, device float *, constant G2P &,
@@ -334,13 +334,11 @@ kernel void g2_rope(device float *x [[buffer(0)]], constant G2P &p [[buffer(1)]]
     x[off + z + halfd] = a * si + b * co;
 }
 // One SIMD group per query/head, online softmax, no quadratic score allocation.
-kernel void g2_attention(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]],
-                         device const float *v [[buffer(2)]], device float *out [[buffer(3)]],
-                         device const float *rpe [[buffer(4)]], constant G2P &p [[buffer(5)]],
-                         device const uint2 *bounds [[buffer(6)]],
-                         uint2 g [[threadgroup_position_in_grid]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-    uint t = g.x, h = g.y, kh = h / (p.heads / p.kv);
+// One (token t, head h) on one simdgroup. Buffers as in g2_attention.
+inline void g2_attention_body(device const float *q, device const float *k, device const float *v,
+                              device float *out, device const float *rpe, constant G2P &p,
+                              device const uint2 *bounds, uint t, uint h, uint lane) {
+    uint kh = h / (p.heads / p.kv);
     float qs[16], acc[16];
     for (uint j = 0; j < p.d / 32; j++) {
         qs[j] = q[(t * p.heads + h) * p.d + lane + j * 32];
@@ -381,6 +379,14 @@ kernel void g2_attention(device const float *q [[buffer(0)]], device const float
             o = clamp(o, p.lo, p.hi);
         out[(t * p.heads + h) * p.d + lane + j * 32] = o;
     }
+}
+kernel void g2_attention(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]],
+                         device const float *v [[buffer(2)]], device float *out [[buffer(3)]],
+                         device const float *rpe [[buffer(4)]], constant G2P &p [[buffer(5)]],
+                         device const uint2 *bounds [[buffer(6)]],
+                         uint2 g [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    g2_attention_body(q, k, v, out, rpe, p, bounds, g.x, g.y, lane);
 }
 kernel void g2_pool(device const float *x [[buffer(0)]], device float *out [[buffer(1)]],
                     device const uint2 *bounds [[buffer(2)]], constant G2P &p [[buffer(3)]],
@@ -493,14 +499,11 @@ kernel void g2_half_pad(device const float *x [[buffer(0)]], device half *y [[bu
 // Weights: 4 = q norm, 5 = k norm (type p.type). p.scale = RoPE base.
 // p.mode != 0 also writes fp16 K/V copies (buffers 7/8) for tensor flash; the
 // grid then covers 64 pad rows past p.n, which are zeroed.
-kernel void g2_qkv_post(device float *q [[buffer(0)]], device float *k [[buffer(1)]],
-                        device float *v [[buffer(2)]], constant G2P &p [[buffer(3)]],
-                        device const uchar *wq [[buffer(4)]], device const uchar *wk [[buffer(5)]],
-                        device const uint2 *bounds [[buffer(6)]], device half *kh [[buffer(7)]],
-                        device half *vh [[buffer(8)]], device const float2 *rope [[buffer(9)]],
-                        uint2 g [[threadgroup_position_in_grid]],
-                        uint lane [[thread_index_in_simdgroup]]) {
-    uint t = g.x, slot = g.y, nd = p.d / 32;
+inline void g2_qkv_post_body(device float *q, device float *k, device float *v, constant G2P &p,
+                             device const uchar *wq, device const uchar *wk,
+                             device const uint2 *bounds, device half *kh, device half *vh,
+                             device const float2 *rope, uint t, uint slot, uint lane) {
+    uint nd = p.d / 32;
     if (t >= p.n) {
         if (slot >= p.heads) {
             device half *dst = slot < p.heads + p.kv ? kh + (t * p.kv + slot - p.heads) * p.d
@@ -555,15 +558,22 @@ kernel void g2_qkv_post(device float *q [[buffer(0)]], device float *k [[buffer(
             dst[lane + j * 32] = half(r[j]);
     }
 }
+kernel void g2_qkv_post(device float *q [[buffer(0)]], device float *k [[buffer(1)]],
+                        device float *v [[buffer(2)]], constant G2P &p [[buffer(3)]],
+                        device const uchar *wq [[buffer(4)]], device const uchar *wk [[buffer(5)]],
+                        device const uint2 *bounds [[buffer(6)]], device half *kh [[buffer(7)]],
+                        device half *vh [[buffer(8)]], device const float2 *rope [[buffer(9)]],
+                        uint2 g [[threadgroup_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    g2_qkv_post_body(q, k, v, p, wq, wk, bounds, kh, vh, rope, g.x, g.y, lane);
+}
 // Gemma sandwich per token (width D): x = (x + rms(h) * w_post) * p.scale.
 // If p.mode != 0 also y = rms(x) * w_next (type p.mode - 1). Buffers: 0 h,
 // 1 x, 2 y, 3 params, 4 w_post (type p.type), 5 w_next.
 template <uint D>
-kernel void g2_post_add_t(device const float *h [[buffer(0)]], device float *x [[buffer(1)]],
-                          device float *y [[buffer(2)]], constant G2P &p [[buffer(3)]],
-                          device const uchar *wp [[buffer(4)]], device const uchar *wn [[buffer(5)]],
-                          uint t [[threadgroup_position_in_grid]],
-                          uint lane [[thread_index_in_simdgroup]]) {
+inline void g2_post_add_body(device const float *h, device float *x, device float *y,
+                             constant G2P &p, device const uchar *wp, device const uchar *wn,
+                             uint t, uint lane) {
     constexpr uint ND = D / 32;
     device const float *hr = h + t * D;
     device float *xr = x + t * D;
@@ -590,6 +600,14 @@ kernel void g2_post_add_t(device const float *h [[buffer(0)]], device float *x [
             y[t * D + z] = v;
         }
     }
+}
+template <uint D>
+kernel void g2_post_add_t(device const float *h [[buffer(0)]], device float *x [[buffer(1)]],
+                          device float *y [[buffer(2)]], constant G2P &p [[buffer(3)]],
+                          device const uchar *wp [[buffer(4)]], device const uchar *wn [[buffer(5)]],
+                          uint t [[threadgroup_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    g2_post_add_body<D>(h, x, y, p, wp, wn, t, lane);
 }
 template [[host_name("g2_post_add")]] kernel void g2_post_add_t<512>(
     device const float *, device float *, device float *, constant G2P &, device const uchar *,

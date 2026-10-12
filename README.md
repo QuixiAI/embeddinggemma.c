@@ -247,6 +247,9 @@ the same time; the scheduler sends each new wave to an idle device first.
   their towers on the GPU at once; each slot is a separate context, so media
   never waits on the text waves. On Metal the final text pass of concurrent
   media requests is packed into one wave.
+- `--media-cache-mb N` (default 256, 0 disables) caches image, video-frame and
+  audio tower outputs by content and whole content objects by their JSON, so
+  a repeated image or clip skips decode and the tower (image768 47 -> 13 ms).
 - Beside a GPU, CPU workers are overflow capacity. They start a wave only when
   every GPU slot is busy and more work is queued than the GPUs' next waves can
   absorb. They take only requests up to `--cpu-max-sequence-tokens` (default

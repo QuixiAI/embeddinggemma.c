@@ -12,6 +12,15 @@ typedef struct {
     float scale, lo, hi;
 } G2P;
 _Static_assert(sizeof(G2P) == 56, "Metal parameter layout mismatch");
+// Persistent layer kernel parameters (g2_layer): byte offsets into textWeights.
+typedef struct {
+    uint32_t n, d, kv, groups, ntg, layer;
+    uint32_t wq, wk, wv, wo, wu, wg, wd, wig, wpr;
+    uint32_t wqn, wkn, wpa, wfn, wpf, wpn, wnext;
+} G2L;
+_Static_assert(sizeof(G2L) == 88, "Metal layer parameter layout mismatch");
+@class EIGemma2Metal;
+static bool layer_probe(EIGemma2Metal *c);
 @interface EIGemma2Metal : NSObject {
   @public
     id<MTLDevice> device;
@@ -29,6 +38,8 @@ _Static_assert(sizeof(G2P) == 56, "Metal parameter layout mismatch");
     NSString *flashTile; // EI_GEMMA2_METAL_FLASH2_TILE=k64 selects the 64-key tile
     bool epi; // fused GeGLU / PLE epilogues on the wide GEMM (EI_GEMMA2_METAL_NOEPI=1 disables)
     bool kvHalfReady; // fp16 K/V for this layer already written by g2_qkv_post
+    bool layer;       // EI_GEMMA2_METAL_LAYER: persistent per-layer kernel on short waves
+    int layerGroups;  // EI_GEMMA2_METAL_LAYER_GROUPS: co-resident threadgroups per layer
     id<MTLBuffer> rope[2]; // fused route: (cos, sin) for base 1e4/d 256 and 1e6/d 512
     // fp16 row-major copies of Q8_0/BF16 text weights for g2t_gemm: name -> buffer.
     NSMutableDictionary<NSString *, id<MTLBuffer>> *packed;
@@ -562,7 +573,17 @@ void *ei_gemma2_metal_create(const ei_gguf *g, char *err, size_t len) {
         c->vfused = vf ? !strcmp(vf, "1") : metal4;
         const char *af = getenv("EI_GEMMA2_METAL_AFUSED");
         c->afused = af ? !strcmp(af, "1") : true;
-        if (c->tensorMM || c->flash || c->tensor2 || c->flash2) {
+        // Persistent layer kernel (Metal 4 library), opt-in: "1" turns it on where
+        // the fused route runs and the startup probe shows the groups rendezvous.
+        // Measured 0.99-1.13x at 1-8 tokens and 0.5-0.8x at 20-39 (2026-10-11):
+        // a grid barrier costs what a dispatch boundary costs on the M5.
+        const char *layerFlag = getenv("EI_GEMMA2_METAL_LAYER");
+        const char *layerGroups = getenv("EI_GEMMA2_METAL_LAYER_GROUPS");
+        c->layerGroups = layerGroups ? atoi(layerGroups) : 128;
+        if (c->layerGroups < 8 || c->layerGroups > 1024)
+            c->layerGroups = 128;
+        bool layerWanted = metal4 && c->fused && layerFlag && !strcmp(layerFlag, "1");
+        if (c->tensorMM || c->flash || c->tensor2 || c->flash2 || layerWanted) {
             bool supported = false;
             if (@available(macOS 26.0, *))
                 supported = [c->device supportsFamily:MTLGPUFamilyMetal4];
@@ -597,14 +618,15 @@ void *ei_gemma2_metal_create(const ei_gguf *g, char *err, size_t len) {
                      @"g2t_flash_256_q16n8", @"g2t_flash_512_q16n8", @"g2t_flash_256_q16k256n8",
                      @"g2t_flash_512_q16k256n8", @"g2t_flash_256_n16", @"g2t_flash_512_n16",
                      @"g2t_flash_256_q64k64n8", @"g2t_flash_512_q64k64n8",
-                     @"g2t_flash_256_q64k64n16", @"g2t_flash_512_q64k64n16"
+                     @"g2t_flash_256_q64k64n16", @"g2t_flash_512_q64k64n16", @"g2_layer",
+                     @"g2_layer_probe"
                  ]) {
                 id<MTLFunction> f = [tensorLib newFunctionWithName:name];
                 id<MTLComputePipelineState> p =
                     f ? [c->device newComputePipelineStateWithFunction:f error:&error] : nil;
                 if (!p && ([name hasSuffix:@"_k64"] || [name containsString:@"_q16"] ||
                            [name containsString:@"_q64"] || [name hasSuffix:@"_n8"] ||
-                           [name hasSuffix:@"_n16"])) {
+                           [name hasSuffix:@"_n16"] || [name hasPrefix:@"g2_layer"])) {
                     // Optional flash tile experiments: report and fall back.
                     if (getenv("EI_GEMMA2_METAL_PROFILE"))
                         fprintf(stderr, "%s unavailable: %s\n", name.UTF8String,
@@ -631,6 +653,26 @@ void *ei_gemma2_metal_create(const ei_gguf *g, char *err, size_t len) {
         if (!c->queue || !c->textWeights) {
             snprintf(err, len, "Gemma 2 Metal weight allocation failed");
             return NULL;
+        }
+        c->layer = layerWanted && c->pipelines[@"g2_layer"] && c->pipelines[@"g2_layer_probe"];
+        if (c->layer) {
+            // The layer kernel decodes Q8_0 only (the fused check covers the rest).
+            const char *kinds[] = {"attn_output", "ffn_down", "proj"};
+            for (int l = 0; l < 24 && c->layer; l++)
+                for (size_t i = 0; i < sizeof kinds / sizeof *kinds; i++) {
+                    char name[64];
+                    snprintf(name, sizeof name, "blk.%d.%s.weight", l, kinds[i]);
+                    const ei_tensor *t = ei_gguf_tensor(g, name, true);
+                    if (t->type != EI_T_Q8_0 || t->offset > UINT32_MAX)
+                        c->layer = false;
+                }
+        }
+        if (c->layer && !layer_probe(c)) {
+            c->layer = false;
+            fprintf(stderr,
+                    "EmbeddingGemma 2 Metal: %d persistent layer groups did not rendezvous; "
+                    "using the dispatch route\n",
+                    c->layerGroups);
         }
         c->packed = [NSMutableDictionary new];
         if (c->tensor2)
@@ -685,6 +727,8 @@ void *ei_gemma2_metal_clone(void *ctx, char *err, size_t len) {
         c->flash2Min = p->flash2Min;
         c->epi = p->epi;
         c->flashTile = p->flashTile;
+        c->layer = p->layer;
+        c->layerGroups = p->layerGroups;
         c->rope[0] = p->rope[0];
         c->rope[1] = p->rope[1];
         c->workspace = [NSMutableDictionary new];
@@ -886,6 +930,100 @@ static void text_layer_fused(EIGemma2Metal *c, const ei_gguf *g, int l, int n, s
     post_add(c, g, T("post_norm"), next, a, x, h, n, scale);
 #undef T
 }
+// Startup probe for the persistent layer kernel: a forward's worth of grid
+// barriers (24 layers x 11 stages) across layerGroups threadgroups. The spin is
+// capped in the kernel, so a group count the GPU cannot keep co-resident fails
+// in milliseconds instead of hanging.
+static bool layer_probe(EIGemma2Metal *c) {
+    @autoreleasepool {
+        id<MTLBuffer> bar = buffer(c, @"layer_bar", 24), fail = buffer(c, @"layer_fail", 1);
+        memset(bar.contents, 0, 24 * 4);
+        memset(fail.contents, 0, 4);
+        begin(c);
+        pipeline(c, @"g2_layer_probe");
+        bind(c, bar, 0);
+        bind(c, fail, 1);
+        params(c, (G2P){.n = 264, .m = (uint32_t)c->layerGroups}, 2);
+        [c->enc dispatchThreadgroups:MTLSizeMake(c->layerGroups, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        char err[256];
+        double start = now_ms();
+        bool ok = finish(c, err, sizeof err) && !*(uint32_t *)fail.contents;
+        if (getenv("EI_GEMMA2_METAL_PROFILE"))
+            fprintf(stderr, "persistent layer probe: %d groups x 264 barriers %s in %.3f ms\n",
+                    c->layerGroups, ok ? "ok" : "FAILED", now_ms() - start);
+        return ok;
+    }
+}
+static uint32_t woff(const ei_gguf *g, const char *name, uint32_t *type) {
+    const ei_tensor *w = ei_gguf_tensor(g, name, true);
+    if (type)
+        *type = w->type;
+    return (uint32_t)w->offset;
+}
+// One text layer as a single persistent dispatch (g2_layer): the short-wave
+// stages of text_layer_fused with grid barriers between them. h holds
+// rms(x) * attn_norm on entry and rms(x) * next_norm on exit, as there.
+static void text_layer_persistent(EIGemma2Metal *c, const ei_gguf *g, int l, int n,
+                                  id<MTLBuffer> x, id<MTLBuffer> h, id<MTLBuffer> q,
+                                  id<MTLBuffer> k, id<MTLBuffer> v, id<MTLBuffer> a,
+                                  id<MTLBuffer> gate, id<MTLBuffer> ple, id<MTLBuffer> bounds) {
+    char name[128], next[128];
+#define T(s) (snprintf(name, sizeof name, "blk.%d." s ".weight", l), name)
+    int d = l % 6 == 5 ? 512 : 256, kv = 512 / d;
+    uint32_t tqn = 0, tpa = 0, tfn = 0, tpf = 0, tpn = 0, tnext = 0;
+    G2L L = {.n = (uint32_t)n, .d = (uint32_t)d, .kv = (uint32_t)kv,
+             .groups = (uint32_t)c->layerGroups, .ntg = (uint32_t)(n + 7) / 8, .layer = (uint32_t)l};
+    L.wq = woff(g, T("attn_q"), NULL);
+    L.wk = woff(g, T("attn_k"), NULL);
+    L.wv = woff(g, T("attn_v"), NULL);
+    L.wo = woff(g, T("attn_output"), NULL);
+    L.wu = woff(g, T("ffn_up"), NULL);
+    L.wg = woff(g, T("ffn_gate"), NULL);
+    L.wd = woff(g, T("ffn_down"), NULL);
+    L.wig = woff(g, T("inp_gate"), NULL);
+    L.wpr = woff(g, T("proj"), NULL);
+    L.wqn = woff(g, T("attn_q_norm"), &tqn);
+    L.wkn = woff(g, T("attn_k_norm"), NULL);
+    L.wpa = woff(g, T("post_attention_norm"), &tpa);
+    L.wfn = woff(g, T("ffn_norm"), &tfn);
+    L.wpf = woff(g, T("post_ffw_norm"), &tpf);
+    L.wpn = woff(g, T("post_norm"), &tpn);
+    if (l < 23)
+        snprintf(next, sizeof next, "blk.%d.attn_norm.weight", l + 1);
+    else
+        snprintf(next, sizeof next, "output_norm.weight");
+    L.wnext = woff(g, next, &tnext);
+    float scale = scalar(g, T("layer_output_scale"), 1);
+    // Stage parameters exactly as the standalone dispatches would receive them.
+    G2P S[5] = {
+        {.n = n, .heads = 4, .kv = kv, .d = d, .type = tqn, .scale = l % 6 == 5 ? 1e6f : 1e4f,
+         .cols = 1},
+        {.n = n, .heads = 4, .kv = kv, .d = d, .window = l % 6 == 5 ? 0 : 512, .layer = 1},
+        {.n = n, .scale = 1, .type = tpa, .mode = tfn + 1},
+        {.n = n, .scale = 1, .type = tpf},
+        {.n = n, .scale = scale, .type = tpn, .mode = tnext + 1},
+    };
+    pipeline(c, @"g2_layer");
+    [c->enc setBuffer:c->textWeights offset:0 atIndex:0];
+    bind(c, x, 1);
+    bind(c, h, 2);
+    bind(c, q, 3);
+    bind(c, k, 4);
+    bind(c, v, 5);
+    bind(c, a, 6);
+    bind(c, gate, 7);
+    bind(c, ple, 8);
+    bind(c, bounds, 9);
+    bind(c, c->rope[l % 6 == 5], 10);
+    [c->enc setBuffer:buffer(c, @"layer_bar", 24) offset:(NSUInteger)l * 4 atIndex:11];
+    bind(c, buffer(c, @"layer_fail", 1), 12);
+    [c->enc setBytes:&L length:sizeof L atIndex:13];
+    [c->enc setBytes:S length:sizeof S atIndex:14];
+    [c->enc dispatchThreadgroups:MTLSizeMake(c->layerGroups, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+#undef T
+}
 static bool embed(void *ctx, const int32_t *ids, const float *inputs, size_t count,
                   const size_t *offsets, size_t batch, float *out, char *err, size_t len) {
     @autoreleasepool {
@@ -930,10 +1068,18 @@ static bool embed(void *ctx, const int32_t *ids, const float *inputs, size_t cou
         mm(c, g, "per_layer_model_proj.weight", x, n, ple);
         element(c, ple, ple, ple, count * 512 * 24, 7, 1 / sqrtf(512), 0);
         norm(c, g, "per_layer_proj_norm.weight", ple, n * 24, 512, ple, 1);
+        bool persistent = c->fused && c->layer && short_route(c, n);
         if (c->fused) {
             norm(c, g, "blk.0.attn_norm.weight", x, n, 512, h, 1);
+            if (persistent) {
+                memset(buffer(c, @"layer_bar", 24).contents, 0, 24 * 4);
+                memset(buffer(c, @"layer_fail", 1).contents, 0, 4);
+            }
             for (int l = 0; l < 24; l++)
-                text_layer_fused(c, g, l, n, count, x, h, q, k, v, a, up, gate, ple, bounds);
+                if (persistent)
+                    text_layer_persistent(c, g, l, n, x, h, q, k, v, a, gate, ple, bounds);
+                else
+                    text_layer_fused(c, g, l, n, count, x, h, q, k, v, a, up, gate, ple, bounds);
             // h = rms(x) * output_norm from the last layer's post_add.
             mm(c, g, "output.weight", h, n, a);
         } else {
@@ -980,6 +1126,14 @@ static bool embed(void *ctx, const int32_t *ids, const float *inputs, size_t cou
         threads(c, batch * 768);
         if (!finish(c, err, len))
             return false;
+        if (persistent && *(uint32_t *)buffer(c, @"layer_fail", 1).contents) {
+            // The groups did not rendezvous (GPU shared with other work): the
+            // forward is invalid. Redo it on the dispatch route and stay there.
+            fprintf(stderr, "EmbeddingGemma 2 Metal: persistent layer barrier timed out; "
+                            "using the dispatch route\n");
+            c->layer = false;
+            return embed(ctx, ids, inputs, count, offsets, batch, out, err, len);
+        }
         memcpy(out, result.contents, batch * 768 * 4);
         for (size_t s = 0; s < batch; s++)
             ei_l2_normalize(out + s * 768, 768);

@@ -309,6 +309,16 @@ exactly (goldens identical to 9 digits):
 The media stack (2026-10-10, `perf/optimization_status.md`), on by default
 (FLASH64 and VFUSED where Metal 4 is available); `0` turns a route off:
 
+- `EI_GEMMA2_METAL_LAYER=1` (opt-in): persistent per-layer kernel for waves
+  under 40 tokens. The eleven dependent short-wave stages of a text layer run
+  as one dispatch of `EI_GEMMA2_METAL_LAYER_GROUPS` (default 128) threadgroups
+  separated by a device-atomic grid barrier; bit-identical to the GEMV route
+  with scalar attention (`make test-gemma2-metal-routes` checks it). A startup
+  probe (264 barriers, capped spin) enables it only where the groups
+  rendezvous, and a barrier timeout inside a forward fails that wave over to
+  the dispatch route and turns the route off. It stays off because a grid
+  barrier costs what a dispatch boundary costs on the M5 (2.2-4.7 us for
+  64-512 groups): 0.99-1.13x at 1-8 tokens, 0.5-0.8x at 20-39.
 - `EI_GEMMA2_METAL_FLASH64=1`: vision attention (64-wide heads) on the
   `matmul2d` flash kernel over 128-wide zero-padded fp16 K/V rows
   (`g2t_flash_64p`, `g2_half_pad`): the pad columns add exact zeros to Q.K^T
@@ -325,6 +335,13 @@ The media stack (2026-10-10, `perf/optimization_status.md`), on by default
   are gone. The patch embedding (as [768][768]) and every 2-D `a.*` projector
   weight now have fp16 copies too (the audio pre-encode and input projection
   were on the tile route).
+- `--media-cache-mb N` (server, default 256, 0 disables): media cache for
+  content-object requests. Image and video-frame tower outputs are cached by
+  (token budget, payload hash), audio by (samples used, payload hash), and
+  whole content objects by their JSON text, so a repeated image, frame or
+  clip skips base64, decode, resize and the tower (image768 46.9 -> 13 ms,
+  audio10s 21 -> 10 ms, video4 44 -> 14 ms at c1, byte-identical responses).
+  One LRU shared by every media slot (`ei_response_cache`), 128-bit keys.
 - `--media-slots N` (server, 1..8, default 2): GPU media contexts. Each media
   request runs its towers on the least-loaded slot under that slot's lock, so
   media requests overlap on the GPU and never take the global inference lock
@@ -436,7 +453,8 @@ keep-alive HTTP load generator for hosts without wrk/hey.
 `make bench-gemma2-metal ROUTE=FUSED=1,TENSOR2=1,FLASH2=1 CASES="1x1 32x16"`
 times a route against the default path (`EI_BENCH_BASE=` names another
 baseline; `EI_BENCH_STREAMS=N` measures N concurrent waves on separate queues).
-Cases are `TOKENSxSEQUENCES` packed into one wave.
+Cases are `TOKENSxSEQUENCES` packed into one wave; `T+TxB+...` packs a mixed
+wave in that order (`2000+20x15`), for ordering and straddling experiments.
 
 The route test requires Metal 4. It covers thresholds, 8192 tokens, packed
 sequence isolation, larger images, and audio spanning the projection threshold.
@@ -582,6 +600,11 @@ Important production controls:
   ahead of requests about to queue. At 512 tokens x c16 the 16 clients
   otherwise phase-lock into a 15-request wave plus a lone one; with it every
   wave carries 16 (wave log) and the c16 p99 drops from ~2 waves to ~1.
+- `EI_BATCH_SORT=0` keeps queue order inside a wave. By default a wave is
+  packed longest sequence first (results still land in request order):
+  sequences pack ragged, so there is no padding to save, but the packed
+  attention tiles then start aligned to the long sequences, 2-4% on mixed
+  waves in-process (seven ordered pairs, all the same direction).
 - `EI_BATCH_WAIT_MAX_US=N`: cap the extended collection deadline. New arrivals
   during collection extend the base `--batch-wait-us` deadline, bounded by
   this cap; the default is four times the base delay.

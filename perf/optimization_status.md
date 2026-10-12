@@ -3691,7 +3691,7 @@ cooperative kernel that keeps the residual row in threadgroup memory and
 synchronizes stages with device atomics. Metal guarantees neither
 co-residency nor forward progress across threadgroups, so viability has to
 be measured (barrier cost, co-resident threadgroup count) before any kernel
-is written. The probe written for that (`scratchpad/grid_barrier.m`) had a
+is written. The probe written for that (now `perf/grid_barrier_probe.m`) had a
 spin cap large enough that the non-resident configurations ran for minutes,
 and when the host process was killed its command buffer kept the GPU at
 100% device utilization for a long time afterwards: orphaned GPU work
@@ -3720,3 +3720,111 @@ and group counts chosen from the probe, never from the dispatch size. The
 kernel itself is the GEMV / attention / norm sequence of
 `text_layer_fused` with the residual row in threadgroup memory and the
 512-row projections split across groups. Not started this pass.
+
+## 2026-10-11 (late): EmbeddingGemma 2 Metal, fifth pass (persistent layer, media cache, wave order)
+
+Three items from the brainstorm: the persistent per-layer kernel, caching
+beyond the HTTP response cache, and length-aware wave packing. Same host and
+discipline as the earlier passes (in-process base/route pairs, `EI_BENCH_BASE`
+= the shipped route, 9-iteration medians).
+
+### Persistent per-layer kernel: built, correct, not a win (opt-in)
+
+`g2_layer` (Metal 4 library, `src/metal4/kernels/gemma2_layer.metal`) runs the
+eleven short-wave stages of a text layer in one dispatch of G threadgroups of
+128 threads with a device-atomic grid barrier between stages. Stage bodies are
+the standalone kernels' bodies (`g2_qkv`, `g2_geglu`, `g2_gemv_core` with one
+row per simdgroup for the 512-row projections, `g2_qkv_post_body`,
+`g2_attention_body`, `g2_post_add_body`), so the result is bit-identical to the
+GEMV route with scalar attention (`test-gemma2-metal-routes` compares bytes at
+1..39 tokens and on a packed wave). Safety: a 264-barrier startup probe with a
+capped spin enables the route; in a forward a timed-out barrier sets a fail
+word, every group returns, and the host re-runs the forward on the dispatch
+route and turns the route off (verified by asking for 1024 groups: the probe
+fails, the forward runs at 1.00x on the dispatch route).
+
+Barrier cost by GPU timestamps (`perf/grid_barrier_probe.m`, 264 barriers,
+128-thread groups, best of 5):
+
+| groups | no fence | seq_cst device fence |
+|---:|---:|---:|
+| 64 | 2.25 us | 3.25 us |
+| 128 | 3.67 | 4.73 |
+| 256 | 4.69 | 1.91 |
+| 384 | 1.81 | 2.28 |
+| 512 | 2.43 | 3.00 |
+
+That is the cost of a dispatch boundary here (the 10-10 floor probe: 1-3 us),
+so replacing 11 dispatches by 10 barriers cannot win by itself. Forward times,
+base = shipped route (ms, median of 9):
+
+| case | base | G=64 | G=128 | G=256 | G=512 |
+|---|---:|---:|---:|---:|---:|
+| 1x1 | 2.24 | 2.45 | 2.26 | 2.27 | 2.60 |
+| 8x1 | 3.74 | 3.91 | 3.32 | 3.31 | 3.60 |
+| 20x1 | 4.28 | 6.82 | 5.47 | 5.20 | 6.92 |
+| 39x1 | 5.47 | 11.39 | 8.81 | 8.22 | 10.66 |
+
+Above 8 tokens each group runs its token groups serially where the dispatch
+route spreads them over more cores. The route ships opt-in
+(`EI_GEMMA2_METAL_LAYER=1`, `EI_GEMMA2_METAL_LAYER_GROUPS`). What would move
+the floor is fusing stages so round trips disappear (each group recomputing
+the post-norm for its tokens with ping-pong residual buffers; attention
+normalizing and rotating K/V on the fly), worth one barrier each; not built.
+
+### Media cache (landed, default 256 MiB)
+
+`--media-cache-mb N`: image and video-frame tower outputs keyed by (budget,
+128-bit payload hash), audio by (samples used, hash), and whole content
+objects by their JSON (`ei_response_cache`, one LRU across media slots). The
+HTTP response cache only served identical bodies; the same image with other
+text re-ran everything. c1 latencies over HTTP, same image with unique text,
+responses `cmp`-identical to the cache-off server:
+
+| request | cache off | cache on (hit) | exact repeat (whole-input hit) |
+|---|---:|---:|---:|
+| image768 | 46.9 ms | 13.0 ms | 2.8 ms |
+| audio10s | 21.0 | 10.4 | 1.5 |
+| video4 (4 frames) | 44.3 | 14.0 | 3.4 |
+
+The hit time is the finish pass (text over 256+ soft tokens) plus HTTP.
+Under load (`perf/loadgen_media.c`, same media with unique text per request,
+4 s cells, same binary with `--media-cache-mb 0` for the off column):
+
+| cell | cache off | cache on |
+|---|---:|---:|
+| image432 c1 | 62 req/s, p50 16.0 ms | 126 req/s, p50 7.8 ms |
+| image432 c8 | 82 req/s, p50 101 ms | 580 req/s, p50 17.0 ms |
+| image768 c1 | 17.8 req/s, p50 56 ms | 72 req/s, p50 13.3 ms |
+| image768 c8 | 21 req/s, p50 400 ms | 221 req/s, p50 36.7 ms |
+| audio10s c1 | 47 req/s, p50 20.9 ms | 92 req/s, p50 10.2 ms |
+| audio10s c8 | 74 req/s, p50 112 ms | 352 req/s, p50 30.1 ms |
+| video4 c1 | 17.2 req/s, p50 58 ms | 75 req/s, p50 12.9 ms |
+| video4 c4 | 19 req/s, p50 220 ms | 180 req/s, p50 21.8 ms |
+
+That is the repeat-media ceiling: the finish waves alone. Byte-identical.
+
+### Wave order (landed, `EI_BATCH_SORT=0` reverts)
+
+Sequences pack ragged, so a length-bucketed collector has no padding to save
+(the item as brainstormed was wrong). What ordering does change is where the
+packed attention tiles start. Mixed waves, both orders, in-process medians:
+
+| wave | short first | long first |
+|---|---:|---:|
+| 100x8 + 500x2 (x3) | 21.60 / 21.58 / 21.64 | 21.20 / 21.18 / 21.17 |
+| 50x16 + 800 (x2) | 20.14 / 20.12 | 19.73 / 19.92 |
+| 200x4 + 600x2 (x2) | 24.37 / 26.99 | 23.95 / 25.87 |
+| 2000 + 20x15 | 33.26 | 33.04 |
+| 1000x2 + 20x20 | 34.96 | 35.04 |
+
+Longest-first is 2-4% on the first three shapes and neutral on the others, so
+the backend sorts each wave longest first before packing (outputs stay in
+request order). An earlier 10% reading on the first pair was host noise; the
+alternating repeats are the evidence.
+
+### Rejected
+
+- Prefix K/V reuse across requests: attention is bidirectional (`t - w .. t +
+  w`), so no prefix of a sequence has a reusable K/V.
+- Length bucketing in the collector: nothing to save beyond the ordering above.

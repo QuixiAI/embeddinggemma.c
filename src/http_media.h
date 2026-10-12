@@ -175,9 +175,31 @@ static bool embed_structured(const server_opts *opts, const sv_string *input, fl
         snprintf(err, len, "multimodal input requires the embeddinggemma-2 profile");
         return false;
     }
+    // Whole-input cache: the same content object (in any batch) is a lookup.
+    // Key: a tag byte and the input text; value: [u64 usage][768 floats].
+    char *input_key = NULL;
+    size_t input_key_len = 0;
+    if (media_cache) {
+        input_key_len = input->len + 1;
+        input_key = ei_xmalloc(input_key_len);
+        input_key[0] = 'E';
+        memcpy(input_key + 1, input->s, input->len);
+        ei_response_cache_value hit;
+        if (ei_response_cache_acquire(media_cache, input_key, input_key_len, &hit) &&
+            hit.len == 8 + 768 * sizeof(float)) {
+            uint64_t used = 0;
+            memcpy(&used, hit.data, 8);
+            memcpy(out, hit.data + 8, 768 * sizeof(float));
+            ei_response_cache_release(media_cache, &hit);
+            *usage += (size_t)used;
+            free(input_key);
+            return true;
+        }
+    }
     ei_media_input m;
     ei_media_input_init(&m, &opts->engine->model.gguf, &opts->engine->tokenizer, opts->projector,
                         opts->engine->thread_pool);
+    m.cache = media_cache;
     // GPU media runs on a slot of the media pool (own context and lock); the
     // CPU backend shares the engine pool with text waves under inference_mutex.
     // Locks cover engine calls only; parsing and decoding run unlocked.
@@ -230,9 +252,18 @@ static bool embed_structured(const server_opts *opts, const sv_string *input, fl
         goto done;
     }
     ok = ei_media_finish(&m, out, err, len);
-    if (ok)
+    if (ok) {
         *usage += m.n;
+        if (input_key) {
+            char blob[8 + 768 * sizeof(float)];
+            uint64_t used = m.n;
+            memcpy(blob, &used, 8);
+            memcpy(blob + 8, out, 768 * sizeof(float));
+            ei_response_cache_insert(media_cache, input_key, input_key_len, blob, sizeof blob);
+        }
+    }
 done:
+    free(input_key);
     free(key.s);
     ei_media_input_free(&m);
     media_slot_release(slot);

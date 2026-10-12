@@ -1,6 +1,7 @@
 #ifndef EI_MEDIA_H
 #define EI_MEDIA_H
 #include "gemma2.h"
+#include "response_cache.h"
 #include "tokenizer.h"
 #include <pthread.h>
 typedef struct {
@@ -18,6 +19,9 @@ typedef struct {
     bool (*finish)(void *ctx, const float *inputs, size_t n, float *out, char *err,
                    size_t err_len);
     void *finish_ctx;
+    /* Optional media cache (ei_response_cache, thread-safe): tower outputs by
+     * content hash, so a repeated image, frame or clip skips decode and tower. */
+    ei_response_cache *cache;
     float *inputs;
     size_t n;
 } ei_media_input;
@@ -34,8 +38,10 @@ typedef struct {
     int width, height, budget;
     bool ok;
     char err[160];
-    float *soft; /* set by ei_media_frames_encode: the tower's output rows */
+    float *soft; /* set by ei_media_frames_encode or a cache hit: the tower's output rows */
     size_t tokens;
+    unsigned char key[24]; /* media cache key when keyed */
+    bool keyed;
 } ei_media_frame;
 void ei_media_image_prepare(const ei_media_input *m, const char *base64, size_t len, int budget,
                             ei_media_frame *frame);

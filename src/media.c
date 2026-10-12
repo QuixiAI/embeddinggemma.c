@@ -267,10 +267,87 @@ static void append_soft(ei_media_input *m, const float *soft, size_t n, int star
     rows(m, soft, n);
     token(m, end);
 }
+/* Media cache: tower outputs keyed by kind, the parameter that fixes the
+ * output (image token budget, audio samples used) and a 128-bit hash of the
+ * base64 payload. Values are [u64 rows][rows x 512 floats]. */
+static uint64_t mix64(uint64_t h) {
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return h;
+}
+static uint64_t hash64(const char *data, size_t len, uint64_t seed) {
+    uint64_t h = mix64(seed ^ 0x9E3779B97F4A7C15ULL ^ (uint64_t)len);
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t w;
+        memcpy(&w, data + i, 8);
+        h = mix64(h ^ w) + 0x632BE59BD9B4E019ULL;
+    }
+    uint64_t tail = 0;
+    if (i < len)
+        memcpy(&tail, data + i, len - i);
+    return mix64(h ^ tail ^ ((uint64_t)(len - i) << 56));
+}
+static void media_key(unsigned char key[24], char kind, uint32_t param, const char *data,
+                      size_t len) {
+    uint64_t a = hash64(data, len, 1), b = hash64(data, len, 2);
+    memset(key, 0, 24);
+    key[0] = (unsigned char)kind;
+    memcpy(key + 4, &param, 4);
+    memcpy(key + 8, &a, 8);
+    memcpy(key + 16, &b, 8);
+}
+/* On a hit *soft is a malloc'd copy of the rows. */
+static bool cache_soft_lookup(const ei_media_input *m, const unsigned char key[24], float **soft,
+                              size_t *n) {
+    ei_response_cache_value v;
+    if (!m->cache || !ei_response_cache_acquire(m->cache, (const char *)key, 24, &v))
+        return false;
+    uint64_t rows_n = 0;
+    memcpy(&rows_n, v.data, 8);
+    *n = (size_t)rows_n;
+    *soft = ei_xmalloc(*n * 512 * sizeof(float) + sizeof(float));
+    memcpy(*soft, v.data + 8, *n * 512 * sizeof(float));
+    ei_response_cache_release(m->cache, &v);
+    return true;
+}
+static void cache_soft_store(const ei_media_input *m, const unsigned char key[24],
+                             const float *soft, size_t n) {
+    if (!m->cache || !soft)
+        return;
+    size_t bytes = 8 + n * 512 * sizeof(float);
+    char *blob = ei_xmalloc(bytes);
+    uint64_t rows_n = n;
+    memcpy(blob, &rows_n, 8);
+    memcpy(blob + 8, soft, n * 512 * sizeof(float));
+    ei_response_cache_insert(m->cache, (const char *)key, 24, blob, bytes);
+    free(blob);
+}
 bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budget, char *err,
                     size_t err_len) {
     size_t size = 0;
     double t0 = media_timing() ? media_now_ms() : 0;
+    /* The output is fixed by the payload and the budget it will actually get. */
+    unsigned char key[24];
+    bool keyed = m->cache != NULL;
+    if (keyed) {
+        int eff = budget;
+        if ((size_t)eff + 2 > avail(m))
+            eff = avail(m) >= 72 ? (int)avail(m) - 2 : 0;
+        media_key(key, 'I', (uint32_t)eff, base64, len);
+        float *soft = NULL;
+        size_t n = 0;
+        if (eff >= 70 && cache_soft_lookup(m, key, &soft, &n)) {
+            if (n + 2 <= avail(m))
+                append_soft(m, soft, n, 255999, 258882);
+            free(soft);
+            MEDIA_STAGE("cached", t0);
+            return true;
+        }
+    }
     uint8_t *bytes = decode(base64, len, &size);
     MEDIA_STAGE("base64", t0);
     if (!bytes)
@@ -344,6 +421,8 @@ bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budge
         pthread_mutex_unlock(m->lock);
     MEDIA_STAGE("vision", t0);
     free(canvas);
+    if (ok && keyed)
+        cache_soft_store(m, key, soft, n);
     if (ok && n + 2 <= avail(m))
         append_soft(m, soft, n, 255999, 258882);
     free(soft);
@@ -353,8 +432,13 @@ bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budge
  * position is only known at commit). */
 void ei_media_image_prepare(const ei_media_input *m, const char *base64, size_t len, int budget,
                             ei_media_frame *frame) {
-    (void)m;
     *frame = (ei_media_frame){.budget = budget, .ok = true};
+    if (m->cache && budget >= 70) {
+        frame->keyed = true;
+        media_key(frame->key, 'I', (uint32_t)budget, base64, len);
+        if (cache_soft_lookup(m, frame->key, &frame->soft, &frame->tokens))
+            return;
+    }
     size_t size = 0;
     uint8_t *bytes = decode(base64, len, &size);
     if (!bytes) {
@@ -456,6 +540,8 @@ void ei_media_frames_encode(ei_media_input *m, ei_media_frame *frames, size_t n)
                 frames[i + j].soft = ei_xmalloc(each * 512 * sizeof *soft);
                 memcpy(frames[i + j].soft, soft + j * each * 512, each * 512 * sizeof *soft);
                 frames[i + j].tokens = each;
+                if (frames[i + j].keyed)
+                    cache_soft_store(m, frames[i + j].key, frames[i + j].soft, each);
             }
         } else
             for (size_t j = 0; j < batch; j++) {
@@ -484,21 +570,20 @@ bool ei_media_image_commit(ei_media_input *m, ei_media_frame *frame, const char 
     float *soft = frame->soft;
     frame->canvas = NULL;
     frame->soft = NULL;
-    if (!ok || !canvas) {
+    if (!ok || (!canvas && !soft)) {
         free(canvas);
         free(soft);
         return ok;
     }
-    if ((size_t)frame->budget + 2 > avail(m) ||
-        (size_t)frame->width * frame->height / 2304 + 2 > avail(m)) {
+    size_t need = soft ? frame->tokens : (size_t)frame->width * frame->height / 2304;
+    if ((size_t)frame->budget + 2 > avail(m) || need + 2 > avail(m)) {
         free(canvas);
         free(soft);
         return ei_media_image(m, base64, len, frame->budget, err, err_len);
     }
     if (soft) {
         free(canvas);
-        if (frame->tokens + 2 <= avail(m))
-            append_soft(m, soft, frame->tokens, 255999, 258882);
+        append_soft(m, soft, frame->tokens, 255999, 258882);
         free(soft);
         return true;
     }
@@ -517,6 +602,8 @@ bool ei_media_image_commit(ei_media_input *m, ei_media_frame *frame, const char 
     if (m->lock)
         pthread_mutex_unlock(m->lock);
     free(canvas);
+    if (ok && frame->keyed)
+        cache_soft_store(m, frame->key, soft, n);
     if (ok && n + 2 <= avail(m))
         append_soft(m, soft, n, 255999, 258882);
     free(soft);
@@ -616,6 +703,26 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
         free(bytes);
         return true;
     }
+    /* The rows are fixed by the payload and the samples used after the trim. */
+    unsigned char key[24];
+    bool keyed = m->cache != NULL;
+    if (keyed) {
+        media_key(key, 'A', (uint32_t)samples, base64, len);
+        float *soft = NULL;
+        size_t n = 0;
+        if (cache_soft_lookup(m, key, &soft, &n)) {
+            free(bytes);
+            token(m, 256000);
+            size_t left = avail(m) > 1 ? avail(m) - 1 : 0;
+            rows(m, soft, n < left ? n : left);
+            free(soft);
+            token(m, 258883);
+            MEDIA_STAGE("cached", t0);
+            return true;
+        }
+    }
+    float *all = NULL;
+    size_t all_n = 0;
     float *pcm = ei_xmalloc(samples * sizeof(float));
     for (size_t i = 0; i < samples; ++i) {
         if (bits == 16)
@@ -698,10 +805,18 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
             /* Per-chunk rounding can overshoot the estimate; keep the end marker's slot. */
             size_t left = avail(m) > 1 ? avail(m) - 1 : 0;
             rows(m, soft, n < left ? n : left);
+            if (keyed) {
+                all = ei_xrealloc(all, (all_n + n) * 512 * sizeof(float));
+                memcpy(all + all_n * 512, soft, n * 512 * sizeof(float));
+                all_n += n;
+            }
         }
         free(soft);
     }
     free(pcm);
+    if (ok && keyed)
+        cache_soft_store(m, key, all, all_n);
+    free(all);
     if (ok)
         token(m, 258883);
     return ok;

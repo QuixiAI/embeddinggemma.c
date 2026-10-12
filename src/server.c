@@ -220,6 +220,7 @@ typedef struct {
     size_t max_batch_sequence_tokens;
     size_t pipeline_slots;
     size_t media_slots;
+    size_t media_cache_bytes;
     size_t short_bypass_tokens;
     size_t threads;              /* 0: EI_THREADS or the default */
     size_t cpu_workers;          /* 0: none beside a GPU, the engine itself on CPU */
@@ -919,6 +920,9 @@ static void handle_tags(int fd, const server_opts *opts, bool keep_alive) {
     free(b.data);
 }
 
+// Media cache (embeddinggemma-2 content objects): tower outputs by content
+// hash and whole-input embeddings, shared by every media slot. NULL when off.
+static ei_response_cache *media_cache;
 #include "http_media.h"
 
 static void handle_embed(int fd, ei_inference_service *service,
@@ -1429,6 +1433,8 @@ static void usage(const char *argv0) {
             "          [--response-cache-mb N] [--persistent-cache-path PATH]\n"
             "          [--pipeline-slots N]  (embeddinggemma-2 GPU waves in flight, 1..8)\n"
             "          [--media-slots N]  (embeddinggemma-2 GPU media contexts in flight, 1..8; default 2)\n"
+            "          [--media-cache-mb N]  (embeddinggemma-2 cache of image/audio tower outputs and\n"
+            "                                 content-object embeddings; 0 disables; default 256)\n"
             "          [--short-bypass-tokens N]  (short requests bypass long waves; implies 2 slots)\n"
             "          [--threads N]  (CPU inference threads; split across --cpu-workers)\n"
             "          [--cpu-workers N]  (independent CPU executors; beside a GPU they take overflow)\n"
@@ -1474,6 +1480,7 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
     opts->max_batch_sequence_tokens = 1024;
     opts->pipeline_slots = 1;
     opts->media_slots = 2;
+    opts->media_cache_bytes = 256u * 1024u * 1024u;
     opts->threads = 0;
     opts->cpu_workers = 0;
     opts->cpu_max_batch_tokens = 1024;
@@ -1528,6 +1535,10 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
                                 &opts->max_batch_requests)) return false;
         } else if (strcmp(argv[i], "--short-bypass-tokens") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 0, 8192, &opts->short_bypass_tokens)) return false;
+        } else if (strcmp(argv[i], "--media-cache-mb") == 0 && i + 1 < argc) {
+            size_t value = 0;
+            if (!parse_size_arg(argv[++i], 0, 65536, &value)) return false;
+            opts->media_cache_bytes = value * 1024u * 1024u;
         } else if (strcmp(argv[i], "--media-slots") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], 1, EI_MAX_MEDIA_SLOTS, &opts->media_slots)) return false;
         } else if (strcmp(argv[i], "--pipeline-slots") == 0 && i + 1 < argc) {
@@ -1930,6 +1941,8 @@ int main(int argc, char **argv) {
     if (!service) ei_die("invalid inference service configuration");
     ei_response_cache *response_cache = ei_response_cache_create(
         opts.response_cache_bytes, 4096);
+    if (second && opts.projector)
+        media_cache = ei_response_cache_create(opts.media_cache_bytes, 1024);
 
     socket_queue connection_queue;
     socket_queue_init(&connection_queue, opts.max_queue);

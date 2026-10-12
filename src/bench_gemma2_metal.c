@@ -1,7 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 // Compare and time an EmbeddingGemma 2 Metal route against the default path.
 // usage: [EI_BENCH_BASE=FLAGS] bench_gemma2_metal text.gguf "FLAG=1,FLAG=1" [TxB ...]
-// Each case packs B sequences of T tokens; flags name EI_GEMMA2_METAL_<FLAG>.
+// Each case packs B sequences of T tokens (T+TxB+... packs a mixed wave in that
+// order); flags name EI_GEMMA2_METAL_<FLAG>.
 #include "engine.h"
 #include "gemma2_metal.h"
 #include <math.h>
@@ -12,7 +13,7 @@
 
 static const char *route_flags[] = {"TENSOR", "FLASH",  "GEMV",   "FUSED",  "TENSOR2",
                                     "FLASH2", "NOEPI", "FLASH64", "VFUSED", "AFUSED",
-                                    "FLASH2_TILE"};
+                                    "LAYER",  "FLASH2_TILE", "LAYER_GROUPS"};
 
 static void set_route(const char *spec) {
     char name[64];
@@ -20,7 +21,7 @@ static void set_route(const char *spec) {
         snprintf(name, sizeof name, "EI_GEMMA2_METAL_%s", route_flags[i]);
         // Routes are explicit: everything not named is off ("0"), since the
         // batched stack defaults on.
-        if (strcmp(route_flags[i], "FLASH2_TILE"))
+        if (strcmp(route_flags[i], "FLASH2_TILE") && strcmp(route_flags[i], "LAYER_GROUPS"))
             setenv(name, "0", 1);
         else
             unsetenv(name);
@@ -40,6 +41,36 @@ static double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec * 1e-6;
+}
+// A case is T (one sequence), TxB (B sequences of T) or several joined by '+'
+// (a mixed wave in the given order, e.g. 2000+20x15). Returns the sequence count.
+static size_t parse_case(const char *spec, size_t *lens, size_t cap, size_t *total) {
+    size_t count = 0;
+    *total = 0;
+    char *copy = strdup(spec), *save = NULL;
+    for (char *item = strtok_r(copy, "+", &save); item; item = strtok_r(NULL, "+", &save)) {
+        size_t t = 0, b = 1;
+        if (sscanf(item, "%zux%zu", &t, &b) < 1 || !t || !b)
+            ei_die("bad case '%s' (T, TxB or T+TxB..., at most 8192 tokens)", spec);
+        for (size_t i = 0; i < b; i++) {
+            if (count == cap)
+                ei_die("case '%s' has too many sequences", spec);
+            lens[count++] = t;
+            *total += t;
+        }
+    }
+    free(copy);
+    if (!count || *total > 8192)
+        ei_die("bad case '%s' (T, TxB or T+TxB..., at most 8192 tokens)", spec);
+    return count;
+}
+static void fill_case(const size_t *lens, size_t count, int32_t *ids, size_t *offsets) {
+    offsets[0] = 0;
+    for (size_t s = 0; s < count; s++)
+        offsets[s + 1] = offsets[s] + lens[s];
+    for (size_t s = 0; s < count; s++)
+        for (size_t i = offsets[s]; i < offsets[s + 1]; i++)
+            ids[i] = (int32_t)(100 + (i * 137 + s * 7919) % 20000);
 }
 static int cmp(const void *a, const void *b) {
     double x = *(const double *)a, y = *(const double *)b;
@@ -91,15 +122,12 @@ static void streams(const char *model_route, ei_engine *e, size_t n_streams, con
     printf("route %s, %zu streams\n%-10s %14s %14s %8s\n", model_route, n_streams, "case",
            "1-stream tok/s", "N-stream tok/s", "scaling");
     for (size_t c = 0; c < n_cases; c++) {
-        size_t t = 0, b = 0;
-        if (sscanf(cases[c], "%zux%zu", &t, &b) != 2 || !t || !b || t * b > 8192)
-            ei_die("bad case '%s'", cases[c]);
-        int32_t *ids = ei_xmalloc(t * b * sizeof *ids);
+        size_t lens[8192], total = 0;
+        size_t b = parse_case(cases[c], lens, 8192, &total);
+        int32_t *ids = ei_xmalloc(total * sizeof *ids);
         size_t *offsets = ei_xmalloc((b + 1) * sizeof *offsets);
-        for (size_t i = 0; i < t * b; i++)
-            ids[i] = (int32_t)(100 + (i * 137 + i / t * 7919) % 20000);
-        for (size_t s = 0; s <= b; s++)
-            offsets[s] = s * t;
+        fill_case(lens, b, ids, offsets);
+        size_t t = total / b;
         int iterations = (int)(2000 / (t * b) + 20);
         stream_job one = {ctx[0], ids, offsets, b, iterations, 0};
         stream_main(&one); // warm
@@ -158,15 +186,11 @@ int main(int argc, char **argv) {
     printf("%-10s %12s %12s %8s %14s %12s\n", "case", "base ms", "route ms", "speedup",
            "min cosine", "route tok/s");
     for (size_t c = 0; c < n_cases; c++) {
-        size_t t = 0, b = 0;
-        if (sscanf(cases[c], "%zux%zu", &t, &b) != 2 || !t || !b || t * b > 8192)
-            ei_die("bad case '%s' (TxB, at most 8192 tokens)", cases[c]);
-        int32_t *ids = ei_xmalloc(t * b * sizeof *ids);
+        size_t lens[8192], total = 0;
+        size_t b = parse_case(cases[c], lens, 8192, &total);
+        int32_t *ids = ei_xmalloc(total * sizeof *ids);
         size_t *offsets = ei_xmalloc((b + 1) * sizeof *offsets);
-        for (size_t i = 0; i < t * b; i++)
-            ids[i] = (int32_t)(100 + (i * 137 + i / t * 7919) % 20000);
-        for (size_t s = 0; s <= b; s++)
-            offsets[s] = s * t;
+        fill_case(lens, b, ids, offsets);
         float *a = ei_xmalloc(b * 768 * sizeof *a), *r = ei_xmalloc(b * 768 * sizeof *r);
         double base = run(e.gemma2_metal, ids, offsets, b, a, iterations);
         double fast = run(candidate, ids, offsets, b, r, iterations);
@@ -186,7 +210,7 @@ int main(int argc, char **argv) {
                 worst = cosine;
         }
         printf("%-10s %12.3f %12.3f %7.2fx %14.9f %12.0f\n", cases[c], base, fast, base / fast,
-               worst, (double)(t * b) / fast * 1000.0);
+               worst, (double)total / fast * 1000.0);
         fflush(stdout);
         free(ids);
         free(offsets);

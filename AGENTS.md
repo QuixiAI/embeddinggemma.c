@@ -161,7 +161,7 @@ The target is the hardware ceiling under many concurrent requests (SlimServe
   check of the utilization counter afterwards.
 - **Device-atomic barriers across threadgroups work on the M5** when the
   group count is modest: 160 x 256-thread groups rendezvous at 1.8-3.9 us per
-  barrier (`scratchpad/grid_barrier.m`, safe caps). That is the route to the
+  barrier (`perf/grid_barrier_probe.m`, safe caps). That is the route to the
   short-wave floor (11 round trips/layer at ~10 us each); gate it behind a
   startup probe and a bounded spin that fails the wave rather than hangs.
 - **The flash kernel is not K/V-bandwidth-bound.** Doubling queries per K/V
@@ -172,6 +172,34 @@ The target is the hardware ceiling under many concurrent requests (SlimServe
   HTTP responses with `cmp`, and send unique bodies: the response cache
   serves repeats, and curl's `Expect: 100-continue` breaks this server's
   body read.
+
+## EmbeddingGemma 2 text lessons (2026-10-11)
+
+- **A device-atomic grid barrier costs what a dispatch boundary costs on the
+  M5** (2.2 us at 64 groups, 3.7-4.7 at 128-256, 2.4-3.0 at 384-512; the
+  device-scope fence adds ~1 us), so a persistent per-layer kernel that only
+  replaces dispatches with barriers does not move the short-wave floor:
+  built, bit-identical, 0.99-1.13x at 1-8 tokens and 0.5-0.8x at 20-39
+  (each group runs its token groups serially instead of on more cores). It
+  ships opt-in (`EI_GEMMA2_METAL_LAYER=1`). Further gains need stage fusion
+  that removes round trips (norm recomputed per group, attention normalizing
+  K/V on the fly), each worth one barrier of ~3 us; the one-token floor is
+  the ~11 dependent memory latencies, not the sync primitive.
+- **`atomic_thread_fence` needs `-std=metal3.2`**; the base library is 3.1,
+  so kernels that need it live in the Metal 4 library (`gemma2_layer.metal`
+  includes `gemma2.metal` for the shared bodies).
+- **A probe's host timing is not the barrier cost**: 264 barriers read 16 us
+  each through `finish()` and 3.7 us by GPU timestamps.
+- **Attention is bidirectional (sliding window `t - w .. t + w`)**, so prefix
+  K/V reuse across requests is impossible for this model; the exact token
+  cache in the inference service already covers repeated text.
+- **Waves pack ragged, so there is no padding to bucket away.** Ordering
+  inside a wave is worth 2-4% (longest first, seven ordered pairs in-process);
+  bucketing by length would buy nothing more.
+- **Media repeats were the uncached case.** The HTTP response cache only hits
+  identical bodies; the same image with different text re-ran decode, resize
+  and the tower. Caching tower outputs by payload hash (and content objects
+  by text) is 3.5x at c1 on image768 and byte-identical.
 
 ## EmbeddingGemma 2 scaling lessons (2026-10-10)
 

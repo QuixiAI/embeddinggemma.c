@@ -786,19 +786,23 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
         MEDIA_STAGE("logmel", t0);
         float *soft = NULL;
         size_t n = 0;
-        if (m->lock)
-            pthread_mutex_lock(m->lock);
+        if (m->audio)
+            ok = m->audio(m->audio_ctx, mel, frames, &soft, &n, err, err_len);
+        else {
+            if (m->lock)
+                pthread_mutex_lock(m->lock);
 #if defined(EI_ENABLE_METAL)
-        if (m->metal) ok = ei_gemma2_metal_audio(m->metal, m->projector, mel, frames, &soft, &n, err, err_len);
-        else
+            if (m->metal) ok = ei_gemma2_metal_audio(m->metal, m->projector, mel, frames, &soft, &n, err, err_len);
+            else
 #endif
 #if defined(EI_ENABLE_CUDA)
-        if (m->cuda) ok = ei_gemma2_cuda_audio(m->cuda, m->projector, mel, frames, &soft, &n, err, err_len);
-        else
+            if (m->cuda) ok = ei_gemma2_cuda_audio(m->cuda, m->projector, mel, frames, &soft, &n, err, err_len);
+            else
 #endif
-        ok = ei_gemma2_audio(m->projector, m->pool, mel, frames, &soft, &n, err, err_len);
-        if (m->lock)
-            pthread_mutex_unlock(m->lock);
+            ok = ei_gemma2_audio(m->projector, m->pool, mel, frames, &soft, &n, err, err_len);
+            if (m->lock)
+                pthread_mutex_unlock(m->lock);
+        }
         MEDIA_STAGE("audio", t0);
         free(mel);
         if (ok) {

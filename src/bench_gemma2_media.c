@@ -27,6 +27,7 @@ typedef struct {
     const char *name;
     int width, height, frames; // vision when width > 0 (frames > 1: one packed
                                // video wave), audio when width == 0 && frames > 0
+    int clips;                 // audio: clips of `frames` frames as one packed wave
 } item;
 typedef struct {
     void *ctx;
@@ -55,7 +56,16 @@ static void run_once(job *j) {
     } else if (j->it->width)
         ok = ei_gemma2_metal_vision(j->ctx, j->proj, j->rgb, j->it->width, j->it->height, &soft, &n,
                                     err, sizeof err);
-    else if (j->it->frames)
+    else if (j->it->frames && j->it->clips > 1) {
+        const float *mel[64];
+        int frames[64];
+        for (int i = 0; i < j->it->clips && i < 64; i++) {
+            mel[i] = j->mel;
+            frames[i] = j->it->frames;
+        }
+        ok = ei_gemma2_metal_audio_clips(j->ctx, j->proj, mel, frames, j->it->clips, &soft, &n,
+                                         err, sizeof err);
+    } else if (j->it->frames)
         ok = ei_gemma2_metal_audio(j->ctx, j->proj, j->mel, j->it->frames, &soft, &n, err,
                                    sizeof err);
     else {
@@ -95,9 +105,9 @@ int main(int argc, char **argv) {
     if (streams < 1 || streams > 16)
         ei_die("EI_BENCH_STREAMS must be 1..16");
     static const item items[] = {
-        {"v432", 432, 432, 0},   {"v768", 768, 768, 0}, {"v912x672", 912, 672, 0},
-        {"video4", 432, 432, 4}, {"a10", 0, 0, 1000},   {"a30", 0, 0, 3000},
-        {"mixed", 0, 0, 0},
+        {"v432", 432, 432, 0, 0}, {"v768", 768, 768, 0, 0}, {"v912x672", 912, 672, 0, 0},
+        {"video4", 432, 432, 4, 0}, {"a10", 0, 0, 1000, 0}, {"a30", 0, 0, 3000, 0},
+        {"mixed", 0, 0, 0, 0},
     };
     size_t count = sizeof items / sizeof *items;
     char err[512];
@@ -120,8 +130,9 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < mixed_n * 512; i++)
         inputs[i] = sinf((float)i * .0013f) * 2;
     printf("streams %d (median of 5 after 2 warmups; aggregate rate across streams)\n", streams);
-    // Extra vision sizes on the command line: vWIDTHxHEIGHT (48-pixel
-    // multiples), or vWIDTHxHEIGHTxFRAMES for a packed video wave.
+    // Extra sizes on the command line: vWIDTHxHEIGHT (48-pixel multiples),
+    // vWIDTHxHEIGHTxFRAMES for a packed video wave, aFRAMESxCLIPS for a packed
+    // audio wave of CLIPS clips of FRAMES mel frames (10 ms each).
     item extra[32];
     size_t extras = 0;
     for (int a = 3; a < argc && extras < 32; a++) {
@@ -131,10 +142,13 @@ int main(int argc, char **argv) {
             known |= !strcmp(argv[a], items[i].name);
         if (known)
             continue;
-        int got = sscanf(argv[a], "v%dx%dx%d", &w, &h, &f);
+        int got = sscanf(argv[a], "v%dx%dx%d", &w, &h, &f), clips = 0;
         if (got >= 2 && w > 0 && h > 0 && f <= 64 &&
             (size_t)w * h * (f > 1 ? f : 1) * 3 <= pixels)
-            extra[extras++] = (item){argv[a], w, h, got == 3 ? f : 0};
+            extra[extras++] = (item){argv[a], w, h, got == 3 ? f : 0, 0};
+        else if (sscanf(argv[a], "a%dx%d", &f, &clips) == 2 && f >= 1 && f <= 3000 && clips >= 1 &&
+                 clips <= 64)
+            extra[extras++] = (item){argv[a], 0, 0, f, clips};
     }
     // EI_BENCH_REPEAT=N runs the item list N times round-robin so configurations
     // interleave on this shared host instead of drifting apart.

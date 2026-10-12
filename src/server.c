@@ -153,6 +153,96 @@ static bool media_finish_submit(void *ctx, const float *inputs, size_t n, float 
     if (!f.ok) snprintf(err, err_len, "%s", f.err);
     return f.ok;
 }
+// Audio towers: concurrent requests' clips queue here and one thread encodes
+// every queued clip as one packed wave on its own context (the tower is 1.35x
+// at two clips and 1.48x from four up). EI_MEDIA_AUDIO_BATCH=0 disables.
+typedef struct media_audio_job {
+    const float *mel;
+    int frames;
+    float *out; /* malloc'd rows on success */
+    size_t n;
+    bool done, ok;
+    char err[256];
+    struct media_audio_job *next;
+} media_audio_job;
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t ready, done;
+    media_audio_job *head, *tail;
+    void *ctx;
+    const ei_gguf *projector;
+    bool enabled;
+} media_audio_batcher = {.mu = PTHREAD_MUTEX_INITIALIZER,
+                         .ready = PTHREAD_COND_INITIALIZER,
+                         .done = PTHREAD_COND_INITIALIZER};
+static void *media_audio_batcher_run(void *arg) {
+    (void)arg;
+    media_audio_job *items[64];
+    const float *mels[64];
+    int frames[64];
+    for (;;) {
+        pthread_mutex_lock(&media_audio_batcher.mu);
+        while (!media_audio_batcher.head)
+            pthread_cond_wait(&media_audio_batcher.ready, &media_audio_batcher.mu);
+        size_t batch = 0, total = 0;
+        for (media_audio_job *j = media_audio_batcher.head;
+             j && batch < 64 && total + (size_t)j->frames <= EI_GEMMA2_AUDIO_WAVE_FRAMES;
+             j = j->next) {
+            batch++;
+            total += (size_t)j->frames;
+        }
+        if (!batch) batch = 1; /* an over-long clip runs alone and reports the limit */
+        for (size_t i = 0; i < batch; i++) {
+            items[i] = media_audio_batcher.head;
+            mels[i] = items[i]->mel;
+            frames[i] = items[i]->frames;
+            media_audio_batcher.head = media_audio_batcher.head->next;
+        }
+        if (!media_audio_batcher.head) media_audio_batcher.tail = NULL;
+        pthread_mutex_unlock(&media_audio_batcher.mu);
+        float *rows = NULL;
+        size_t n = 0;
+        char err[256] = "";
+        bool ok = ei_gemma2_metal_audio_clips(media_audio_batcher.ctx, media_audio_batcher.projector,
+                                              mels, frames, (int)batch, &rows, &n, err, sizeof err);
+        pthread_mutex_lock(&media_audio_batcher.mu);
+        for (size_t i = 0, at = 0; i < batch; i++) {
+            size_t each = (size_t)(frames[i] + 3) / 4;
+            if (ok) {
+                items[i]->out = ei_xmalloc(each * 512 * sizeof *rows);
+                memcpy(items[i]->out, rows + at * 512, each * 512 * sizeof *rows);
+                items[i]->n = each;
+                at += each;
+            } else
+                snprintf(items[i]->err, sizeof items[i]->err, "%s", err);
+            items[i]->ok = ok;
+            items[i]->done = true;
+        }
+        pthread_cond_broadcast(&media_audio_batcher.done);
+        pthread_mutex_unlock(&media_audio_batcher.mu);
+        free(rows);
+    }
+    return NULL;
+}
+static bool media_audio_submit(void *ctx, const float *mel, int frames, float **out, size_t *n,
+                               char *err, size_t err_len) {
+    (void)ctx;
+    media_audio_job j = {.mel = mel, .frames = frames};
+    pthread_mutex_lock(&media_audio_batcher.mu);
+    if (media_audio_batcher.tail) media_audio_batcher.tail->next = &j;
+    else media_audio_batcher.head = &j;
+    media_audio_batcher.tail = &j;
+    pthread_cond_signal(&media_audio_batcher.ready);
+    while (!j.done) pthread_cond_wait(&media_audio_batcher.done, &media_audio_batcher.mu);
+    pthread_mutex_unlock(&media_audio_batcher.mu);
+    if (!j.ok) {
+        snprintf(err, err_len, "%s", j.err);
+        return false;
+    }
+    *out = j.out;
+    *n = j.n;
+    return true;
+}
 #endif
 #define EMBEDDINGGEMMA_DEFAULT_PORT 42666
 #define MAX_BODY_BYTES (16u * 1024u * 1024u)
@@ -378,8 +468,18 @@ static bool parse_json_string(const char **p, sv_string *out, char *err, size_t 
     while (**p && **p != '"') {
         unsigned char c = (unsigned char)**p;
         if (c != '\\') {
-            append_byte(&buf, &n, &cap, c);
-            (*p)++;
+            /* A run of plain bytes (a base64 payload is one run of up to
+             * megabytes) copies at memcpy speed instead of a byte at a time. */
+            size_t run = strcspn(*p, "\"\\");
+            if (n + run + 1u > cap) {
+                cap = cap ? cap : 64u;
+                while (n + run + 1u > cap) cap *= 2u;
+                buf = ei_xrealloc(buf, cap);
+            }
+            memcpy(buf + n, *p, run);
+            n += run;
+            buf[n] = '\0';
+            *p += run;
             continue;
         }
 
@@ -1888,6 +1988,17 @@ int main(int argc, char **argv) {
                 ei_die("cannot start the media finish thread");
             pthread_detach(thread);
             media_finisher.enabled = true;
+        }
+        const char *audio_batch = getenv("EI_MEDIA_AUDIO_BATCH");
+        if (engine.gemma2_metal && media_slot_count && !(audio_batch && !strcmp(audio_batch, "0"))) {
+            media_audio_batcher.ctx = ei_gemma2_metal_clone(engine.gemma2_metal, err, sizeof err);
+            if (!media_audio_batcher.ctx) ei_die("media audio context: %s", err);
+            media_audio_batcher.projector = opts.projector;
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, media_audio_batcher_run, NULL))
+                ei_die("cannot start the media audio thread");
+            pthread_detach(thread);
+            media_audio_batcher.enabled = true;
         }
 #endif
     }

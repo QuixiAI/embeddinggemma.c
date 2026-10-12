@@ -68,6 +68,9 @@ static void pipeline(EIGemma2Metal *c, NSString *name) {
 static void bind(EIGemma2Metal *c, id<MTLBuffer> b, int i) {
     [c->enc setBuffer:b offset:0 atIndex:i];
 }
+static void bind_at(EIGemma2Metal *c, id<MTLBuffer> b, size_t floats, int i) {
+    [c->enc setBuffer:b offset:floats * 4 atIndex:i];
+}
 static void params(EIGemma2Metal *c, G2P p, int i) {
     [c->enc setBytes:&p length:sizeof p atIndex:i];
 }
@@ -238,7 +241,7 @@ static void attention_c(EIGemma2Metal *c, id<MTLBuffer> q, id<MTLBuffer> k, id<M
             flash = [NSString stringWithFormat:@"g2t_flash_%d", d];
         // Tile geometry follows the kernel name: _q16 = 16 queries, _n8 = 8 simdgroups.
         int tq = [flash containsString:@"_q16"] ? 16 : [flash containsString:@"_q64"] ? 64 : 32;
-        int nsg = [flash hasSuffix:@"n16"] ? 16 : [flash hasSuffix:@"n8"] ? 8 : 4;
+        int nsg = [flash containsString:@"n16"] ? 16 : [flash containsString:@"n8"] ? 8 : 4;
         pipeline(c, flash);
         bind(c, q, 0);
         bind(c, kh, 1);
@@ -625,7 +628,7 @@ void *ei_gemma2_metal_create(const ei_gguf *g, char *err, size_t len) {
                 id<MTLComputePipelineState> p =
                     f ? [c->device newComputePipelineStateWithFunction:f error:&error] : nil;
                 if (!p && ([name hasSuffix:@"_k64"] || [name containsString:@"_q16"] ||
-                           [name containsString:@"_q64"] || [name hasSuffix:@"_n8"] ||
+                           [name containsString:@"_q64"] || [name containsString:@"_n8"] ||
                            [name hasSuffix:@"_n16"] || [name hasPrefix:@"g2_layer"])) {
                     // Optional flash tile experiments: report and fall back.
                     if (getenv("EI_GEMMA2_METAL_PROFILE"))
@@ -1285,24 +1288,61 @@ bool ei_gemma2_metal_vision_frames(void *ctx, const ei_gguf *g, const uint8_t *c
 }
 bool ei_gemma2_metal_audio(void *ctx, const ei_gguf *g, const float *mel, int frames, float **out,
                            size_t *tokens, char *err, size_t len) {
+    return ei_gemma2_metal_audio_clips(ctx, g, &mel, &frames, 1, out, tokens, err, len);
+}
+// Clips run as one packed wave: the subsampling convs run per clip (their
+// outputs land clip after clip, (frames + 3) / 4 rows of 1024 each), then the
+// conformer layers see the sum of the rows with per-token clip bounds for the
+// depthwise conv and attention. One clip encodes exactly as before.
+bool ei_gemma2_metal_audio_clips(void *ctx, const ei_gguf *g, const float *const *mel,
+                                 const int *frames, int clips, float **out, size_t *tokens,
+                                 char *err, size_t len) {
     @autoreleasepool {
-        if (frames < 1 || frames > 3000) {
-            snprintf(err, len, "audio chunk must contain 1..3000 mel frames");
+        if (clips < 1 || clips > 64) {
+            snprintf(err, len, "audio wave must contain 1..64 clips");
+            return false;
+        }
+        size_t total_frames = 0;
+        int n = 0;
+        for (int i = 0; i < clips; i++) {
+            if (frames[i] < 1 || frames[i] > 3000) {
+                snprintf(err, len, "audio chunk must contain 1..3000 mel frames");
+                return false;
+            }
+            total_frames += (size_t)frames[i];
+            n += (frames[i] + 3) / 4;
+        }
+        if (total_frames > EI_GEMMA2_AUDIO_WAVE_FRAMES) {
+            snprintf(err, len, "audio wave exceeds %d mel frames", EI_GEMMA2_AUDIO_WAVE_FRAMES);
             return false;
         }
         EIGemma2Metal *c = (__bridge EIGemma2Metal *)ctx;
         if (!projector(c, g, err, len))
             return false;
-        int n = (frames + 3) / 4;
-        size_t count = (size_t)n * 1024;
+        size_t count = (size_t)n * 1024, conv0_floats = 0;
+        for (int i = 0; i < clips; i++)
+            conv0_floats += (size_t)((frames[i] + 1) / 2) * 64 * 128;
         id<MTLBuffer> x = buffer(c, @"ax", count), h = buffer(c, @"ah", count),
                       q = buffer(c, @"aq", count), k = buffer(c, @"ak", count),
                       v = buffer(c, @"av", count), a = buffer(c, @"aa", count),
                       up = buffer(c, @"aup", count * 4),
-                      cur = buffer(c, @"mel", (size_t)frames * 128),
+                      melbuf = buffer(c, @"mel", total_frames * 128),
+                      conv0 = buffer(c, @"conv0", conv0_floats), conv1 = buffer(c, @"conv1", count),
                       pos = buffer(c, @"pos", 13 * 1024), rpe = buffer(c, @"rpe", 13 * 1024),
-                      result = buffer(c, @"aresult", (size_t)n * 512);
-        memcpy(cur.contents, mel, (size_t)frames * 128 * 4);
+                      result = buffer(c, @"aresult", (size_t)n * 512), bounds = nil;
+        for (int i = 0, at = 0; i < clips; at += frames[i++])
+            memcpy((float *)melbuf.contents + (size_t)at * 128, mel[i], (size_t)frames[i] * 128 * 4);
+        if (clips > 1) {
+            bounds = buffer(c, @"abounds", (size_t)n * 2);
+            uint32_t *b = bounds.contents;
+            for (int i = 0, t = 0; i < clips; i++) {
+                int rows = (frames[i] + 3) / 4;
+                for (int r = 0; r < rows; r++, t++) {
+                    b[2 * t] = (uint32_t)(t - r);
+                    b[2 * t + 1] = (uint32_t)(t - r + rows);
+                }
+            }
+        }
         float *pv = pos.contents;
         for (int p = 0; p < 13; p++)
             for (int z = 0; z < 512; z++) {
@@ -1311,26 +1351,40 @@ bool ei_gemma2_metal_audio(void *ctx, const ei_gguf *g, const float *mel, int fr
                 pv[p * 1024 + z + 512] = cosf(theta);
             }
         begin(c);
-        int nt = frames, nf = 128, nc = 1;
-        for (int l = 0; l < 2; l++) {
-            char name[96];
-            int ot = (nt + 1) / 2, of = (nf + 1) / 2, oc = l ? 32 : 128;
-            id<MTLBuffer> next = buffer(c, l ? @"conv1" : @"conv0", (size_t)ot * of * oc);
-            pipeline(c, @"g2_conv");
-            bind(c, cur, 0);
-            snprintf(name, sizeof name, "a.conv1d.%d.weight", l);
-            weight(c, g, name, 1);
-            bind(c, next, 2);
-            params(c, (G2P){.n = nt, .k = nf, .d = nc, .m = oc}, 3);
-            threads(c, (size_t)ot * of * oc);
-            snprintf(name, sizeof name, "a.conv1d.%d.norm.weight", l);
-            norm(c, g, name, next, ot * of, oc, next, 2);
-            cur = next;
-            nt = ot;
-            nf = of;
-            nc = oc;
+        for (int i = 0, mel_at = 0, c0_at = 0, row_at = 0; i < clips; i++) {
+            int nt = frames[i], nf = 128, nc = 1;
+            id<MTLBuffer> cur = melbuf;
+            size_t cur_at = (size_t)mel_at * 128;
+            for (int l = 0; l < 2; l++) {
+                char name[96];
+                int ot = (nt + 1) / 2, of = (nf + 1) / 2, oc = l ? 32 : 128;
+                id<MTLBuffer> next = l ? conv1 : conv0;
+                size_t next_at = l ? (size_t)row_at * 1024 : (size_t)c0_at;
+                pipeline(c, @"g2_conv");
+                bind_at(c, cur, cur_at, 0);
+                snprintf(name, sizeof name, "a.conv1d.%d.weight", l);
+                weight(c, g, name, 1);
+                bind_at(c, next, next_at, 2);
+                params(c, (G2P){.n = nt, .k = nf, .d = nc, .m = oc}, 3);
+                threads(c, (size_t)ot * of * oc);
+                snprintf(name, sizeof name, "a.conv1d.%d.norm.weight", l);
+                pipeline(c, @"g2_norm");
+                bind_at(c, next, next_at, 0);
+                bind_at(c, next, next_at, 2);
+                params(c, (G2P){.n = ot * of, .d = oc, .mode = 2, .type = weight(c, g, name, 1)->type},
+                       3);
+                groups(c, (size_t)ot * of, 1);
+                cur = next;
+                cur_at = next_at;
+                nt = ot;
+                nf = of;
+                nc = oc;
+            }
+            mel_at += frames[i];
+            c0_at += ((frames[i] + 1) / 2) * 64 * 128;
+            row_at += (frames[i] + 3) / 4;
         }
-        mm(c, g, "a.input_projection.weight", cur, n, x);
+        mm(c, g, "a.input_projection.weight", conv1, n, x);
         for (int l = 0; l < 12 && c->afused; l++) {
             // Clamps fold into producers (norm/SiLU/attention/post_add) and
             // GEMM epilogues; the three Gemma sandwiches become post_add_1024.
@@ -1362,7 +1416,7 @@ bool ei_gemma2_metal_audio(void *ctx, const ei_gguf *g, const float *mel, int fr
             threads(c, count);
             mm(c, g, A("attn_k_rel"), pos, 13, rpe);
             input_clamp(g, A("attn_out"), &lo, &hi);
-            attention_c(c, q, k, v, a, n, 8, 8, 128, 0, rpe, nil, lo, hi);
+            attention_c(c, q, k, v, a, n, 8, 8, 128, 0, rpe, bounds, lo, hi);
             AMF("attn_out", a, h);
             input_clamp(g, A("conv_pw1"), &lo, &hi);
             post_add_a(c, g, A("attn_post_norm"), AN("conv_norm"), h, x, h, n, 1, 1024, true, lo,
@@ -1373,7 +1427,8 @@ bool ei_gemma2_metal_audio(void *ctx, const ei_gguf *g, const float *mel, int fr
             bind(c, h, 0);
             weight(c, g, A("conv_dw"), 1);
             bind(c, a, 2);
-            params(c, (G2P){.n = n}, 3);
+            params(c, (G2P){.n = n, .layer = bounds ? 1 : 0}, 3);
+            bind(c, bounds ? bounds : h, 4);
             threads(c, count);
             input_clamp(g, A("conv_pw2"), &lo, &hi);
             norm_c(c, g, A("norm_conv"), a, n, 1024, a, 1, true, lo, hi);
@@ -1412,7 +1467,7 @@ bool ei_gemma2_metal_audio(void *ctx, const ei_gguf *g, const float *mel, int fr
             params(c, (G2P){.n = n}, 3);
             threads(c, count);
             mm(c, g, A("attn_k_rel"), pos, 13, rpe);
-            attention(c, q, k, v, a, n, 8, 8, 128, 0, rpe, nil);
+            attention(c, q, k, v, a, n, 8, 8, 128, 0, rpe, bounds);
             AM("attn_out", a, h);
             norm(c, g, A("attn_post_norm"), h, n, 1024, h, 1);
             element(c, x, h, x, count, 0, 1, 0);
@@ -1423,7 +1478,8 @@ bool ei_gemma2_metal_audio(void *ctx, const ei_gguf *g, const float *mel, int fr
             bind(c, h, 0);
             weight(c, g, A("conv_dw"), 1);
             bind(c, a, 2);
-            params(c, (G2P){.n = n}, 3);
+            params(c, (G2P){.n = n, .layer = bounds ? 1 : 0}, 3);
+            bind(c, bounds ? bounds : h, 4);
             threads(c, count);
             norm(c, g, A("norm_conv"), a, n, 1024, a, 1);
             element(c, a, a, a, count, 3, 1, 0);

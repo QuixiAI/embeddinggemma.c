@@ -210,6 +210,7 @@ static bool embed_structured(const server_opts *opts, const sv_string *input, fl
         m.lock = &slot->lock;
 #if defined(EI_ENABLE_METAL)
         if (media_finisher.enabled) m.finish = media_finish_submit;
+        if (media_audio_batcher.enabled) m.audio = media_audio_submit;
 #endif
     } else {
         m.metal = opts->engine->gemma2_media ? opts->engine->gemma2_media : opts->engine->gemma2_metal;

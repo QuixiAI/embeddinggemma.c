@@ -1,5 +1,6 @@
 #include "response_cache.h"
 
+#include <string.h>
 #include <pthread.h>
 
 typedef struct response_cache_entry response_cache_entry;
@@ -25,13 +26,28 @@ struct ei_response_cache {
     pthread_mutex_t mutex;
 };
 
+/* In-memory only (never persisted), so the function is free to change. Eight
+ * bytes per step: keys can be whole media request bodies of a megabyte or more,
+ * and the byte-at-a-time FNV loop cost ~1 ms per megabyte on every lookup. */
+static uint64_t mix_bits(uint64_t x) {
+    x ^= x >> 32;
+    x *= 0xD6E8FEB86659FD93ull;
+    x ^= x >> 32;
+    x *= 0xD6E8FEB86659FD93ull;
+    x ^= x >> 32;
+    return x;
+}
 static uint64_t hash_bytes(const char *data, size_t len) {
-    uint64_t hash = 1469598103934665603ull;
-    for (size_t i = 0; i < len; i++) {
-        hash ^= (unsigned char)data[i];
-        hash *= 1099511628211ull;
+    uint64_t hash = 1469598103934665603ull ^ (uint64_t)len;
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t word;
+        memcpy(&word, data + i, 8);
+        hash = mix_bits(hash ^ word) + 0x9E3779B97F4A7C15ull;
     }
-    return hash;
+    uint64_t tail = 0;
+    if (i < len) memcpy(&tail, data + i, len - i);
+    return mix_bits(hash ^ tail ^ ((uint64_t)(len - i) << 56));
 }
 
 static size_t next_power_of_two(size_t value) {

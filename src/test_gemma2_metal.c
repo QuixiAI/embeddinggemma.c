@@ -114,6 +114,41 @@ int main(int argc, char **argv) {
         free(b);
         free(mel);
     }
+    // Packed audio clips (one wave) against the same clips encoded alone: the
+    // clip bounds keep the depthwise conv and attention inside each clip.
+    {
+        const int clip_frames[] = {96, 129, 600, 1000};
+        const int clips = 4;
+        float *mels[4];
+        for (int i = 0; i < clips; i++) {
+            mels[i] = ei_xmalloc((size_t)clip_frames[i] * 128 * 4);
+            for (int j = 0; j < clip_frames[i] * 128; j++)
+                mels[i][j] = sinf(j * .013f + i);
+        }
+        float *packed_rows = NULL;
+        size_t packed_n = 0;
+        if (!ei_gemma2_metal_audio_clips(fast, &g, (const float *const *)mels, clip_frames, clips,
+                                         &packed_rows, &packed_n, err, sizeof err))
+            ei_die("%s", err);
+        size_t at = 0;
+        for (int i = 0; i < clips; i++) {
+            float *single = NULL;
+            size_t n = 0;
+            if (!ei_gemma2_metal_audio(fast, &g, mels[i], clip_frames[i], &single, &n, err,
+                                       sizeof err))
+                ei_die("%s", err);
+            if (n != (size_t)(clip_frames[i] + 3) / 4 || at + n > packed_n)
+                ei_die("packed audio token count mismatch");
+            compare("audio packed clip", (size_t)clip_frames[i], single, packed_rows + at * 512,
+                    n * 512, .9999);
+            at += n;
+            free(single);
+            free(mels[i]);
+        }
+        if (at != packed_n)
+            ei_die("packed audio token count mismatch");
+        free(packed_rows);
+    }
     // Persistent layer kernel (EI_GEMMA2_METAL_LAYER=1): bit-identical to the
     // GEMV route with scalar attention (FLASH2 off below 40 tokens) on short
     // waves, single and packed, or it is disabled here (probe failed).

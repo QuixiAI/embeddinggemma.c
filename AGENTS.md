@@ -201,6 +201,42 @@ The target is the hardware ceiling under many concurrent requests (SlimServe
   and the tower. Caching tower outputs by payload hash (and content objects
   by text) is 3.5x at c1 on image768 and byte-identical.
 
+## EmbeddingGemma 2 media lessons (2026-10-12)
+
+- **Measure packing with the bench before building a collector.** Eight
+  432x432 images packed into one vision wave run 62 ms against 69 ms for
+  eight single calls (768x768: 3.5%), so cross-request image packing is not
+  worth a thread. Audio was the opposite: a 30 s clip costs 19 ms where three
+  10 s clips cost 28, and two streams reach only 1.3x of one, so the packed
+  audio tower is 1.35x at two clips and 1.48x from four (`aFxC` bench items).
+- **Packing a tower needs every cross-token kernel to take bounds.** The
+  audio conformer had two: the causal depthwise conv (taps now stop at the
+  clip's first token) and the relative-position attention, whose `p.mode`
+  key range was computed after the bounds clamp and silently overrode it.
+  The subsampling convs run per clip with offset binds; their outputs are
+  already contiguous rows, so the packed layout costs no copy.
+- **HTTP throughput caps at the sum of the GPU passes, not the tower.** At c8
+  a packed audio request costs ~6 ms of tower plus ~4 ms of its share of the
+  2k-row finish wave, so the 1.48x tower is 1.1-1.4x of requests per second
+  (93 req/s at the ceiling). Read the `EI_MEDIA_TIMING=1` stage means under
+  load before attributing a gain to a kernel.
+- **Megabyte JSON strings were parsed a byte at a time, twice.** The input
+  scanner and the content-part parser both ran `parse_json_string` over the
+  base64 payload (append_byte per character), and the response cache hashed
+  the whole body with byte-wise FNV: 4-6 ms per request on a 1 MB image or
+  video hit, 10-15% of the hit latency. A `strcspn` run copy and an 8-byte
+  hash removed it; the cache hash is in-memory only, so changing it is free.
+- **The image front end is not the miss cost.** PNG decode is 1.7 ms at
+  432x432 and 4.8 ms at 768x768, resize 0.1-0.2 ms, against 12 and 40 ms of
+  tower; hardware decode would buy under 10%.
+- **The flash softmax phase is not the long-context bottleneck.** `fast::exp`
+  in the online softmax was 1.00x (cosine 0.9999999) and skipping the
+  running-output rescale on blocks where no row maximum moved was 0.94-1.01x,
+  so the 20-of-37 TFLOPS gap is in the matmul and threadgroup round trips, not
+  the exponentials. Tile names are parsed for geometry (`containsString`,
+  not suffix): a variant name ending in a letter dispatched half the
+  simdgroups and produced NaNs before that was fixed.
+
 ## EmbeddingGemma 2 scaling lessons (2026-10-10)
 
 - **One CPU wave peaks at ~64 threads and collapses past it** (256-thread pool

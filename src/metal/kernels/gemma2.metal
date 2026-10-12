@@ -346,13 +346,14 @@ inline void g2_attention_body(device const float *q, device const float *k, devi
     }
     uint lo = p.window && t > p.window ? t - p.window : 0,
          hi = p.window ? min(p.n, t + p.window + 1) : p.n;
-    if (p.layer) {
-        lo = max(lo, bounds[t].x);
-        hi = min(hi, bounds[t].y);
-    }
     if (p.mode) {
         lo = t > 11 ? t - 11 : 0;
         hi = t + 1;
+    }
+    // Packed sequences (video frames, audio clips): keys stay inside the token's own.
+    if (p.layer) {
+        lo = max(lo, bounds[t].x);
+        hi = min(hi, bounds[t].y);
     }
     float mx = -INFINITY, total = 0;
     for (uint s = lo; s < hi; s++) {
@@ -462,15 +463,19 @@ kernel void g2_audio_scale(device float *q [[buffer(0)]], device float *k [[buff
         k[i] *= log(1 + exp(1.0f)) / log(2.0f);
     }
 }
+// Causal depthwise conv over time (kernel 5). With p.layer, taps stay inside the
+// token's own clip (bounds[t].x is the clip's first token) so packed clips never
+// read each other.
 kernel void g2_depthwise(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]],
                          device float *y [[buffer(2)]], constant G2P &p [[buffer(3)]],
+                         device const uint2 *bounds [[buffer(4)]],
                          uint i [[thread_position_in_grid]]) {
     if (i >= p.n * 1024)
         return;
-    uint t = i / 1024, z = i % 1024;
+    uint t = i / 1024, z = i % 1024, first = p.layer ? bounds[t].x : 0;
     float sum = 0;
     for (uint j = 0; j < 5; j++)
-        if (t + j >= 4)
+        if (t + j >= 4 + first)
             sum += x[(t + j - 4) * 1024 + z] * w[z * 5 + j];
     y[i] = sum;
 }

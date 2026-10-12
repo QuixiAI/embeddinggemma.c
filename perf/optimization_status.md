@@ -3828,3 +3828,102 @@ alternating repeats are the evidence.
 - Prefix K/V reuse across requests: attention is bidirectional (`t - w .. t +
   w`), so no prefix of a sequence has a reusable K/V.
 - Length bucketing in the collector: nothing to save beyond the ordering above.
+
+## 2026-10-12: EmbeddingGemma 2 Metal, sixth pass (packed audio towers, hit-path JSON, flash softmax)
+
+Recommendation from the 10-12 brainstorm: cross-request tower packing (images,
+audio), a profile of the media hit and miss paths, and the flash kernel's
+long-context headroom. Same host and discipline (in-process pairs,
+`EI_BENCH_REPEAT`, interleaved HTTP rounds).
+
+### Cross-request packing: audio yes, images no
+
+Vision packing was sized with the existing bench before building anything
+(`bench_gemma2_media`, median of 5, three rounds):
+
+| case | single call | packed wave | per image |
+|---|---:|---:|---:|
+| 432x432 x8 | 8.58 ms | 62.1 ms | 7.8 ms (0.91x) |
+| 768x768 x4 | 33.4 ms | 129.0 ms | 32.3 ms (0.97x) |
+
+The tower is near its compute ceiling at 729 patches, so no image collector.
+Audio had room: a 30 s clip (750 tokens) took 19.2 ms where three 10 s clips
+took 27.7, and two streams reached 140 against 108 items/s for one.
+`ei_gemma2_metal_audio_clips` packs clips into one wave (convs per clip with
+offset binds, conformer over the packed rows with clip bounds in the depthwise
+conv and the relative-position attention). Routes test: packed clips against
+single encodes, cosine 0.999999 or exact at 96, 129, 600 and 1000 frames.
+
+| wave | ms/call | per 10 s clip | vs single |
+|---|---:|---:|---:|
+| a10 (1000 frames) | 9.37 | 9.37 | 1.00x |
+| a1000x2 | 13.84 | 6.92 | 1.35x |
+| a1000x4 | 25.36 | 6.34 | 1.48x |
+| a1000x8 | 50.76 | 6.35 | 1.48x |
+| a500x8 | 25.77 | (5 s clips) | 1.44x |
+
+Server: one audio thread with its own context packs every queued clip
+(`EI_MEDIA_AUDIO_BATCH=0` reverts). HTTP audio10s, media cache off, 4 s cells,
+two interleaved rounds (req/s, on / off):
+
+| c1 | c2 | c4 | c8 | c16 |
+|---:|---:|---:|---:|---:|
+| 40.0 / 43.0, 43.5 / 44.0 | 59.8 / 60.8, 60.8 / 61.5 | 70.8 / 68.0, 71.2 / 68.2 | 77.0 / 71.5, 78.5 / 71.2 | 79.8 / 74.5, 80.0 / 72.5 |
+
+A third run with stage timing read 93 against 67 req/s at c8. The gain is
+bounded by the finish wave: with timing on, a c8 request spends ~48 ms in the
+audio queue plus tower (6.3 ms of GPU per clip packed) and ~35 ms in the
+finish queue (8 x 255 rows = 2,040-row waves, ~4.4 ms of GPU per request),
+which puts the ceiling at ~93 req/s where the run landed.
+
+### Media hit and miss profile (`EI_MEDIA_TIMING=1`, c1, stage means)
+
+| request | base64 | decode | resize | tower | finish | loadgen p50 |
+|---|---:|---:|---:|---:|---:|---:|
+| image432 miss | 0.13 | 1.66 | 0.11 | 11.9 | 6.6 | 21.2 |
+| image768 miss | 0.40 | 4.81 | 0.20 | ~40 (one noisy run read 125) | 10.2 | 64 (noisy) |
+| image432 hit | cached 0.27 | | | | 5.9 | 7.5 |
+| image768 hit | cached 0.97 | | | | 8.3 | 13.3 |
+| video4 hit | | | | | 8.8 | 14.9 |
+
+The front end is under 10% of a miss, so hardware image decode was dropped.
+On hits, 4-6 ms per request were outside every stage and scaled with body
+size: `parse_input_item` and `media_part` each ran `parse_json_string` over
+the megabyte base64 string a byte at a time, and the response cache hashed the
+whole body with byte-wise FNV on every lookup. Fixes: plain-byte runs copy
+with `strcspn` + `memcpy`; the (in-memory only) cache hash mixes 8 bytes per
+step. Hit p50 over HTTP, new / old build, two interleaved rounds:
+
+| request | round 1 | round 2 |
+|---|---:|---:|
+| image768 c1 | 10.59 / 11.77 ms | 10.69 / 12.05 |
+| image432 c1 | 5.95 / 7.02 | 6.01 / 7.11 |
+| video4 c1 | 11.23 / 12.77 | 11.26 / 13.04 |
+| audio10s c1 | 9.24 / 9.82 | 9.27 / 9.95 |
+| image768 c8 | 26.8 / 27.3 | 28.6 / 29.1 |
+
+### Flash softmax variants (rejected)
+
+Attention is 60% of the 8192-token forward (250 vs 93-112 ms with
+`EI_GEMMA2_METAL_SKIP=attn`) and 32% at 2048. Two opt-in tile variants of
+the shipped 32x128 n8 kernel, in-process against base:
+
+| variant | 8192x1 | 2048x1 | 512x16 | min cosine |
+|---|---:|---:|---:|---:|
+| n8f: `fast::exp` in the softmax | 1.00x | 1.00x | 0.98x | 0.9999999 |
+| n8s: skip O rescale when no row max moved | 0.94x | 0.98x | 1.01x | 1.0 |
+| n8fs: both | 0.96x | 1.00x | 0.99x | 0.9999999 |
+
+The exponentials and the rescale are not the cost; the remaining gap is the
+matmul2d phases and the S/P threadgroup round trips, which a register-resident
+single-simdgroup tile would address (not built; see the 10-10 MPP note). The
+variants were removed. Host bug found on the way: the tile geometry parse used
+`hasSuffix:` for the simdgroup count, so a tile name with a trailing letter
+dispatched 4 simdgroups for an 8-simdgroup kernel (NaN output); it now uses
+`containsString:`.
+
+### Rejected
+
+- Cross-request image packing (under 10% at 432x432, 3.5% at 768x768).
+- Hardware image decode (PNG decode 1.7-4.8 ms of a 21-56 ms miss).
+- Flash softmax fast exp and rescale skip (above).

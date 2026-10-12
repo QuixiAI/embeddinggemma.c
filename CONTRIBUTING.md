@@ -351,6 +351,14 @@ The media stack (2026-10-10, `perf/optimization_status.md`), on by default
   to one thread that packs every waiting finish into a wave on its own
   context (`ei_gemma2_metal_batch_inputs`); `EI_MEDIA_FINISH_BATCH=0` runs
   them one by one as before. Metal only.
+- Audio towers queue the same way: one thread packs every waiting clip into
+  one wave on its own context (`ei_gemma2_metal_audio_clips`: the subsampling
+  convs run per clip, the conformer layers see the packed rows with per-token
+  clip bounds for the depthwise conv and attention; at most 12,000 mel frames
+  and 64 clips per wave). The tower is 1.35x at two 10 s clips and 1.48x from
+  four up; `EI_MEDIA_AUDIO_BATCH=0` runs each clip on its request's slot as
+  before. Metal only. Images are not packed across requests: the vision tower
+  gains under 10% at 432x432 and 3.5% at 768x768 from packing.
 - Video frames decode and resize in parallel (up to 8 threads), then on Metal
   runs of same-sized frames go through one packed vision wave
   (`ei_gemma2_metal_vision_frames`: tokens laid out frame after frame, per-frame
@@ -368,7 +376,8 @@ The media stack (2026-10-10, `perf/optimization_status.md`), on by default
   twiddles and uses the sparse filter ranges (identical values, 3-4x less CPU).
 - `make bench-gemma2-media [ITEMS="v768 a30 v960x960 video4 v432x432x8"]
   [EI_BENCH_STREAMS=N] [EI_BENCH_REPEAT=N]` times the towers (`vWxHxF` is a
-  packed F-frame wave) and the mixed-input text pass, repeating the list
+  packed F-frame wave, `aFxC` a packed wave of C audio clips of F mel frames)
+  and the mixed-input text pass, repeating the list
   round-robin with `EI_BENCH_REPEAT` so configurations interleave on this
   noisy host; `perf/loadgen_media.c` posts a content-object body
   (`perf/media_fixtures.py` writes image/audio/video fixtures) at a given

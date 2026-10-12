@@ -19,6 +19,12 @@ typedef struct {
     bool (*finish)(void *ctx, const float *inputs, size_t n, float *out, char *err,
                    size_t err_len);
     void *finish_ctx;
+    /* Optional: runs the audio tower over a clip's mel frames (e.g. packed with
+     * other requests' clips into one wave) instead of the engine call. On
+     * success *out is a malloc'd (frames + 3) / 4 x 512 block. */
+    bool (*audio)(void *ctx, const float *mel, int frames, float **out, size_t *n, char *err,
+                  size_t err_len);
+    void *audio_ctx;
     /* Optional media cache (ei_response_cache, thread-safe): tower outputs by
      * content hash, so a repeated image, frame or clip skips decode and tower. */
     ei_response_cache *cache;

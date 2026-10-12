@@ -19,6 +19,13 @@ bool ei_gemma2_metal_vision_frames(void *ctx, const ei_gguf *g, const uint8_t *c
                                    char *err, size_t len);
 bool ei_gemma2_metal_audio(void *ctx, const ei_gguf *g, const float *mel, int frames, float **out,
                            size_t *tokens, char *err, size_t len);
+/* Audio clips (1..3000 mel frames each) as one packed wave: out holds every
+ * clip's rows in order, (frames + 3) / 4 rows per clip; tokens counts all of
+ * them. At most EI_GEMMA2_AUDIO_WAVE_FRAMES frames and 64 clips per wave. */
+#define EI_GEMMA2_AUDIO_WAVE_FRAMES 12000
+bool ei_gemma2_metal_audio_clips(void *ctx, const ei_gguf *g, const float *const *mel,
+                                 const int *frames, int clips, float **out, size_t *tokens,
+                                 char *err, size_t len);
 bool ei_gemma2_metal_batch(void *ctx, const int32_t *ids, const size_t *offsets, size_t batch,
                            float *out, char *err, size_t len);
 /* Packed sequences of 512-float input rows (media requests after their towers):

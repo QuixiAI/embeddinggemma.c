@@ -70,6 +70,11 @@ The target is the hardware ceiling under many concurrent requests (SlimServe
   transposed operand with `relaxed_precision` reaches ~37 TFLOPS. The int8
   operand + per-32-group scale recipe lost ~3x once compute-bound; tile-major
   layouts and strict precision lost too. Fuse epilogues (GeGLU, PLE) in it.
+- **Without Metal 4 (macOS 15 and earlier) the batched stack is off**, and
+  packed waves fell back to per-token GEMVs, `g2_mm` and scalar attention:
+  24 passages/s on an M3 Max against llama.cpp's 60. The `SG` route
+  (simdgroup-matrix GEMM and flash on Metal 3.1) is 6-9x that path and 2.3x
+  llama.cpp; attention was 75% of the forward once the GEMM was fixed.
 - **Several waves in flight did not help** uniform loads (`--pipeline-slots`):
   one packed wave beats overlapping small ones. Keep it opt-in.
 - **Every `matmul2d` flash instantiation at head width 64 crashes the M5

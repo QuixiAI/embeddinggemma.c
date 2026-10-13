@@ -77,7 +77,8 @@ METAL_SOURCES := \
 	src/metal/kernels/attention.metal \
 	src/metal/kernels/elementwise.metal \
 	src/metal/kernels/pool.metal \
-	src/metal/kernels/gemma2.metal
+	src/metal/kernels/gemma2.metal \
+	src/metal/kernels/gemma2_simdgroup.metal
 METAL_HEADERS := $(wildcard $(METAL_INCLUDE_DIR)/*.metal)
 METALLIB := $(BUILD)/embeddinggemma.metallib
 METAL4_SOURCES := \

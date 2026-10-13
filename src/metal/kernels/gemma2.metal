@@ -1,24 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 // Fixed-profile kernels. Activations stay FP32; GGUF Q8/BF16 weights stay packed.
-struct G2P {
-    uint n, k, m, type, heads, kv, d, window, cols, mode, layer;
-    float scale, lo, hi;
-};
-struct G2Q8 {
-    half d;
-    char qs[32];
-};
-inline float g2w(device const uchar *w, uint type, uint i) {
-    if (type == 0)
-        return ((device const float *)w)[i];
-    if (type == 30)
-        return as_type<float>(uint(((device const ushort *)w)[i]) << 16);
-    if (type == 1)
-        return float(((device const half *)w)[i]);
-    device const G2Q8 *b = (device const G2Q8 *)w;
-    return float(b[i / 32].d) * float(b[i / 32].qs[i % 32]);
-}
+#include "../include/gemma2_common.metal"
 inline float g2gelu(float x) {
     return 0.5f * x * (1 + tanh(0.7978845608f * x * (1 + 0.044715f * x * x)));
 }

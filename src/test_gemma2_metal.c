@@ -28,7 +28,7 @@ int main(int argc, char **argv) {
     // names; the rest stay "0"), default FUSED,TENSOR2,FLASH2, the shipped
     // default. The reference route has every flag off.
     const char *all[] = {"TENSOR", "FLASH",   "GEMV",   "FUSED",  "TENSOR2",
-                         "FLASH2", "FLASH64", "VFUSED", "AFUSED", "LAYER"};
+                         "FLASH2", "FLASH64", "VFUSED", "AFUSED", "LAYER",  "SG"};
     char name[64];
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) {
         snprintf(name, sizeof name, "EI_GEMMA2_METAL_%s", all[i]);

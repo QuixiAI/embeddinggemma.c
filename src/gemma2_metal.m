@@ -35,6 +35,8 @@ static bool layer_probe(EIGemma2Metal *c);
     bool vfused;  // EI_GEMMA2_METAL_VFUSED: fused vision layer (qkv post, GeGLU epilogue, post_add)
     bool afused;  // EI_GEMMA2_METAL_AFUSED: audio clamps folded into producers/GEMM epilogues
     int tensor2Min, tensor2Wide, flash2Min;
+    bool sg;   // EI_GEMMA2_METAL_SG: simdgroup-matrix GEMM for packed waves without Metal 4
+    int sgMin; // EI_GEMMA2_METAL_SG_MIN_TOKENS: smallest wave the simdgroup GEMM takes
     NSString *flashTile; // EI_GEMMA2_METAL_FLASH2_TILE=k64 selects the 64-key tile
     bool epi; // fused GeGLU / PLE epilogues on the wide GEMM (EI_GEMMA2_METAL_NOEPI=1 disables)
     bool kvHalfReady; // fp16 K/V for this layer already written by g2_qkv_post
@@ -133,7 +135,9 @@ static bool mm_clamp(EIGemma2Metal *c, const ei_gguf *g, const char *name, id<MT
         p.k = p.m = 768;
     bool wide = c->tensor2 && n >= c->tensor2Min;
     id<MTLBuffer> packed = wide ? c->packed[@(name)] : nil;
-    bool clamped = packed && lo < hi;
+    bool simdgroup = !packed && !(c->tensorMM && n >= 32) && !wide && c->sg && n >= c->sgMin &&
+                     p.m % 64 == 0 && p.k % 32 == 0;
+    bool clamped = (packed || simdgroup) && lo < hi;
     if (clamped) {
         p.lo = lo;
         p.hi = hi;
@@ -147,6 +151,10 @@ static bool mm_clamp(EIGemma2Metal *c, const ei_gguf *g, const char *name, id<MT
                             : (tm == 64 ? @"g2t_gemm_64" : @"g2t_gemm_32"));
         [c->enc setBuffer:packed offset:0 atIndex:0];
         [c->enc dispatchThreadgroups:MTLSizeMake((n + tm - 1) / tm, p.m / 64, 1)
+               threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else if (simdgroup) {
+        pipeline(c, @"g2s_gemm");
+        [c->enc dispatchThreadgroups:MTLSizeMake(p.m / 64, (n + 31) / 32, 1)
                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else if ((c->tensorMM && n >= 32) || wide) {
         // Unpacked weights (BF16 PLE projection, F32 media) keep the tile route.
@@ -319,6 +327,33 @@ static void attention_c(EIGemma2Metal *c, id<MTLBuffer> q, id<MTLBuffer> k, id<M
         bind(c, bounds ? bounds : q, 5);
         [c->enc dispatchThreadgroups:MTLSizeMake((n + 7) / 8, heads, 1)
                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        return;
+    }
+    if (c->sg && !rpe && (d == 256 || d == 512) && n >= c->sgMin) {
+        // fp16 K/V with at least 32 zero rows past the last token for whole key blocks.
+        int padded = (n + 31) / 32 * 32 + 32;
+        id<MTLBuffer> kh = buffer(c, @"kh", (size_t)padded * kv * d / 2),
+                      vh = buffer(c, @"vh_half", (size_t)padded * kv * d / 2);
+        pipeline(c, @"g2_half");
+        bind(c, k, 0);
+        bind(c, kh, 1);
+        params(c, (G2P){.n = n, .m = padded, .d = kv * d}, 2);
+        threads(c, (size_t)padded * kv * d);
+        bind(c, v, 0);
+        bind(c, vh, 1);
+        threads(c, (size_t)padded * kv * d);
+        pipeline(c, d == 512 ? @"g2s_flash_512" : @"g2s_flash_256");
+        bind(c, q, 0);
+        bind(c, kh, 1);
+        bind(c, vh, 2);
+        bind(c, a, 3);
+        params(c,
+               (G2P){.n = n, .heads = heads, .kv = kv, .d = d, .window = window,
+                     .layer = bounds ? 1 : 0, .lo = lo, .hi = hi},
+               4);
+        bind(c, bounds ? bounds : q, 5);
+        [c->enc dispatchThreadgroups:MTLSizeMake((n + 7) / 8, heads, 1)
+               threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         return;
     }
     pipeline(c, @"g2_attention");
@@ -496,7 +531,7 @@ void *ei_gemma2_metal_create(const ei_gguf *g, char *err, size_t len) {
                  @"g2_conv", @"g2_audio_scale", @"g2_depthwise", @"g2_bias", @"g2_gemv_q8",
                  @"g2_gemv_bf16", @"g2_gemv_f16", @"g2_gemv_f32", @"g2_gemv_ple", @"g2_gemv_qkv",
                  @"g2_gemv_geglu", @"g2_qkv_post", @"g2_post_add", @"g2_post_add_768",
-                 @"g2_post_add_1024", @"g2_vqkv_post"
+                 @"g2_post_add_1024", @"g2_vqkv_post", @"g2s_gemm", @"g2s_flash_256", @"g2s_flash_512"
              ]) {
             id<MTLFunction> f = [lib newFunctionWithName:name];
             id<MTLComputePipelineState> p =
@@ -567,6 +602,12 @@ void *ei_gemma2_metal_create(const ei_gguf *g, char *err, size_t len) {
         c->tensor2Wide = t2wide ? atoi(t2wide) : 256;
         const char *flash2Flag = getenv("EI_GEMMA2_METAL_FLASH2");
         c->flash2 = flash2Flag ? !strcmp(flash2Flag, "1") : metal4;
+        // Without Metal 4 the packed waves would fall back to per-token GEMVs and
+        // g2_mm; the simdgroup GEMM takes them instead (default on there).
+        const char *sgFlag = getenv("EI_GEMMA2_METAL_SG");
+        c->sg = sgFlag ? !strcmp(sgFlag, "1") : !metal4;
+        const char *sgMinFlag = getenv("EI_GEMMA2_METAL_SG_MIN_TOKENS");
+        c->sgMin = sgMinFlag ? atoi(sgMinFlag) : 32;
         const char *f2min = getenv("EI_GEMMA2_METAL_FLASH2_MIN_TOKENS");
         c->flash2Min = f2min ? atoi(f2min) : 16;
         // Media stack (2026-10-10): default on with Metal 4, "0" turns a route off.
@@ -787,7 +828,8 @@ static bool projector(EIGemma2Metal *c, const ei_gguf *g, char *err, size_t len)
 // Fused text-layer helpers (EI_GEMMA2_METAL_FUSED=1). Short waves use fused
 // GEMVs; waves on the tensor route keep separate projections.
 static bool short_route(EIGemma2Metal *c, int n) {
-    return !(c->tensorMM && n >= 32) && !(c->tensor2 && n >= c->tensor2Min);
+    return !(c->tensorMM && n >= 32) && !(c->tensor2 && n >= c->tensor2Min) &&
+           !(c->sg && n >= c->sgMin);
 }
 static void short_groups(EIGemma2Metal *c, size_t rows_per_group, size_t rows, int n) {
     [c->enc dispatchThreadgroups:MTLSizeMake(rows / rows_per_group, (n + 7) / 8, 1)

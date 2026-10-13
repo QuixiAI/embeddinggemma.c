@@ -73,8 +73,10 @@ The target is the hardware ceiling under many concurrent requests (SlimServe
 - **Without Metal 4 (macOS 15 and earlier) the batched stack is off**, and
   packed waves fell back to per-token GEMVs, `g2_mm` and scalar attention:
   24 passages/s on an M3 Max against llama.cpp's 60. The `SG` route
-  (simdgroup-matrix GEMM and flash on Metal 3.1) is 6-9x that path and 2.3x
-  llama.cpp; attention was 75% of the forward once the GEMM was fixed.
+  (simdgroup-matrix GEMM and flash on Metal 3.1) is 6-9x that path, level
+  with llama.cpp in tokens/s at 5.8x less memory; attention was 75% of the
+  forward once the GEMM was fixed. Benchmark with unique passages: repeats
+  are answered by the exact cache and inflated one comparison 2.3x.
 - **Several waves in flight did not help** uniform loads (`--pipeline-slots`):
   one packed wave beats overlapping small ones. Keep it opt-in.
 - **Every `matmul2d` flash instantiation at head width 64 crashes the M5

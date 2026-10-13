@@ -3969,15 +3969,25 @@ In-process pairs, `bench_gemma2_metal` base `FUSED=1`, route `FUSED=1,SG=1`
 | 1000x4 | 1994.8 | 263.9 | 7.56x | 0.999999 | 15,158 |
 | 2040x4 | 5492.4 | 631.1 | 8.70x | 0.999999 | 12,930 |
 
-HTTP against the installed llama.cpp b11459 embedding server (same Q8_0 and
-projector, `--pooling mean --embd-normalize 2`), 512 fresh passages:
+HTTP against llama.cpp b11459's `llama-server` on the same Q8_0 and
+projector (`--pooling mean --embd-normalize 2 -c/-b/-ub 8192`), 35 Markdown
+documents cut into 2,994 unique 1,200-character passages (1.22M tokens, 409
+a passage), 32 a request, 4 requests in flight:
 
-| server | 16 x 1 in flight | 32 x 8 in flight | query alone p50 | RSS after |
+| server | streamed | a document at a time | single query p50 | RSS after |
 |---|---:|---:|---:|---:|
-| llama.cpp b11459 | 59.8 /s | 65.4 /s | 10.1 ms | 2.69 GB |
-| embeddinggemma.c, SG | 146.3 /s | 149.2 /s | 8.4 ms | 0.75 GB |
+| llama.cpp b11459 | 17,709 tok/s | 16,282 tok/s | 10.1 ms | 4.46 GB |
+| embeddinggemma.c, SG | 17,691 tok/s | 18,193 tok/s | 8.4 ms | 0.77 GB |
 
-Embeddings agree with llama.cpp at minimum cosine 0.999999 over 32 passages.
+Throughput is at parity with llama.cpp on this GPU; the win is memory (5.8x
+less) and query latency. An earlier run that reported 2.3x repeated each
+passage about 2.5 times, so this server's exact cache answered the repeats;
+it is withdrawn. Embeddings agree with llama.cpp at minimum cosine 0.999999.
+
+Rejected: a 64-token x 64-row GEMM tile (4 x 4 accumulators per simdgroup,
+half the weight decodes): back to back it lost at every size (400x20 450 vs
+438 ms, 64x4 23.2 vs 19.1 ms, 2040x4 673 vs 644 ms). At 400x20 the forward
+is about 64% GEMM, 23% attention and 14% the rest (`EI_GEMMA2_METAL_SKIP`).
 
 Media (`bench_gemma2_media`, SG=0 / SG=1, ms per call): v432 253.4 / 135.2,
 v768 1655.1 / 1264.8, video4 1049.2 / 566.0, a10 100.5 / 31.0, mixed

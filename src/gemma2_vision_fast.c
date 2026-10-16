@@ -94,7 +94,7 @@ static const float *f32_of(const ei_gguf *g, const char *name) {
 
 typedef struct {
     size_t cap;                    /* patches */
-    float *x, *h, *q, *k, *v, *a;  /* [cap][768] */
+    float *x, *h, *q, *k, *v;      /* [cap][768]; v doubles as the attention output */
     float *up, *gate;              /* [FFN_CHUNK][3072] */
     ei_block_q8_0 *xq;             /* [max(cap*24, FFN_CHUNK*96)] */
     float *rope;                   /* [positions][32]: 16 cos then 16 sin */
@@ -108,14 +108,13 @@ static ei_gemma2_fast *gemm_ctx;
 static void reserve(vision_ws *w, size_t n) {
     if (w->cap >= n)
         return;
-    free(w->x), free(w->h), free(w->q), free(w->k), free(w->v), free(w->a), free(w->xq);
+    free(w->x), free(w->h), free(w->q), free(w->k), free(w->v), free(w->xq);
     size_t row = (size_t)VD * sizeof(float);
     w->x = ei_xmalloc(n * row);
     w->h = ei_xmalloc(n * row);
     w->q = ei_xmalloc(n * row);
     w->k = ei_xmalloc(n * row);
     w->v = ei_xmalloc(n * row);
-    w->a = ei_xmalloc(n * row);
     size_t blocks = n * VD / 32 > (size_t)FFN_CHUNK * VF / 32 ? n * VD / 32 : (size_t)FFN_CHUNK * VF / 32;
     w->xq = ei_xmalloc(blocks * sizeof(ei_block_q8_0));
     if (!w->up) {
@@ -275,7 +274,7 @@ typedef struct {
     const vision_ws *w;
     int n, blocks;
 } attn_job;
-/* Q and the output are token-major [n][768]; K (in h) and V (in k) are
+/* Q and the output (into v, free once V moved) are token-major [n][768]; K (in h) and V (in k) are
  * head-major [12][n][64], so the K/V stream of a query block is contiguous:
  * read in place from the token-major buffers, every key of a head sat on its
  * own 4 KB page (3 KB row stride) and the per-head stream at 10080 patches
@@ -287,7 +286,7 @@ static void attn_tasks(void *opaque, int32_t begin, int32_t end) {
         int hd = task / j->blocks, q0 = task % j->blocks * qb;
         int nq = j->n - q0 < qb ? j->n - q0 : qb;
         const size_t plane = (size_t)hd * j->n * 64;
-        g2m_attn_args a = {.q = j->w->q, .k = j->w->h + plane, .v = j->w->k + plane, .out = j->w->a,
+        g2m_attn_args a = {.q = j->w->q, .k = j->w->h + plane, .v = j->w->k + plane, .out = j->w->v,
                            .qstride = VD, .kvstride = 64, .ostride = VD, .qcol = (size_t)hd * 64, .kvcol = 0,
                            .ocol = (size_t)hd * 64, .d = 64, .q0 = q0, .nq = nq, .klo = 0, .khi = j->n,
                            .scale = 1.0f};
@@ -341,7 +340,7 @@ bool ei_gemma2_vision_fast(const ei_gguf *g, ei_thread_pool *pool, const uint8_t
         VP(VP_ROWS, rows(pool, n, (row_job){.op = ROW_QKV_POST, .w = w, .qn = qn, .kn = kn, .cols = cols, .n = n});
            rows(pool, n, (row_job){.op = ROW_V_HEADS, .w = w, .n = n}));
         VP(VP_ATTN, ei_parallel_for(pool, VHEADS * aj.blocks, 1, attn_tasks, &aj));
-        VP(VP_ROWS, rows(pool, n, (row_job){.op = ROW_QUANT, .w = w, .src = w->a}));
+        VP(VP_ROWS, rows(pool, n, (row_job){.op = ROW_QUANT, .w = w, .src = w->v}));
         VP(VP_GEMM_O, ei_gemma2_fast_gemm_q8(gemm_ctx, pool, V("attn_out"), w->xq, n, w->h));
         VP(VP_ROWS, rows(pool, n, (row_job){.op = ROW_POST_ADD, .w = w, .nw = VF32("attn_post_norm")}));
         /* ln2 activations for every token first (q buffer is free now), then the

@@ -43,6 +43,14 @@ BUILD   := build
 DIST    ?= dist
 MODEL   ?= model/embeddinggemma-300M-qat-Q4_0.gguf
 VERSION := $(strip $(shell cat VERSION 2>/dev/null))
+# cpu-max fork: build identity reported by `embeddinggemma --version` and at startup.
+CPU_MAX_VERSION := $(strip $(shell cat CPU_MAX_VERSION 2>/dev/null))
+GIT_COMMIT ?= $(strip $(shell git rev-parse --short=7 HEAD 2>/dev/null)$(shell git diff --quiet HEAD -- 2>/dev/null || echo -dirty))
+# The upstream commit this fork is based on (`git describe --tags d8f9e33`; upstream's
+# VERSION file still reads v0.3.1). A literal, so shallow clones report it too.
+UPSTREAM_BASE := v0.3.1-8-gd8f9e33
+IDENTITY_DEFS = -DEI_CPU_MAX_VERSION='"$(or $(CPU_MAX_VERSION),unknown)"' -DEI_UPSTREAM_VERSION='"$(UPSTREAM_BASE)"' \
+	-DEI_GIT_COMMIT='"$(or $(GIT_COMMIT),unknown)"'
 PERF_SERVER_URL ?= http://127.0.0.1:42666
 PERF_SERVER_API ?= embeddinggemma
 PERF_SERVER_MODEL ?= embeddinggemma-300m
@@ -187,8 +195,8 @@ $(BUILD)/test_batch: src/test_batch.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
 $(BUILD)/test_kernels: src/test_kernels.c src/quants.c src/kernels.c src/gguf.c $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_kernels.c src/quants.c src/kernels.c src/gguf.c $(LDLIBS)
 
-$(BUILD)/embeddinggemma: $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(HDRS_NATIVE) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(LDLIBS)
+$(BUILD)/embeddinggemma: $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(HDRS_NATIVE) CPU_MAX_VERSION | $(BUILD)
+	$(CC) $(CFLAGS) $(IDENTITY_DEFS) -o $@ $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(LDLIBS)
 
 $(BUILD)/test_inference_service: src/test_inference_service.c $(SRCS_SERVICE) src/tokenizer.c src/gguf.c $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_inference_service.c $(SRCS_SERVICE) src/tokenizer.c src/gguf.c $(LDLIBS)

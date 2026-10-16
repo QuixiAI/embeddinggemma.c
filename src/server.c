@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "engine.h"
+#include "cpu_max_version.h"
 #include "profiles.h"
 #include "media.h"
 #if defined(EI_ENABLE_METAL)
@@ -1565,7 +1566,7 @@ static void handle_stop_signal(int sig) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--bind ADDR] [--port PORT] [--backend auto|cpu|metal|cuda|rocm|xpu]\n"
+            "usage: %s [--version] [--bind ADDR] [--port PORT] [--backend auto|cpu|metal|cuda|rocm|xpu]\n"
             "          [--profile embeddinggemma-2|embeddinggemma-300m]\n"
             "          [--model PATH] [--mmproj PATH] [--workers N] [--max-queue N]\n"
             "          [--cache-entries N] [--max-batch-tokens N]\n"
@@ -1747,6 +1748,9 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
             opts->persistent_cache_path = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
+            exit(0);
+        } else if (strcmp(argv[i], "--version") == 0) {
+            printf("%s\n", EI_BUILD_IDENTITY);
             exit(0);
         } else {
             return false;
@@ -1938,6 +1942,7 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 2;
     }
+    fprintf(stderr, "%s\n", EI_BUILD_IDENTITY);
 
     char *model_path = resolve_model_path(&opts);
     ensure_model_available(model_path, opts.profile->url);

@@ -1,0 +1,17 @@
+# Created by `uv sync`, scripts/download_assets.sh, scripts/make_fixtures.py,
+# scripts/prepare_retrieval_data.py and scripts/setup_upstream.sh: never committed.
+.venv/
+__pycache__/
+models/gguf/
+data/
+bench/fixtures/
+third_party/
+logs/
+build/
+
+# Large or regenerable result artifacts (embeddings, caches, tower dumps);
+# the JSON summaries next to them are committed.
+reports/raw/*.npz
+reports/raw/retrieval/
+reports/raw/audio_parity/
+reports/raw/vision_parity/

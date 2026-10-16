@@ -1,0 +1,35 @@
+[project]
+name = "embeddinggemma2-cpu-max"
+version = "0.1.0"
+description = "CPU-only benchmark, validation and optimized native inference for google/embeddinggemma-2"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  # Reference FP32 implementation (CPU-only torch build, no CUDA libraries).
+  "torch==2.14.1",
+  "torchvision==0.29.1",
+  "transformers==5.20.0",
+  "sentence-transformers==6.1.0",
+  # ONNX Community Q8 baseline (CPU execution provider only).
+  "onnxruntime==1.23.2",
+  "numpy>=2,<3",
+  "Pillow>=10,<13",
+  "soundfile>=0.12",
+  "psutil>=5.9",
+  "matplotlib>=3.9",
+  "pandas>=2.2",
+  "huggingface_hub>=1.0",
+  "requests>=2.31",
+  "pyarrow>=17",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

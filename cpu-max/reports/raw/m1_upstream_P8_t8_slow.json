@@ -1,0 +1,271 @@
+{
+ "backend": "quixi_upstream",
+ "kind": "native",
+ "threads": 8,
+ "cpus": "P8",
+ "cpu_list": [
+  0,
+  2,
+  4,
+  6,
+  8,
+  10,
+  12,
+  14
+ ],
+ "started": "2026-10-16T04:35:25",
+ "host": "redacted",
+ "load_before": [
+  8.435546875,
+  8.7275390625,
+  8.81201171875
+ ],
+ "load_after": [
+  6.86328125,
+  7.4130859375,
+  8.15478515625
+ ],
+ "load_ms": 107.09212200064212,
+ "peak_rss_mb": 1022.08203125,
+ "versions": {
+  "binary": "third_party/embeddinggemma.c/build/embeddinggemma",
+  "cmd": [
+   "taskset",
+   "-c",
+   "0,2,4,6,8,10,12,14",
+   "third_party/embeddinggemma.c/build/embeddinggemma",
+   "--bind",
+   "127.0.0.1",
+   "--port",
+   "48419",
+   "--threads",
+   "8",
+   "--model",
+   "models/gguf/embeddinggemma-2-Q8_0.gguf",
+   "--mmproj",
+   "models/gguf/mmproj-embeddinggemma-2-Q8_0.gguf",
+   "--cache-entries",
+   "0",
+   "--response-cache-mb",
+   "0",
+   "--media-cache-mb",
+   "0",
+   "--keepalive-timeout-ms",
+   "60000"
+  ],
+  "git": "d8f9e33"
+ },
+ "warmup": 0,
+ "repeat": 2,
+ "argv": [
+  "bench/run_bench.py",
+  "--backend",
+  "native",
+  "--binary",
+  "third_party/embeddinggemma.c/build/embeddinggemma",
+  "--name",
+  "quixi_upstream",
+  "--threads",
+  "8",
+  "--cpus",
+  "P8",
+  "--items",
+  "i1120,v16",
+  "--warmup",
+  "0",
+  "--min-repeat",
+  "2",
+  "--repeat",
+  "2",
+  "--budget-s",
+  "1",
+  "--out",
+  "reports/raw/m1_upstream_P8_t8_slow.json"
+ ],
+ "results": [
+  {
+   "item": "i1120",
+   "modality": "image",
+   "tokens": 1124,
+   "expected_tokens": 1124,
+   "stats": {
+    "total": {
+     "p50": 552465.9380970001,
+     "p95": 554508.4302639,
+     "mean": 552465.9380970001,
+     "min": 550196.5023560002,
+     "max": 554735.373838,
+     "n": 2
+    },
+    "preprocess": {
+     "p50": 32.035000000000004,
+     "p95": 33.6055,
+     "mean": 32.035000000000004,
+     "min": 30.290000000000003,
+     "max": 33.78,
+     "n": 2
+    },
+    "inference": {
+     "p50": 552428.035,
+     "p95": 554472.3985,
+     "mean": 552428.035,
+     "min": 550156.52,
+     "max": 554699.55,
+     "n": 2
+    },
+    "towers": {
+     "p50": 550799.65,
+     "p95": 552813.166,
+     "mean": 550799.65,
+     "min": 548562.41,
+     "max": 553036.89,
+     "n": 2
+    },
+    "text": {
+     "p50": 1628.385,
+     "p95": 1659.2325,
+     "mean": 1628.385,
+     "min": 1594.11,
+     "max": 1662.66,
+     "n": 2
+    },
+    "client_encode": {
+     "p50": 12.972373999655247,
+     "p95": 12.972373999655247,
+     "mean": 12.972373999655247,
+     "min": 12.972373999655247,
+     "max": 12.972373999655247,
+     "n": 2
+    },
+    "rps_single": 0.001810066342632011
+   },
+   "cpu_util": 0.9844945448327065,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 554735.373838,
+     "client_encode": 12.972373999655247,
+     "preprocess": 30.290000000000003,
+     "towers": 553036.89,
+     "text": 1662.66,
+     "tokens": 1124,
+     "stages": {
+      "base64": 0.99,
+      "decode": 28.03,
+      "resize": 1.27,
+      "vision": 553036.89,
+      "finish": 1662.66
+     },
+     "inference": 554699.55
+    },
+    {
+     "total": 550196.5023560002,
+     "client_encode": 12.972373999655247,
+     "preprocess": 33.78,
+     "towers": 548562.41,
+     "text": 1594.11,
+     "tokens": 1124,
+     "stages": {
+      "base64": 0.85,
+      "decode": 31.77,
+      "resize": 1.16,
+      "vision": 548562.41,
+      "finish": 1594.11
+     },
+     "inference": 550156.52
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "v16",
+   "modality": "video",
+   "tokens": 2385,
+   "expected_tokens": 2274,
+   "stats": {
+    "total": {
+     "p50": 161199.34931400046,
+     "p95": 170244.8847599998,
+     "mean": 161199.34931400046,
+     "min": 151148.75437400118,
+     "max": 171249.94425399974,
+     "n": 2
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 2
+    },
+    "inference": {
+     "p50": 3821.185,
+     "p95": 3846.3895,
+     "mean": 3821.185,
+     "min": 3793.18,
+     "max": 3849.19,
+     "n": 2
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 2
+    },
+    "text": {
+     "p50": 3821.185,
+     "p95": 3846.3895,
+     "mean": 3821.185,
+     "min": 3793.18,
+     "max": 3849.19,
+     "n": 2
+    },
+    "client_encode": {
+     "p50": 28.640462999232113,
+     "p95": 28.640462999232113,
+     "mean": 28.640462999232113,
+     "min": 28.640462999232113,
+     "max": 28.640462999232113,
+     "n": 2
+    },
+    "rps_single": 0.006203498985917731
+   },
+   "cpu_util": 0.8941411408438918,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 171249.94425399974,
+     "client_encode": 28.640462999232113,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 3849.19,
+     "tokens": 2385,
+     "stages": {
+      "finish": 3849.19
+     },
+     "inference": 3849.19
+    },
+    {
+     "total": 151148.75437400118,
+     "client_encode": 28.640462999232113,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 3793.18,
+     "tokens": 2385,
+     "stages": {
+      "finish": 3793.18
+     },
+     "inference": 3793.18
+    }
+   ],
+   "throughput": []
+  }
+ ]
+}

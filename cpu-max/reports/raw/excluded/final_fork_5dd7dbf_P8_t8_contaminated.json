@@ -1,0 +1,3139 @@
+{
+ "backend": "fork_5dd7dbf",
+ "kind": "native",
+ "threads": 8,
+ "cpus": "P8",
+ "cpu_list": [
+  0,
+  2,
+  4,
+  6,
+  8,
+  10,
+  12,
+  14
+ ],
+ "started": "2026-10-16T12:45:07",
+ "host": "redacted",
+ "load_before": [
+  15.330078125,
+  16.1494140625,
+  16.2412109375
+ ],
+ "load_after": [
+  7.8662109375,
+  11.68017578125,
+  14.38916015625
+ ],
+ "load_ms": 104.774831995368,
+ "peak_rss_mb": 1411.7578125,
+ "versions": {
+  "binary": "engine/build/embeddinggemma",
+  "cmd": [
+   "taskset",
+   "-c",
+   "0,2,4,6,8,10,12,14",
+   "engine/build/embeddinggemma",
+   "--bind",
+   "127.0.0.1",
+   "--port",
+   "48127",
+   "--threads",
+   "8",
+   "--model",
+   "models/gguf/embeddinggemma-2-Q8_0.gguf",
+   "--mmproj",
+   "models/gguf/mmproj-embeddinggemma-2-Q8_0.gguf",
+   "--cache-entries",
+   "0",
+   "--response-cache-mb",
+   "0",
+   "--media-cache-mb",
+   "0",
+   "--keepalive-timeout-ms",
+   "60000"
+  ],
+  "git": "5dd7dbf"
+ },
+ "warmup": 1,
+ "repeat": 10,
+ "argv": [
+  "bench/run_bench.py",
+  "--backend",
+  "native",
+  "--binary",
+  "engine/build/embeddinggemma",
+  "--name",
+  "fork_5dd7dbf",
+  "--threads",
+  "8",
+  "--cpus",
+  "P8",
+  "--warmup",
+  "1",
+  "--min-repeat",
+  "3",
+  "--repeat",
+  "10",
+  "--budget-s",
+  "30",
+  "--out",
+  "reports/raw/final_fork_5dd7dbf_P8_t8.json"
+ ],
+ "results": [
+  {
+   "item": "t16",
+   "modality": "text",
+   "tokens": 16,
+   "expected_tokens": 16,
+   "stats": {
+    "total": {
+     "p50": 9.251400500535965,
+     "p95": 10.340321651101112,
+     "mean": 9.2854410007596,
+     "min": 7.338930003345013,
+     "max": 10.661037996411324,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 0.017382003366947174,
+     "p95": 0.017382003366947174,
+     "mean": 0.017382003366947174,
+     "min": 0.017382003366947174,
+     "max": 0.017382003366947174,
+     "n": 10
+    },
+    "rps_single": 107.69547724423583
+   },
+   "cpu_util": 0.6452563917008782,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 7.338930003345013,
+     "client_encode": 0.017382003366947174,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 9.948335006833076,
+     "client_encode": 0.017382003366947174,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 10.661037996411324,
+     "client_encode": 0.017382003366947174,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 9.063664004206657,
+     "client_encode": 0.017382003366947174,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 9.740990996360779,
+     "client_encode": 0.017382003366947174,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 8.797457002103329,
+     "client_encode": 0.017382003366947174,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 9.06342899799347,
+     "client_encode": 0.017382003366947174,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 8.86633000522852,
+     "client_encode": 0.017382003366947174,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 9.935098998248577,
+     "client_encode": 0.017382003366947174,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 9.439136996865273,
+     "client_encode": 0.017382003366947174,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "t128",
+   "modality": "text",
+   "tokens": 128,
+   "expected_tokens": 128,
+   "stats": {
+    "total": {
+     "p50": 28.568684995174408,
+     "p95": 28.788073750957846,
+     "mean": 28.58432579934597,
+     "min": 28.32625100016594,
+     "max": 28.854433000087738,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 0.01225600391626358,
+     "p95": 0.01225600391626358,
+     "mean": 0.01225600391626358,
+     "min": 0.01225600391626358,
+     "max": 0.01225600391626358,
+     "n": 10
+    },
+    "rps_single": 34.98420802434601
+   },
+   "cpu_util": 0.8511767322158054,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 28.522034004330635,
+     "client_encode": 0.01225600391626358,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 28.671469002962112,
+     "client_encode": 0.01225600391626358,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 28.50975599884987,
+     "client_encode": 0.01225600391626358,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 28.32625100016594,
+     "client_encode": 0.01225600391626358,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 28.559385992586613,
+     "client_encode": 0.01225600391626358,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 28.443846993148327,
+     "client_encode": 0.01225600391626358,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 28.706968002021313,
+     "client_encode": 0.01225600391626358,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 28.854433000087738,
+     "client_encode": 0.01225600391626358,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 28.671130001544952,
+     "client_encode": 0.01225600391626358,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 28.577983997762203,
+     "client_encode": 0.01225600391626358,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "t512",
+   "modality": "text",
+   "tokens": 512,
+   "expected_tokens": 512,
+   "stats": {
+    "total": {
+     "p50": 141.29816599935293,
+     "p95": 142.91977444775404,
+     "mean": 141.24454020112753,
+     "min": 139.46976900100708,
+     "max": 143.56469599157572,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 0.01241300255060196,
+     "p95": 0.01241300255060196,
+     "mean": 0.01241300255060196,
+     "min": 0.01241300255060196,
+     "max": 0.01241300255060196,
+     "n": 10
+    },
+    "rps_single": 7.07991968097339
+   },
+   "cpu_util": 0.9185598858144488,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 139.46976900100708,
+     "client_encode": 0.01241300255060196,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 139.72567299753428,
+     "client_encode": 0.01241300255060196,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 140.72515800595284,
+     "client_encode": 0.01241300255060196,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 141.02033299952745,
+     "client_encode": 0.01241300255060196,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 141.3872970044613,
+     "client_encode": 0.01241300255060196,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 142.1315370053053,
+     "client_encode": 0.01241300255060196,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 143.56469599157572,
+     "client_encode": 0.01241300255060196,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 141.8246070072055,
+     "client_encode": 0.01241300255060196,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 141.2625799998641,
+     "client_encode": 0.01241300255060196,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 141.33375199884176,
+     "client_encode": 0.01241300255060196,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "i70",
+   "modality": "image",
+   "tokens": 74,
+   "expected_tokens": 74,
+   "stats": {
+    "total": {
+     "p50": 159.51127400621772,
+     "p95": 161.35493120141328,
+     "mean": 159.2125688008964,
+     "min": 154.28902499377728,
+     "max": 161.40859100222588,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 2.6550000000000002,
+     "p95": 2.762,
+     "mean": 2.638,
+     "min": 2.43,
+     "max": 2.78,
+     "n": 10
+    },
+    "inference": {
+     "p50": 156.09,
+     "p95": 157.9255,
+     "mean": 155.845,
+     "min": 151.25,
+     "max": 157.93,
+     "n": 10
+    },
+    "towers": {
+     "p50": 136.435,
+     "p95": 138.2795,
+     "mean": 136.13299999999998,
+     "min": 131.73,
+     "max": 138.41,
+     "n": 10
+    },
+    "text": {
+     "p50": 19.655,
+     "p95": 19.9605,
+     "mean": 19.712,
+     "min": 19.51,
+     "max": 20.01,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 1.3674590066075325,
+     "p95": 1.3674590066075325,
+     "mean": 1.3674590066075325,
+     "min": 1.3674590066075325,
+     "max": 1.3674590066075325,
+     "n": 10
+    },
+    "rps_single": 6.280911158782646
+   },
+   "cpu_util": 0.9581179013844637,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 154.28902499377728,
+     "client_encode": 1.3674590066075325,
+     "preprocess": 2.43,
+     "towers": 131.73,
+     "text": 19.52,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.07,
+      "decode": 2.31,
+      "resize": 0.05,
+      "vision": 131.73,
+      "finish": 19.52
+     },
+     "inference": 151.25
+    },
+    {
+     "total": 158.59422999620438,
+     "client_encode": 1.3674590066075325,
+     "preprocess": 2.58,
+     "towers": 135.33,
+     "text": 19.9,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.09,
+      "decode": 2.44,
+      "resize": 0.05,
+      "vision": 135.33,
+      "finish": 19.9
+     },
+     "inference": 155.23000000000002
+    },
+    {
+     "total": 158.18601099401712,
+     "client_encode": 1.3674590066075325,
+     "preprocess": 2.54,
+     "towers": 135.35,
+     "text": 19.61,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.09,
+      "decode": 2.4,
+      "resize": 0.05,
+      "vision": 135.35,
+      "finish": 19.61
+     },
+     "inference": 154.95999999999998
+    },
+    {
+     "total": 158.90662800520658,
+     "client_encode": 1.3674590066075325,
+     "preprocess": 2.6100000000000003,
+     "towers": 135.64,
+     "text": 19.85,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.09,
+      "decode": 2.47,
+      "resize": 0.05,
+      "vision": 135.64,
+      "finish": 19.85
+     },
+     "inference": 155.48999999999998
+    },
+    {
+     "total": 161.40859100222588,
+     "client_encode": 1.3674590066075325,
+     "preprocess": 2.74,
+     "towers": 138.41,
+     "text": 19.51,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.09,
+      "decode": 2.6,
+      "resize": 0.05,
+      "vision": 138.41,
+      "finish": 19.51
+     },
+     "inference": 157.92
+    },
+    {
+     "total": 159.77975499629974,
+     "client_encode": 1.3674590066075325,
+     "preprocess": 2.78,
+     "towers": 136.64,
+     "text": 19.6,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.1,
+      "decode": 2.63,
+      "resize": 0.05,
+      "vision": 136.64,
+      "finish": 19.6
+     },
+     "inference": 156.23999999999998
+    },
+    {
+     "total": 159.6186440065503,
+     "client_encode": 1.3674590066075325,
+     "preprocess": 2.6999999999999997,
+     "towers": 136.54,
+     "text": 19.68,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.1,
+      "decode": 2.55,
+      "resize": 0.05,
+      "vision": 136.54,
+      "finish": 19.68
+     },
+     "inference": 156.22
+    },
+    {
+     "total": 161.2893470004201,
+     "client_encode": 1.3674590066075325,
+     "preprocess": 2.58,
+     "towers": 138.12,
+     "text": 19.81,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.1,
+      "decode": 2.43,
+      "resize": 0.05,
+      "vision": 138.12,
+      "finish": 19.81
+     },
+     "inference": 157.93
+    },
+    {
+     "total": 159.40390400588512,
+     "client_encode": 1.3674590066075325,
+     "preprocess": 2.6999999999999997,
+     "towers": 136.33,
+     "text": 19.63,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.1,
+      "decode": 2.55,
+      "resize": 0.05,
+      "vision": 136.33,
+      "finish": 19.63
+     },
+     "inference": 155.96
+    },
+    {
+     "total": 160.64955300837755,
+     "client_encode": 1.3674590066075325,
+     "preprocess": 2.7199999999999998,
+     "towers": 137.24,
+     "text": 20.01,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.1,
+      "decode": 2.57,
+      "resize": 0.05,
+      "vision": 137.24,
+      "finish": 20.01
+     },
+     "inference": 157.25
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "i280",
+   "modality": "image",
+   "tokens": 284,
+   "expected_tokens": 284,
+   "stats": {
+    "total": {
+     "p50": 1033.3037874996662,
+     "p95": 1044.4686301004142,
+     "mean": 1035.5999566994608,
+     "min": 1029.454319998622,
+     "max": 1048.702816002071,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 9.61,
+     "p95": 9.841000000000001,
+     "mean": 9.637,
+     "min": 9.41,
+     "max": 9.850000000000001,
+     "n": 10
+    },
+    "inference": {
+     "p50": 1022.5400000000001,
+     "p95": 1033.4905,
+     "mean": 1024.645,
+     "min": 1018.31,
+     "max": 1037.5900000000001,
+     "n": 10
+    },
+    "towers": {
+     "p50": 949.965,
+     "p95": 961.0255,
+     "mean": 951.243,
+     "min": 946.66,
+     "max": 966.07,
+     "n": 10
+    },
+    "text": {
+     "p50": 72.265,
+     "p95": 78.905,
+     "mean": 73.402,
+     "min": 71.52,
+     "max": 80.3,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 3.5360540002584457,
+     "p95": 3.5360540002584457,
+     "mean": 3.5360540002584457,
+     "min": 3.5360540002584457,
+     "max": 3.5360540002584457,
+     "n": 10
+    },
+    "rps_single": 0.9656238333449524
+   },
+   "cpu_util": 0.9772113948124146,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 1048.702816002071,
+     "client_encode": 3.5360540002584457,
+     "preprocess": 9.81,
+     "towers": 966.07,
+     "text": 71.52,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.31,
+      "decode": 9.23,
+      "resize": 0.27,
+      "vision": 966.07,
+      "finish": 71.52
+     },
+     "inference": 1037.5900000000001
+    },
+    {
+     "total": 1029.9321109950542,
+     "client_encode": 3.5360540002584457,
+     "preprocess": 9.68,
+     "towers": 947.44,
+     "text": 71.52,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.31,
+      "decode": 9.11,
+      "resize": 0.26,
+      "vision": 947.44,
+      "finish": 71.52
+     },
+     "inference": 1018.96
+    },
+    {
+     "total": 1038.9909330010414,
+     "client_encode": 3.5360540002584457,
+     "preprocess": 9.48,
+     "towers": 951.06,
+     "text": 77.2,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.31,
+      "decode": 8.85,
+      "resize": 0.32,
+      "vision": 951.06,
+      "finish": 77.2
+     },
+     "inference": 1028.26
+    },
+    {
+     "total": 1033.4738240018487,
+     "client_encode": 3.5360540002584457,
+     "preprocess": 9.52,
+     "towers": 950.34,
+     "text": 72.31,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.31,
+      "decode": 8.93,
+      "resize": 0.28,
+      "vision": 950.34,
+      "finish": 72.31
+     },
+     "inference": 1022.6500000000001
+    },
+    {
+     "total": 1029.454319998622,
+     "client_encode": 3.5360540002584457,
+     "preprocess": 9.850000000000001,
+     "towers": 946.66,
+     "text": 71.65,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.31,
+      "decode": 9.21,
+      "resize": 0.33,
+      "vision": 946.66,
+      "finish": 71.65
+     },
+     "inference": 1018.31
+    },
+    {
+     "total": 1039.2935139983892,
+     "client_encode": 3.5360540002584457,
+     "preprocess": 9.459999999999999,
+     "towers": 948.18,
+     "text": 80.3,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.31,
+      "decode": 8.87,
+      "resize": 0.28,
+      "vision": 948.18,
+      "finish": 80.3
+     },
+     "inference": 1028.48
+    },
+    {
+     "total": 1031.9410040006042,
+     "client_encode": 3.5360540002584457,
+     "preprocess": 9.83,
+     "towers": 947.74,
+     "text": 73.03,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.31,
+      "decode": 9.23,
+      "resize": 0.29,
+      "vision": 947.74,
+      "finish": 73.03
+     },
+     "inference": 1020.77
+    },
+    {
+     "total": 1032.7569040060043,
+     "client_encode": 3.5360540002584457,
+     "preprocess": 9.540000000000001,
+     "towers": 949.59,
+     "text": 72.33,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.3,
+      "decode": 8.98,
+      "resize": 0.26,
+      "vision": 949.59,
+      "finish": 72.33
+     },
+     "inference": 1021.9200000000001
+    },
+    {
+     "total": 1033.1337509974837,
+     "client_encode": 3.5360540002584457,
+     "preprocess": 9.41,
+     "towers": 950.49,
+     "text": 71.94,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.31,
+      "decode": 8.83,
+      "resize": 0.27,
+      "vision": 950.49,
+      "finish": 71.94
+     },
+     "inference": 1022.4300000000001
+    },
+    {
+     "total": 1038.3203899934888,
+     "client_encode": 3.5360540002584457,
+     "preprocess": 9.790000000000001,
+     "towers": 954.86,
+     "text": 72.22,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.31,
+      "decode": 9.21,
+      "resize": 0.27,
+      "vision": 954.86,
+      "finish": 72.22
+     },
+     "inference": 1027.08
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "i1120",
+   "modality": "image",
+   "tokens": 1124,
+   "expected_tokens": 1124,
+   "stats": {
+    "total": {
+     "p50": 10774.945357993245,
+     "p95": 10884.996941299736,
+     "mean": 10808.527847997844,
+     "min": 10753.41329099983,
+     "max": 10897.224895000458,
+     "n": 3
+    },
+    "preprocess": {
+     "p50": 30.09,
+     "p95": 31.952999999999996,
+     "mean": 30.606666666666666,
+     "min": 29.57,
+     "max": 32.16,
+     "n": 3
+    },
+    "inference": {
+     "p50": 10742.349999999999,
+     "p95": 10851.898,
+     "mean": 10774.916666666666,
+     "min": 10718.33,
+     "max": 10864.07,
+     "n": 3
+    },
+    "towers": {
+     "p50": 10351.72,
+     "p95": 10459.378,
+     "mean": 10383.883333333333,
+     "min": 10328.59,
+     "max": 10471.34,
+     "n": 3
+    },
+    "text": {
+     "p50": 390.63,
+     "p95": 392.52000000000004,
+     "mean": 391.0333333333333,
+     "min": 389.74,
+     "max": 392.73,
+     "n": 3
+    },
+    "client_encode": {
+     "p50": 11.914930000901222,
+     "p95": 11.914930000901222,
+     "mean": 11.914930000901222,
+     "min": 11.914930000901222,
+     "max": 11.914930000901222,
+     "n": 3
+    },
+    "rps_single": 0.09251953772642946
+   },
+   "cpu_util": 0.9924617053546474,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 10753.41329099983,
+     "client_encode": 11.914930000901222,
+     "preprocess": 32.16,
+     "towers": 10328.59,
+     "text": 389.74,
+     "tokens": 1124,
+     "stages": {
+      "base64": 0.78,
+      "decode": 30.29,
+      "resize": 1.09,
+      "vision": 10328.59,
+      "finish": 389.74
+     },
+     "inference": 10718.33
+    },
+    {
+     "total": 10774.945357993245,
+     "client_encode": 11.914930000901222,
+     "preprocess": 29.57,
+     "towers": 10351.72,
+     "text": 390.63,
+     "tokens": 1124,
+     "stages": {
+      "base64": 0.8,
+      "decode": 27.66,
+      "resize": 1.11,
+      "vision": 10351.72,
+      "finish": 390.63
+     },
+     "inference": 10742.349999999999
+    },
+    {
+     "total": 10897.224895000458,
+     "client_encode": 11.914930000901222,
+     "preprocess": 30.09,
+     "towers": 10471.34,
+     "text": 392.73,
+     "tokens": 1124,
+     "stages": {
+      "base64": 0.79,
+      "decode": 27.91,
+      "resize": 1.39,
+      "vision": 10471.34,
+      "finish": 392.73
+     },
+     "inference": 10864.07
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "a5",
+   "modality": "audio",
+   "tokens": 129,
+   "expected_tokens": 129,
+   "stats": {
+    "total": {
+     "p50": 84.592619497329,
+     "p95": 85.76582409739494,
+     "mean": 84.38572719991207,
+     "min": 81.72243899852037,
+     "max": 86.01813999563456,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 0.705,
+     "p95": 0.731,
+     "mean": 0.697,
+     "min": 0.64,
+     "max": 0.74,
+     "n": 10
+    },
+    "inference": {
+     "p50": 83.255,
+     "p95": 84.36500000000001,
+     "mean": 83.03099999999999,
+     "min": 80.43,
+     "max": 84.59,
+     "n": 10
+    },
+    "towers": {
+     "p50": 53.305,
+     "p95": 54.1195,
+     "mean": 53.072,
+     "min": 51.57,
+     "max": 54.52,
+     "n": 10
+    },
+    "text": {
+     "p50": 29.98,
+     "p95": 30.691,
+     "mean": 29.958999999999996,
+     "min": 28.86,
+     "max": 30.88,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 0.5989920049905777,
+     "p95": 0.5989920049905777,
+     "mean": 0.5989920049905777,
+     "min": 0.5989920049905777,
+     "max": 0.5989920049905777,
+     "n": 10
+    },
+    "rps_single": 11.850345232327891
+   },
+   "cpu_util": 0.937094142578068,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 81.72243899852037,
+     "client_encode": 0.5989920049905777,
+     "preprocess": 0.64,
+     "towers": 51.57,
+     "text": 28.86,
+     "tokens": 129,
+     "stages": {
+      "base64": 0.05,
+      "wav": 0.11,
+      "logmel": 0.48,
+      "audio": 51.57,
+      "finish": 28.86
+     },
+     "inference": 80.43
+    },
+    {
+     "total": 84.25135000795126,
+     "client_encode": 0.5989920049905777,
+     "preprocess": 0.66,
+     "towers": 52.14,
+     "text": 30.88,
+     "tokens": 129,
+     "stages": {
+      "base64": 0.05,
+      "wav": 0.11,
+      "logmel": 0.5,
+      "audio": 52.14,
+      "finish": 30.88
+     },
+     "inference": 83.02
+    },
+    {
+     "total": 83.69204900413752,
+     "client_encode": 0.5989920049905777,
+     "preprocess": 0.71,
+     "towers": 52.46,
+     "text": 29.86,
+     "tokens": 129,
+     "stages": {
+      "base64": 0.06,
+      "wav": 0.14,
+      "logmel": 0.51,
+      "audio": 52.46,
+      "finish": 29.86
+     },
+     "inference": 82.32
+    },
+    {
+     "total": 83.59740600734949,
+     "client_encode": 0.5989920049905777,
+     "preprocess": 0.69,
+     "towers": 52.7,
+     "text": 29.53,
+     "tokens": 129,
+     "stages": {
+      "base64": 0.07,
+      "wav": 0.15,
+      "logmel": 0.47,
+      "audio": 52.7,
+      "finish": 29.53
+     },
+     "inference": 82.23
+    },
+    {
+     "total": 84.4306829944253,
+     "client_encode": 0.5989920049905777,
+     "preprocess": 0.69,
+     "towers": 53.2,
+     "text": 29.9,
+     "tokens": 129,
+     "stages": {
+      "base64": 0.07,
+      "wav": 0.15,
+      "logmel": 0.47,
+      "audio": 53.2,
+      "finish": 29.9
+     },
+     "inference": 83.1
+    },
+    {
+     "total": 86.01813999563456,
+     "client_encode": 0.5989920049905777,
+     "preprocess": 0.71,
+     "towers": 54.52,
+     "text": 30.07,
+     "tokens": 129,
+     "stages": {
+      "base64": 0.07,
+      "wav": 0.16,
+      "logmel": 0.48,
+      "audio": 54.52,
+      "finish": 30.07
+     },
+     "inference": 84.59
+    },
+    {
+     "total": 85.1251919940114,
+     "client_encode": 0.5989920049905777,
+     "preprocess": 0.74,
+     "towers": 53.61,
+     "text": 30.07,
+     "tokens": 129,
+     "stages": {
+      "base64": 0.07,
+      "wav": 0.15,
+      "logmel": 0.52,
+      "audio": 53.61,
+      "finish": 30.07
+     },
+     "inference": 83.68
+    },
+    {
+     "total": 84.7545560002327,
+     "client_encode": 0.5989920049905777,
+     "preprocess": 0.71,
+     "towers": 53.41,
+     "text": 30.03,
+     "tokens": 129,
+     "stages": {
+      "base64": 0.07,
+      "wav": 0.16,
+      "logmel": 0.48,
+      "audio": 53.41,
+      "finish": 30.03
+     },
+     "inference": 83.44
+    },
+    {
+     "total": 85.45743799954653,
+     "client_encode": 0.5989920049905777,
+     "preprocess": 0.72,
+     "towers": 53.63,
+     "text": 30.46,
+     "tokens": 129,
+     "stages": {
+      "base64": 0.07,
+      "wav": 0.16,
+      "logmel": 0.49,
+      "audio": 53.63,
+      "finish": 30.46
+     },
+     "inference": 84.09
+    },
+    {
+     "total": 84.80801899731159,
+     "client_encode": 0.5989920049905777,
+     "preprocess": 0.7,
+     "towers": 53.48,
+     "text": 29.93,
+     "tokens": 129,
+     "stages": {
+      "base64": 0.07,
+      "wav": 0.15,
+      "logmel": 0.48,
+      "audio": 53.48,
+      "finish": 29.93
+     },
+     "inference": 83.41
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "a15",
+   "modality": "audio",
+   "tokens": 379,
+   "expected_tokens": 379,
+   "stats": {
+    "total": {
+     "p50": 255.88627949729562,
+     "p95": 257.28831480108204,
+     "mean": 256.0217484988272,
+     "min": 255.11348699778318,
+     "max": 258.04723799973726,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 1.63,
+     "p95": 1.7205,
+     "mean": 1.64,
+     "min": 1.59,
+     "max": 1.77,
+     "n": 10
+    },
+    "inference": {
+     "p50": 253.215,
+     "p95": 254.6195,
+     "mean": 253.331,
+     "min": 252.32,
+     "max": 255.38,
+     "n": 10
+    },
+    "towers": {
+     "p50": 154.06,
+     "p95": 155.061,
+     "mean": 154.19,
+     "min": 153.58,
+     "max": 155.07,
+     "n": 10
+    },
+    "text": {
+     "p50": 98.965,
+     "p95": 100.7705,
+     "mean": 99.14099999999999,
+     "min": 98.18,
+     "max": 101.36,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 1.6143309995532036,
+     "p95": 1.6143309995532036,
+     "mean": 1.6143309995532036,
+     "min": 1.6143309995532036,
+     "max": 1.6143309995532036,
+     "n": 10
+    },
+    "rps_single": 3.9059181724344048
+   },
+   "cpu_util": 0.9580693340786701,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 255.11348699778318,
+     "client_encode": 1.6143309995532036,
+     "preprocess": 1.77,
+     "towers": 153.97,
+     "text": 98.35,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.2,
+      "wav": 0.32,
+      "logmel": 1.25,
+      "audio": 153.97,
+      "finish": 98.35
+     },
+     "inference": 252.32
+    },
+    {
+     "total": 256.3607420027256,
+     "client_encode": 1.6143309995532036,
+     "preprocess": 1.61,
+     "towers": 155.07,
+     "text": 98.62,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.2,
+      "wav": 0.3,
+      "logmel": 1.11,
+      "audio": 155.07,
+      "finish": 98.62
+     },
+     "inference": 253.69
+    },
+    {
+     "total": 258.04723799973726,
+     "client_encode": 1.6143309995532036,
+     "preprocess": 1.64,
+     "towers": 154.02,
+     "text": 101.36,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.22,
+      "wav": 0.29,
+      "logmel": 1.13,
+      "audio": 154.02,
+      "finish": 101.36
+     },
+     "inference": 255.38
+    },
+    {
+     "total": 255.9670529961586,
+     "client_encode": 1.6143309995532036,
+     "preprocess": 1.59,
+     "towers": 153.85,
+     "text": 99.46,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.2,
+      "wav": 0.28,
+      "logmel": 1.11,
+      "audio": 153.85,
+      "finish": 99.46
+     },
+     "inference": 253.31
+    },
+    {
+     "total": 255.78701499849558,
+     "client_encode": 1.6143309995532036,
+     "preprocess": 1.66,
+     "towers": 154.11,
+     "text": 98.96,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.21,
+      "wav": 0.3,
+      "logmel": 1.15,
+      "audio": 154.11,
+      "finish": 98.96
+     },
+     "inference": 253.07
+    },
+    {
+     "total": 255.87541999667883,
+     "client_encode": 1.6143309995532036,
+     "preprocess": 1.61,
+     "towers": 155.05,
+     "text": 98.18,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.2,
+      "wav": 0.29,
+      "logmel": 1.12,
+      "audio": 155.05,
+      "finish": 98.18
+     },
+     "inference": 253.23000000000002
+    },
+    {
+     "total": 255.8971389979124,
+     "client_encode": 1.6143309995532036,
+     "preprocess": 1.6199999999999999,
+     "towers": 154.23,
+     "text": 98.97,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.2,
+      "wav": 0.29,
+      "logmel": 1.13,
+      "audio": 154.23,
+      "finish": 98.97
+     },
+     "inference": 253.2
+    },
+    {
+     "total": 256.35613299906254,
+     "client_encode": 1.6143309995532036,
+     "preprocess": 1.64,
+     "towers": 153.58,
+     "text": 100.05,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.2,
+      "wav": 0.29,
+      "logmel": 1.15,
+      "audio": 153.58,
+      "finish": 100.05
+     },
+     "inference": 253.63
+    },
+    {
+     "total": 255.66277799755335,
+     "client_encode": 1.6143309995532036,
+     "preprocess": 1.61,
+     "towers": 153.92,
+     "text": 99.08,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.21,
+      "wav": 0.28,
+      "logmel": 1.12,
+      "audio": 153.92,
+      "finish": 99.08
+     },
+     "inference": 253.0
+    },
+    {
+     "total": 255.15048000216484,
+     "client_encode": 1.6143309995532036,
+     "preprocess": 1.65,
+     "towers": 154.1,
+     "text": 98.38,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.23,
+      "wav": 0.28,
+      "logmel": 1.14,
+      "audio": 154.1,
+      "finish": 98.38
+     },
+     "inference": 252.48
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "a30",
+   "modality": "audio",
+   "tokens": 754,
+   "expected_tokens": 754,
+   "stats": {
+    "total": {
+     "p50": 576.6470949947834,
+     "p95": 607.5785709489137,
+     "mean": 574.4079650007188,
+     "min": 549.6512460038066,
+     "max": 613.6706029996276,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 2.985,
+     "p95": 3.469,
+     "mean": 3.1,
+     "min": 2.88,
+     "max": 3.55,
+     "n": 10
+    },
+    "inference": {
+     "p50": 571.73,
+     "p95": 602.291,
+     "mean": 569.495,
+     "min": 545.06,
+     "max": 608.51,
+     "n": 10
+    },
+    "towers": {
+     "p50": 311.22,
+     "p95": 347.96649999999994,
+     "mean": 319.413,
+     "min": 306.3,
+     "max": 358.15,
+     "n": 10
+    },
+    "text": {
+     "p50": 246.13,
+     "p95": 265.796,
+     "mean": 250.08200000000002,
+     "min": 238.76,
+     "max": 267.74,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 6.355785995721817,
+     "p95": 6.355785995721817,
+     "mean": 6.355785995721817,
+     "min": 6.355785995721817,
+     "max": 6.355785995721817,
+     "n": 10
+    },
+    "rps_single": 1.740922934449122
+   },
+   "cpu_util": 0.9542827785600422,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 549.6512460038066,
+     "client_encode": 6.355785995721817,
+     "preprocess": 2.9,
+     "towers": 306.3,
+     "text": 238.76,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.41,
+      "wav": 0.47,
+      "logmel": 2.02,
+      "audio": 306.3,
+      "finish": 238.76
+     },
+     "inference": 545.06
+    },
+    {
+     "total": 550.4332640096545,
+     "client_encode": 6.355785995721817,
+     "preprocess": 2.94,
+     "towers": 306.38,
+     "text": 239.33,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.4,
+      "wav": 0.49,
+      "logmel": 2.05,
+      "audio": 306.38,
+      "finish": 239.33
+     },
+     "inference": 545.71
+    },
+    {
+     "total": 551.7610789984465,
+     "client_encode": 6.355785995721817,
+     "preprocess": 2.88,
+     "towers": 306.42,
+     "text": 240.72,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.4,
+      "wav": 0.48,
+      "logmel": 2.0,
+      "audio": 306.42,
+      "finish": 240.72
+     },
+     "inference": 547.14
+    },
+    {
+     "total": 579.7373839914799,
+     "client_encode": 6.355785995721817,
+     "preprocess": 2.9899999999999998,
+     "towers": 307.19,
+     "text": 267.74,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.4,
+      "wav": 0.48,
+      "logmel": 2.11,
+      "audio": 307.19,
+      "finish": 267.74
+     },
+     "inference": 574.9300000000001
+    },
+    {
+     "total": 600.1327539980412,
+     "client_encode": 6.355785995721817,
+     "preprocess": 3.55,
+     "towers": 335.52,
+     "text": 259.17,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.46,
+      "wav": 0.56,
+      "logmel": 2.53,
+      "audio": 335.52,
+      "finish": 259.17
+     },
+     "inference": 594.69
+    },
+    {
+     "total": 589.596537001431,
+     "client_encode": 6.355785995721817,
+     "preprocess": 3.37,
+     "towers": 325.1,
+     "text": 259.28,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.43,
+      "wav": 0.53,
+      "logmel": 2.41,
+      "audio": 325.1,
+      "finish": 259.28
+     },
+     "inference": 584.38
+    },
+    {
+     "total": 613.6706029996276,
+     "client_encode": 6.355785995721817,
+     "preprocess": 3.31,
+     "towers": 358.15,
+     "text": 250.36,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.42,
+      "wav": 0.52,
+      "logmel": 2.37,
+      "audio": 358.15,
+      "finish": 250.36
+     },
+     "inference": 608.51
+    },
+    {
+     "total": 552.3325750082731,
+     "client_encode": 6.355785995721817,
+     "preprocess": 2.9499999999999997,
+     "towers": 307.42,
+     "text": 240.14,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.4,
+      "wav": 0.48,
+      "logmel": 2.07,
+      "audio": 307.42,
+      "finish": 240.14
+     },
+     "inference": 547.56
+    },
+    {
+     "total": 583.2074019983411,
+     "client_encode": 6.355785995721817,
+     "preprocess": 2.98,
+     "towers": 315.02,
+     "text": 263.42,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.42,
+      "wav": 0.48,
+      "logmel": 2.08,
+      "audio": 315.02,
+      "finish": 263.42
+     },
+     "inference": 578.44
+    },
+    {
+     "total": 573.5568059980869,
+     "client_encode": 6.355785995721817,
+     "preprocess": 3.1300000000000003,
+     "towers": 326.63,
+     "text": 241.9,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.41,
+      "wav": 0.5,
+      "logmel": 2.22,
+      "audio": 326.63,
+      "finish": 241.9
+     },
+     "inference": 568.53
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "v4",
+   "modality": "video",
+   "tokens": 570,
+   "expected_tokens": 570,
+   "stats": {
+    "total": {
+     "p50": 1566.787278495729,
+     "p95": 1666.9090261526405,
+     "mean": 1587.6799337983132,
+     "min": 1564.1521410048008,
+     "max": 1671.5908950045705,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "inference": {
+     "p50": 169.56,
+     "p95": 178.75799999999998,
+     "mean": 171.06,
+     "min": 168.32,
+     "max": 179.01,
+     "n": 10
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "text": {
+     "p50": 169.56,
+     "p95": 178.75799999999998,
+     "mean": 171.06,
+     "min": 168.32,
+     "max": 179.01,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 6.520304001867771,
+     "p95": 6.520304001867771,
+     "mean": 6.520304001867771,
+     "min": 6.520304001867771,
+     "max": 6.520304001867771,
+     "n": 10
+    },
+    "rps_single": 0.6298498700601657
+   },
+   "cpu_util": 0.9830074660368658,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 1565.0731089934707,
+     "client_encode": 6.520304001867771,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 169.78,
+     "tokens": 570,
+     "stages": {
+      "finish": 169.78
+     },
+     "inference": 169.78
+    },
+    {
+     "total": 1575.1676129996777,
+     "client_encode": 6.520304001867771,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 169.42,
+     "tokens": 570,
+     "stages": {
+      "finish": 169.42
+     },
+     "inference": 169.42
+    },
+    {
+     "total": 1564.9469619989395,
+     "client_encode": 6.520304001867771,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 168.63,
+     "tokens": 570,
+     "stages": {
+      "finish": 168.63
+     },
+     "inference": 168.63
+    },
+    {
+     "total": 1566.0987809970975,
+     "client_encode": 6.520304001867771,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 168.32,
+     "tokens": 570,
+     "stages": {
+      "finish": 168.32
+     },
+     "inference": 168.32
+    },
+    {
+     "total": 1564.1521410048008,
+     "client_encode": 6.520304001867771,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 168.91,
+     "tokens": 570,
+     "stages": {
+      "finish": 168.91
+     },
+     "inference": 168.91
+    },
+    {
+     "total": 1565.9048819988966,
+     "client_encode": 6.520304001867771,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 168.56,
+     "tokens": 570,
+     "stages": {
+      "finish": 168.56
+     },
+     "inference": 168.56
+    },
+    {
+     "total": 1567.4757759943604,
+     "client_encode": 6.520304001867771,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 169.7,
+     "tokens": 570,
+     "stages": {
+      "finish": 169.7
+     },
+     "inference": 169.7
+    },
+    {
+     "total": 1575.202436991036,
+     "client_encode": 6.520304001867771,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 169.82,
+     "tokens": 570,
+     "stages": {
+      "finish": 169.82
+     },
+     "inference": 169.82
+    },
+    {
+     "total": 1671.5908950045705,
+     "client_encode": 6.520304001867771,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 179.01,
+     "tokens": 570,
+     "stages": {
+      "finish": 179.01
+     },
+     "inference": 179.01
+    },
+    {
+     "total": 1661.1867420002818,
+     "client_encode": 6.520304001867771,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 178.45,
+     "tokens": 570,
+     "stages": {
+      "finish": 178.45
+     },
+     "inference": 178.45
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "v8",
+   "modality": "video",
+   "tokens": 1138,
+   "expected_tokens": 1138,
+   "stats": {
+    "total": {
+     "p50": 3210.6979335024953,
+     "p95": 3613.868515400961,
+     "mean": 3291.2572837010025,
+     "min": 3205.701834999025,
+     "max": 3633.918521001935,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "inference": {
+     "p50": 403.135,
+     "p95": 442.92749999999995,
+     "mean": 410.174,
+     "min": 401.04,
+     "max": 473.55,
+     "n": 10
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "text": {
+     "p50": 403.135,
+     "p95": 442.92749999999995,
+     "mean": 410.174,
+     "min": 401.04,
+     "max": 473.55,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 21.40454399585724,
+     "p95": 21.40454399585724,
+     "mean": 21.40454399585724,
+     "min": 21.40454399585724,
+     "max": 21.40454399585724,
+     "n": 10
+    },
+    "rps_single": 0.3038352561959255
+   },
+   "cpu_util": 0.9818490632521508,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 3633.918521001935,
+     "client_encode": 21.40454399585724,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 473.55,
+     "tokens": 1138,
+     "stages": {
+      "finish": 473.55
+     },
+     "inference": 473.55
+    },
+    {
+     "total": 3589.3629529997706,
+     "client_encode": 21.40454399585724,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 401.04,
+     "tokens": 1138,
+     "stages": {
+      "finish": 401.04
+     },
+     "inference": 401.04
+    },
+    {
+     "total": 3217.079366005957,
+     "client_encode": 21.40454399585724,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 403.15,
+     "tokens": 1138,
+     "stages": {
+      "finish": 403.15
+     },
+     "inference": 403.15
+    },
+    {
+     "total": 3209.874402999878,
+     "client_encode": 21.40454399585724,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 405.5,
+     "tokens": 1138,
+     "stages": {
+      "finish": 405.5
+     },
+     "inference": 405.5
+    },
+    {
+     "total": 3210.704800002277,
+     "client_encode": 21.40454399585724,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 401.99,
+     "tokens": 1138,
+     "stages": {
+      "finish": 401.99
+     },
+     "inference": 401.99
+    },
+    {
+     "total": 3205.701834999025,
+     "client_encode": 21.40454399585724,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 401.53,
+     "tokens": 1138,
+     "stages": {
+      "finish": 401.53
+     },
+     "inference": 401.53
+    },
+    {
+     "total": 3206.21332000196,
+     "client_encode": 21.40454399585724,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 403.12,
+     "tokens": 1138,
+     "stages": {
+      "finish": 403.12
+     },
+     "inference": 403.12
+    },
+    {
+     "total": 3210.6910670027137,
+     "client_encode": 21.40454399585724,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 401.88,
+     "tokens": 1138,
+     "stages": {
+      "finish": 401.88
+     },
+     "inference": 401.88
+    },
+    {
+     "total": 3209.279197998345,
+     "client_encode": 21.40454399585724,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 405.44,
+     "tokens": 1138,
+     "stages": {
+      "finish": 405.44
+     },
+     "inference": 405.44
+    },
+    {
+     "total": 3219.747373998165,
+     "client_encode": 21.40454399585724,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 404.54,
+     "tokens": 1138,
+     "stages": {
+      "finish": 404.54
+     },
+     "inference": 404.54
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "v16",
+   "modality": "video",
+   "tokens": 2274,
+   "expected_tokens": 2274,
+   "stats": {
+    "total": {
+     "p50": 6593.483382999897,
+     "p95": 6605.028990001976,
+     "mean": 6590.7891797989605,
+     "min": 6569.825009994209,
+     "max": 6605.55494300276,
+     "n": 5
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 5
+    },
+    "inference": {
+     "p50": 967.27,
+     "p95": 969.988,
+     "mean": 966.698,
+     "min": 962.69,
+     "max": 970.37,
+     "n": 5
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 5
+    },
+    "text": {
+     "p50": 967.27,
+     "p95": 969.988,
+     "mean": 966.698,
+     "min": 962.69,
+     "max": 970.37,
+     "n": 5
+    },
+    "client_encode": {
+     "p50": 40.728821992874146,
+     "p95": 40.728821992874146,
+     "mean": 40.728821992874146,
+     "min": 40.728821992874146,
+     "max": 40.728821992874146,
+     "n": 5
+    },
+    "rps_single": 0.151726898360676
+   },
+   "cpu_util": 0.9902676410989605,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 6569.825009994209,
+     "client_encode": 40.728821992874146,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 967.27,
+     "tokens": 2274,
+     "stages": {
+      "finish": 967.27
+     },
+     "inference": 967.27
+    },
+    {
+     "total": 6602.925177998841,
+     "client_encode": 40.728821992874146,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 970.37,
+     "tokens": 2274,
+     "stages": {
+      "finish": 970.37
+     },
+     "inference": 970.37
+    },
+    {
+     "total": 6593.483382999897,
+     "client_encode": 40.728821992874146,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 962.69,
+     "tokens": 2274,
+     "stages": {
+      "finish": 962.69
+     },
+     "inference": 962.69
+    },
+    {
+     "total": 6582.157384999096,
+     "client_encode": 40.728821992874146,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 964.7,
+     "tokens": 2274,
+     "stages": {
+      "finish": 964.7
+     },
+     "inference": 964.7
+    },
+    {
+     "total": 6605.55494300276,
+     "client_encode": 40.728821992874146,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 968.46,
+     "tokens": 2274,
+     "stages": {
+      "finish": 968.46
+     },
+     "inference": 968.46
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "m_ti",
+   "modality": "mixed",
+   "tokens": 314,
+   "expected_tokens": 314,
+   "stats": {
+    "total": {
+     "p50": 1064.819023501128,
+     "p95": 1067.4965071514248,
+     "mean": 1064.703167400509,
+     "min": 1061.149388000369,
+     "max": 1067.8636410012841,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 9.87,
+     "p95": 9.967500000000001,
+     "mean": 9.806000000000001,
+     "min": 9.35,
+     "max": 9.99,
+     "n": 10
+    },
+    "inference": {
+     "p50": 1053.5749999999998,
+     "p95": 1056.1865,
+     "mean": 1053.4940000000001,
+     "min": 1049.96,
+     "max": 1056.56,
+     "n": 10
+    },
+    "towers": {
+     "p50": 972.365,
+     "p95": 975.349,
+     "mean": 972.5540000000001,
+     "min": 969.17,
+     "max": 975.7,
+     "n": 10
+    },
+    "text": {
+     "p50": 80.565,
+     "p95": 83.417,
+     "mean": 80.94,
+     "min": 79.81,
+     "max": 85.55,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 2.4999520033597946,
+     "p95": 2.4999520033597946,
+     "mean": 2.4999520033597946,
+     "min": 2.4999520033597946,
+     "max": 2.4999520033597946,
+     "n": 10
+    },
+    "rps_single": 0.9392289143287862
+   },
+   "cpu_util": 0.9792423992267821,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 1063.8703840002418,
+     "client_encode": 2.4999520033597946,
+     "preprocess": 9.940000000000001,
+     "towers": 972.76,
+     "text": 79.81,
+     "tokens": 314,
+     "stages": {
+      "base64": 0.33,
+      "decode": 9.3,
+      "resize": 0.31,
+      "vision": 972.76,
+      "finish": 79.81
+     },
+     "inference": 1052.57
+    },
+    {
+     "total": 1067.8636410012841,
+     "client_encode": 2.4999520033597946,
+     "preprocess": 9.99,
+     "towers": 971.01,
+     "text": 85.55,
+     "tokens": 314,
+     "stages": {
+      "base64": 0.31,
+      "decode": 9.41,
+      "resize": 0.27,
+      "vision": 971.01,
+      "finish": 85.55
+     },
+     "inference": 1056.56
+    },
+    {
+     "total": 1061.149388000369,
+     "client_encode": 2.4999520033597946,
+     "preprocess": 9.790000000000001,
+     "towers": 969.17,
+     "text": 80.79,
+     "tokens": 314,
+     "stages": {
+      "base64": 0.31,
+      "decode": 9.21,
+      "resize": 0.27,
+      "vision": 969.17,
+      "finish": 80.79
+     },
+     "inference": 1049.96
+    },
+    {
+     "total": 1063.4922640025616,
+     "client_encode": 2.4999520033597946,
+     "preprocess": 9.89,
+     "towers": 971.97,
+     "text": 80.22,
+     "tokens": 314,
+     "stages": {
+      "base64": 0.31,
+      "decode": 9.3,
+      "resize": 0.28,
+      "vision": 971.97,
+      "finish": 80.22
+     },
+     "inference": 1052.19
+    },
+    {
+     "total": 1065.976562000811,
+     "client_encode": 2.4999520033597946,
+     "preprocess": 9.879999999999999,
+     "towers": 974.06,
+     "text": 80.52,
+     "tokens": 314,
+     "stages": {
+      "base64": 0.32,
+      "decode": 9.27,
+      "resize": 0.29,
+      "vision": 974.06,
+      "finish": 80.52
+     },
+     "inference": 1054.58
+    },
+    {
+     "total": 1062.1154870018363,
+     "client_encode": 2.4999520033597946,
+     "preprocess": 9.86,
+     "towers": 970.5,
+     "text": 80.4,
+     "tokens": 314,
+     "stages": {
+      "base64": 0.33,
+      "decode": 9.24,
+      "resize": 0.29,
+      "vision": 970.5,
+      "finish": 80.4
+     },
+     "inference": 1050.9
+    },
+    {
+     "total": 1062.8533390015364,
+     "client_encode": 2.4999520033597946,
+     "preprocess": 9.35,
+     "towers": 971.44,
+     "text": 80.66,
+     "tokens": 314,
+     "stages": {
+      "base64": 0.33,
+      "decode": 8.76,
+      "resize": 0.26,
+      "vision": 971.44,
+      "finish": 80.66
+     },
+     "inference": 1052.1000000000001
+    },
+    {
+     "total": 1067.047788001597,
+     "client_encode": 2.4999520033597946,
+     "preprocess": 9.92,
+     "towers": 974.92,
+     "text": 80.81,
+     "tokens": 314,
+     "stages": {
+      "base64": 0.32,
+      "decode": 9.31,
+      "resize": 0.29,
+      "vision": 974.92,
+      "finish": 80.81
+     },
+     "inference": 1055.73
+    },
+    {
+     "total": 1066.8951579928398,
+     "client_encode": 2.4999520033597946,
+     "preprocess": 9.74,
+     "towers": 975.7,
+     "text": 80.03,
+     "tokens": 314,
+     "stages": {
+      "base64": 0.34,
+      "decode": 9.13,
+      "resize": 0.27,
+      "vision": 975.7,
+      "finish": 80.03
+     },
+     "inference": 1055.73
+    },
+    {
+     "total": 1065.7676630020142,
+     "client_encode": 2.4999520033597946,
+     "preprocess": 9.700000000000001,
+     "towers": 974.01,
+     "text": 80.61,
+     "tokens": 314,
+     "stages": {
+      "base64": 0.3,
+      "decode": 9.13,
+      "resize": 0.27,
+      "vision": 974.01,
+      "finish": 80.61
+     },
+     "inference": 1054.62
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "m_ta",
+   "modality": "mixed",
+   "tokens": 409,
+   "expected_tokens": 409,
+   "stats": {
+    "total": {
+     "p50": 272.11514800041914,
+     "p95": 272.8797266483307,
+     "mean": 272.0120545014739,
+     "min": 270.3654790073633,
+     "max": 272.93784099817276,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 1.635,
+     "p95": 1.7525,
+     "mean": 1.6510000000000002,
+     "min": 1.6,
+     "max": 1.82,
+     "n": 10
+    },
+    "inference": {
+     "p50": 269.25,
+     "p95": 270.1,
+     "mean": 269.228,
+     "min": 267.67,
+     "max": 270.19,
+     "n": 10
+    },
+    "towers": {
+     "p50": 156.01,
+     "p95": 156.5635,
+     "mean": 156.001,
+     "min": 155.43,
+     "max": 156.73,
+     "n": 10
+    },
+    "text": {
+     "p50": 113.2,
+     "p95": 113.8105,
+     "mean": 113.227,
+     "min": 112.24,
+     "max": 113.95,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 1.747248999774456,
+     "p95": 1.747248999774456,
+     "mean": 1.747248999774456,
+     "min": 1.747248999774456,
+     "max": 1.747248999774456,
+     "n": 10
+    },
+    "rps_single": 3.6763076615583645
+   },
+   "cpu_util": 0.9527178792698399,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 272.1690169945359,
+     "client_encode": 1.747248999774456,
+     "preprocess": 1.61,
+     "towers": 156.26,
+     "text": 113.14,
+     "tokens": 409,
+     "stages": {
+      "base64": 0.2,
+      "wav": 0.29,
+      "logmel": 1.12,
+      "audio": 156.26,
+      "finish": 113.14
+     },
+     "inference": 269.4
+    },
+    {
+     "total": 272.14051999896765,
+     "client_encode": 1.747248999774456,
+     "preprocess": 1.65,
+     "towers": 156.36,
+     "text": 113.08,
+     "tokens": 409,
+     "stages": {
+      "base64": 0.23,
+      "wav": 0.29,
+      "logmel": 1.13,
+      "audio": 156.36,
+      "finish": 113.08
+     },
+     "inference": 269.44
+    },
+    {
+     "total": 272.8086979985237,
+     "client_encode": 1.747248999774456,
+     "preprocess": 1.64,
+     "towers": 156.73,
+     "text": 113.26,
+     "tokens": 409,
+     "stages": {
+      "base64": 0.21,
+      "wav": 0.29,
+      "logmel": 1.14,
+      "audio": 156.73,
+      "finish": 113.26
+     },
+     "inference": 269.99
+    },
+    {
+     "total": 271.9737320020795,
+     "client_encode": 1.747248999774456,
+     "preprocess": 1.63,
+     "towers": 155.53,
+     "text": 113.64,
+     "tokens": 409,
+     "stages": {
+      "base64": 0.21,
+      "wav": 0.29,
+      "logmel": 1.13,
+      "audio": 155.53,
+      "finish": 113.64
+     },
+     "inference": 269.17
+    },
+    {
+     "total": 272.93784099817276,
+     "client_encode": 1.747248999774456,
+     "preprocess": 1.6,
+     "towers": 156.24,
+     "text": 113.95,
+     "tokens": 409,
+     "stages": {
+      "base64": 0.2,
+      "wav": 0.28,
+      "logmel": 1.12,
+      "audio": 156.24,
+      "finish": 113.95
+     },
+     "inference": 270.19
+    },
+    {
+     "total": 272.08977600187063,
+     "client_encode": 1.747248999774456,
+     "preprocess": 1.67,
+     "towers": 155.78,
+     "text": 113.48,
+     "tokens": 409,
+     "stages": {
+      "base64": 0.21,
+      "wav": 0.29,
+      "logmel": 1.17,
+      "audio": 155.78,
+      "finish": 113.48
+     },
+     "inference": 269.26
+    },
+    {
+     "total": 271.8583790063858,
+     "client_encode": 1.747248999774456,
+     "preprocess": 1.6300000000000001,
+     "towers": 155.61,
+     "text": 113.51,
+     "tokens": 409,
+     "stages": {
+      "base64": 0.22,
+      "wav": 0.29,
+      "logmel": 1.12,
+      "audio": 155.61,
+      "finish": 113.51
+     },
+     "inference": 269.12
+    },
+    {
+     "total": 272.2056920081377,
+     "client_encode": 1.747248999774456,
+     "preprocess": 1.82,
+     "towers": 156.3,
+     "text": 112.94,
+     "tokens": 409,
+     "stages": {
+      "base64": 0.22,
+      "wav": 0.3,
+      "logmel": 1.3,
+      "audio": 156.3,
+      "finish": 112.94
+     },
+     "inference": 269.24
+    },
+    {
+     "total": 271.57141099870205,
+     "client_encode": 1.747248999774456,
+     "preprocess": 1.64,
+     "towers": 155.77,
+     "text": 113.03,
+     "tokens": 409,
+     "stages": {
+      "base64": 0.21,
+      "wav": 0.29,
+      "logmel": 1.14,
+      "audio": 155.77,
+      "finish": 113.03
+     },
+     "inference": 268.8
+    },
+    {
+     "total": 270.3654790073633,
+     "client_encode": 1.747248999774456,
+     "preprocess": 1.62,
+     "towers": 155.43,
+     "text": 112.24,
+     "tokens": 409,
+     "stages": {
+      "base64": 0.23,
+      "wav": 0.28,
+      "logmel": 1.11,
+      "audio": 155.43,
+      "finish": 112.24
+     },
+     "inference": 267.67
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "m_tia",
+   "modality": "mixed",
+   "tokens": 691,
+   "expected_tokens": 691,
+   "stats": {
+    "total": {
+     "p50": 1359.6598529964685,
+     "p95": 1365.2313606034963,
+     "mean": 1360.2949976995587,
+     "min": 1356.3848519995809,
+     "max": 1366.379163004458,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 11.67,
+     "p95": 11.960999999999999,
+     "mean": 11.651,
+     "min": 11.17,
+     "max": 12.149999999999999,
+     "n": 10
+    },
+    "inference": {
+     "p50": 1345.92,
+     "p95": 1351.499,
+     "mean": 1346.604,
+     "min": 1343.26,
+     "max": 1352.66,
+     "n": 10
+    },
+    "towers": {
+     "p50": 1127.92,
+     "p95": 1132.242,
+     "mean": 1128.387,
+     "min": 1125.59,
+     "max": 1132.26,
+     "n": 10
+    },
+    "text": {
+     "p50": 218.0,
+     "p95": 219.725,
+     "mean": 218.217,
+     "min": 217.2,
+     "max": 220.4,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 4.205095008015633,
+     "p95": 4.205095008015633,
+     "mean": 4.205095008015633,
+     "min": 4.205095008015633,
+     "max": 4.205095008015633,
+     "n": 10
+    },
+    "rps_single": 0.7351346595342437
+   },
+   "cpu_util": 0.9764405518713101,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 1356.3848519995809,
+     "client_encode": 4.205095008015633,
+     "preprocess": 11.17,
+     "towers": 1125.76,
+     "text": 217.5,
+     "tokens": 691,
+     "stages": {
+      "base64": 0.53,
+      "decode": 8.79,
+      "resize": 0.29,
+      "vision": 968.84,
+      "wav": 0.33,
+      "logmel": 1.23,
+      "audio": 156.92,
+      "finish": 217.5
+     },
+     "inference": 1343.26
+    },
+    {
+     "total": 1361.5117529928684,
+     "client_encode": 4.205095008015633,
+     "preprocess": 11.56,
+     "towers": 1129.6,
+     "text": 218.21,
+     "tokens": 691,
+     "stages": {
+      "base64": 0.55,
+      "decode": 9.07,
+      "resize": 0.26,
+      "vision": 973.37,
+      "wav": 0.32,
+      "logmel": 1.36,
+      "audio": 156.23,
+      "finish": 218.21
+     },
+     "inference": 1347.81
+    },
+    {
+     "total": 1366.379163004458,
+     "client_encode": 4.205095008015633,
+     "preprocess": 11.67,
+     "towers": 1132.26,
+     "text": 220.4,
+     "tokens": 691,
+     "stages": {
+      "base64": 0.52,
+      "decode": 9.08,
+      "resize": 0.27,
+      "vision": 975.26,
+      "wav": 0.36,
+      "logmel": 1.44,
+      "audio": 157.0,
+      "finish": 220.4
+     },
+     "inference": 1352.66
+    },
+    {
+     "total": 1357.5749120041728,
+     "client_encode": 4.205095008015633,
+     "preprocess": 11.629999999999999,
+     "towers": 1126.79,
+     "text": 217.2,
+     "tokens": 691,
+     "stages": {
+      "base64": 0.55,
+      "decode": 9.29,
+      "resize": 0.24,
+      "vision": 970.12,
+      "wav": 0.32,
+      "logmel": 1.23,
+      "audio": 156.67,
+      "finish": 217.2
+     },
+     "inference": 1343.99
+    },
+    {
+     "total": 1360.3409859985113,
+     "client_encode": 4.205095008015633,
+     "preprocess": 11.700000000000001,
+     "towers": 1128.73,
+     "text": 217.9,
+     "tokens": 691,
+     "stages": {
+      "base64": 0.56,
+      "decode": 9.32,
+      "resize": 0.28,
+      "vision": 972.19,
+      "wav": 0.31,
+      "logmel": 1.23,
+      "audio": 156.54,
+      "finish": 217.9
+     },
+     "inference": 1346.63
+    },
+    {
+     "total": 1358.758045002818,
+     "client_encode": 4.205095008015633,
+     "preprocess": 12.149999999999999,
+     "towers": 1125.86,
+     "text": 218.68,
+     "tokens": 691,
+     "stages": {
+      "base64": 0.54,
+      "decode": 9.79,
+      "resize": 0.26,
+      "vision": 969.55,
+      "wav": 0.33,
+      "logmel": 1.23,
+      "audio": 156.31,
+      "finish": 218.68
+     },
+     "inference": 1344.54
+    },
+    {
+     "total": 1358.1483609974384,
+     "client_encode": 4.205095008015633,
+     "preprocess": 11.55,
+     "towers": 1125.59,
+     "text": 218.9,
+     "tokens": 691,
+     "stages": {
+      "base64": 0.53,
+      "decode": 9.23,
+      "resize": 0.27,
+      "vision": 969.17,
+      "wav": 0.32,
+      "logmel": 1.2,
+      "audio": 156.42,
+      "finish": 218.9
+     },
+     "inference": 1344.49
+    },
+    {
+     "total": 1361.0446939989924,
+     "client_encode": 4.205095008015633,
+     "preprocess": 11.680000000000001,
+     "towers": 1129.95,
+     "text": 217.42,
+     "tokens": 691,
+     "stages": {
+      "base64": 0.53,
+      "decode": 9.21,
+      "resize": 0.26,
+      "vision": 972.9,
+      "wav": 0.35,
+      "logmel": 1.33,
+      "audio": 157.05,
+      "finish": 217.42
+     },
+     "inference": 1347.3700000000001
+    },
+    {
+     "total": 1358.9787199944258,
+     "client_encode": 4.205095008015633,
+     "preprocess": 11.67,
+     "towers": 1127.1100000000001,
+     "text": 218.1,
+     "tokens": 691,
+     "stages": {
+      "base64": 0.5700000000000001,
+      "decode": 9.15,
+      "resize": 0.27,
+      "vision": 970.2,
+      "wav": 0.31,
+      "logmel": 1.37,
+      "audio": 156.91,
+      "finish": 218.1
+     },
+     "inference": 1345.21
+    },
+    {
+     "total": 1363.8284910023212,
+     "client_encode": 4.205095008015633,
+     "preprocess": 11.73,
+     "towers": 1132.22,
+     "text": 217.86,
+     "tokens": 691,
+     "stages": {
+      "base64": 0.55,
+      "decode": 9.38,
+      "resize": 0.28,
+      "vision": 975.72,
+      "wav": 0.31,
+      "logmel": 1.21,
+      "audio": 156.5,
+      "finish": 217.86
+     },
+     "inference": 1350.08
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "m_tv",
+   "modality": "mixed",
+   "tokens": 1168,
+   "expected_tokens": 1168,
+   "stats": {
+    "total": {
+     "p50": 3236.8451470024884,
+     "p95": 3343.0252973478287,
+     "mean": 3255.9234097003937,
+     "min": 3227.2081220000982,
+     "max": 3399.975783996284,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "inference": {
+     "p50": 415.72,
+     "p95": 430.655,
+     "mean": 418.316,
+     "min": 413.68,
+     "max": 441.23,
+     "n": 10
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "text": {
+     "p50": 415.72,
+     "p95": 430.655,
+     "mean": 418.316,
+     "min": 413.68,
+     "max": 441.23,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 12.143311001360416,
+     "p95": 12.143311001360416,
+     "mean": 12.143311001360416,
+     "min": 12.143311001360416,
+     "max": 12.143311001360416,
+     "n": 10
+    },
+    "rps_single": 0.3071325317483493
+   },
+   "cpu_util": 0.984971978095403,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 3237.911604002118,
+     "client_encode": 12.143311001360416,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 413.68,
+     "tokens": 1168,
+     "stages": {
+      "finish": 413.68
+     },
+     "inference": 413.68
+    },
+    {
+     "total": 3235.416207998991,
+     "client_encode": 12.143311001360416,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 416.94,
+     "tokens": 1168,
+     "stages": {
+      "finish": 416.94
+     },
+     "inference": 416.94
+    },
+    {
+     "total": 3227.2081220000982,
+     "client_encode": 12.143311001360416,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 415.3,
+     "tokens": 1168,
+     "stages": {
+      "finish": 415.3
+     },
+     "inference": 415.3
+    },
+    {
+     "total": 3235.7786900028586,
+     "client_encode": 12.143311001360416,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 415.49,
+     "tokens": 1168,
+     "stages": {
+      "finish": 415.49
+     },
+     "inference": 415.49
+    },
+    {
+     "total": 3238.512560002506,
+     "client_encode": 12.143311001360416,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 415.92,
+     "tokens": 1168,
+     "stages": {
+      "finish": 415.92
+     },
+     "inference": 415.92
+    },
+    {
+     "total": 3273.4191469997168,
+     "client_encode": 12.143311001360416,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 416.26,
+     "tokens": 1168,
+     "stages": {
+      "finish": 416.26
+     },
+     "inference": 416.26
+    },
+    {
+     "total": 3248.0514140054584,
+     "client_encode": 12.143311001360416,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 415.52,
+     "tokens": 1168,
+     "stages": {
+      "finish": 415.52
+     },
+     "inference": 415.52
+    },
+    {
+     "total": 3232.8152389898896,
+     "client_encode": 12.143311001360416,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 417.73,
+     "tokens": 1168,
+     "stages": {
+      "finish": 417.73
+     },
+     "inference": 417.73
+    },
+    {
+     "total": 3230.1453290060163,
+     "client_encode": 12.143311001360416,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 415.09,
+     "tokens": 1168,
+     "stages": {
+      "finish": 415.09
+     },
+     "inference": 415.09
+    },
+    {
+     "total": 3399.975783996284,
+     "client_encode": 12.143311001360416,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 441.23,
+     "tokens": 1168,
+     "stages": {
+      "finish": 441.23
+     },
+     "inference": 441.23
+    }
+   ],
+   "throughput": []
+  }
+ ]
+}

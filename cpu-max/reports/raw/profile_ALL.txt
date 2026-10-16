@@ -1,0 +1,65 @@
+# 2026-10-16T12:52:41+03:00 engine 5dd7dbf budget ALL (28 threads on 0-27)
+## vision tower (i70, i280, i1120 fixtures; 3 runs each, last lines per size)
+vision-fast patches=630 total=169.6 ms: patch=3.3 gemm_qkv=29.6 rows=11.0 attention=26.8 gemm_out=8.1 gemm_ffn=90.4 pool_proj=0.4
+vision-fast patches=630 total=115.6 ms: patch=1.0 gemm_qkv=15.0 rows=10.7 attention=26.8 gemm_out=6.9 gemm_ffn=55.2 pool_proj=0.1
+vision-fast patches=630 total=113.7 ms: patch=1.0 gemm_qkv=13.6 rows=10.1 attention=27.0 gemm_out=6.6 gemm_ffn=55.3 pool_proj=0.2
+vision-fast patches=2520 total=742.2 ms: patch=9.8 gemm_qkv=77.1 rows=35.8 attention=371.9 gemm_out=19.6 gemm_ffn=226.8 pool_proj=1.3
+vision-fast patches=2520 total=723.8 ms: patch=3.5 gemm_qkv=51.3 rows=42.1 attention=375.0 gemm_out=22.0 gemm_ffn=229.4 pool_proj=0.3
+vision-fast patches=2520 total=706.7 ms: patch=3.5 gemm_qkv=51.5 rows=34.9 attention=378.7 gemm_out=17.8 gemm_ffn=220.1 pool_proj=0.3
+vision-fast patches=10080 total=7455.2 ms: patch=37.1 gemm_qkv=307.1 rows=192.1 attention=5950.0 gemm_out=68.6 gemm_ffn=895.5 pool_proj=4.7
+vision-fast patches=10080 total=7450.6 ms: patch=13.2 gemm_qkv=210.5 rows=194.1 attention=6053.6 gemm_out=67.0 gemm_ffn=908.4 pool_proj=4.0
+vision-fast patches=10080 total=7544.8 ms: patch=15.6 gemm_qkv=222.4 rows=193.4 attention=6133.4 gemm_out=68.4 gemm_ffn=910.8 pool_proj=0.9
+{"input":"bench/fixtures/image/i70_0.png","tokens":70,"fast_ms":116.36}
+{"input":"bench/fixtures/image/i280_0.png","tokens":280,"fast_ms":726.65}
+{"input":"bench/fixtures/image/i1120_0.png","tokens":1120,"fast_ms":7471.26}
+## audio tower (synthetic mel: 96, 499, 1499 frames)
+audio-fast frames=96 tokens=24 total=56.1 ms: subsample=1.0 gemm=48.7 rows=5.5 attention=0.9
+audio-fast frames=96 tokens=24 total=17.6 ms: subsample=0.6 gemm=10.8 rows=5.3 attention=0.8
+audio-fast frames=96 tokens=24 total=17.4 ms: subsample=0.5 gemm=10.7 rows=5.4 attention=0.8
+audio-fast frames=499 tokens=125 total=62.4 ms: subsample=1.8 gemm=41.6 rows=17.1 attention=1.9
+audio-fast frames=499 tokens=125 total=49.4 ms: subsample=1.5 gemm=30.4 rows=15.8 attention=1.8
+audio-fast frames=499 tokens=125 total=50.0 ms: subsample=1.6 gemm=31.1 rows=15.6 attention=1.7
+audio-fast frames=1499 tokens=375 total=177.0 ms: subsample=3.7 gemm=123.6 rows=44.9 attention=4.9
+audio-fast frames=1499 tokens=375 total=143.1 ms: subsample=3.6 gemm=92.2 rows=42.7 attention=4.5
+audio-fast frames=1499 tokens=375 total=146.2 ms: subsample=3.7 gemm=91.4 rows=46.5 attention=4.5
+{"input":"synthetic-mel-96","tokens":24,"fast_ms":17.94}
+{"input":"synthetic-mel-499","tokens":125,"fast_ms":50.54}
+{"input":"synthetic-mel-1499","tokens":375,"fast_ms":146.90}
+## text graph (tokens x batch); stage lines are per forward
+gemm_q8 3.36 ms  gemm_f 0.73 ms  rows 2.03 ms  attention 0.38 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 3.73 ms  gemm_f 0.55 ms  rows 1.83 ms  attention 0.31 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 3.99 ms  gemm_f 0.48 ms  rows 1.88 ms  attention 0.31 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 3.72 ms  gemm_f 0.45 ms  rows 1.71 ms  attention 0.31 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 4.00 ms  gemm_f 0.52 ms  rows 1.74 ms  attention 0.31 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 5.99 ms  gemm_f 0.44 ms  rows 2.19 ms  attention 0.40 ms  embed 0.00 ms  pool 0.00 ms  
+28 threads
+case       reference ms      fast ms  speedup     min cosine   fast tok/s
+16x1               0.00         7.09    0.00x    1.000000000         2257
+gemm_q8 18.18 ms  gemm_f 4.35 ms  rows 3.76 ms  attention 3.55 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 18.46 ms  gemm_f 2.52 ms  rows 4.25 ms  attention 3.68 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 17.95 ms  gemm_f 2.30 ms  rows 4.06 ms  attention 3.65 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 17.96 ms  gemm_f 2.30 ms  rows 4.06 ms  attention 3.64 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 18.23 ms  gemm_f 2.39 ms  rows 4.19 ms  attention 3.69 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 18.02 ms  gemm_f 2.37 ms  rows 4.08 ms  attention 3.67 ms  embed 0.00 ms  pool 0.00 ms  
+128x1              0.00        31.02    0.00x    1.000000000         4126
+gemm_q8 78.89 ms  gemm_f 26.98 ms  rows 17.75 ms  attention 38.54 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 65.14 ms  gemm_f 5.50 ms  rows 21.58 ms  attention 38.63 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 59.36 ms  gemm_f 5.47 ms  rows 15.85 ms  attention 38.60 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 61.69 ms  gemm_f 5.45 ms  rows 15.52 ms  attention 38.27 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 63.77 ms  gemm_f 5.46 ms  rows 17.48 ms  attention 38.39 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 56.96 ms  gemm_f 5.44 ms  rows 14.24 ms  attention 38.33 ms  embed 0.00 ms  pool 0.00 ms  
+512x1              0.00       130.38    0.00x    1.000000000         3927
+gemm_q8 105.40 ms  gemm_f 40.80 ms  rows 23.90 ms  attention 73.70 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 83.05 ms  gemm_f 8.20 ms  rows 25.48 ms  attention 73.82 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 80.97 ms  gemm_f 7.87 ms  rows 18.23 ms  attention 75.07 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 83.79 ms  gemm_f 8.19 ms  rows 21.79 ms  attention 74.83 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 81.80 ms  gemm_f 8.35 ms  rows 24.19 ms  attention 74.13 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 95.21 ms  gemm_f 8.09 ms  rows 31.24 ms  attention 74.02 ms  embed 0.00 ms  pool 0.00 ms  
+754x1              0.00       204.52    0.00x    1.000000000         3687
+gemm_q8 270.59 ms  gemm_f 111.32 ms  rows 46.13 ms  attention 327.47 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 205.85 ms  gemm_f 21.18 ms  rows 40.79 ms  attention 332.99 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 208.62 ms  gemm_f 21.72 ms  rows 50.01 ms  attention 333.88 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 209.82 ms  gemm_f 21.17 ms  rows 40.57 ms  attention 335.26 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 204.19 ms  gemm_f 21.23 ms  rows 44.57 ms  attention 334.35 ms  embed 0.00 ms  pool 0.00 ms  
+gemm_q8 214.51 ms  gemm_f 21.41 ms  rows 44.21 ms  attention 335.86 ms  embed 0.00 ms  pool 0.00 ms  
+2048x1             0.00       646.91    0.00x    1.000000000         3166

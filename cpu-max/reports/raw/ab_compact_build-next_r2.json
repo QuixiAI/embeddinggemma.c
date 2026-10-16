@@ -1,0 +1,811 @@
+{
+ "backend": "ab_build-next",
+ "kind": "native",
+ "threads": 8,
+ "cpus": "P8",
+ "cpu_list": [
+  0,
+  2,
+  4,
+  6,
+  8,
+  10,
+  12,
+  14
+ ],
+ "started": "2026-10-16T09:23:42",
+ "host": "redacted",
+ "load_before": [
+  19.76416015625,
+  16.27880859375,
+  19.1962890625
+ ],
+ "load_after": [
+  17.9716796875,
+  16.25341796875,
+  19.0810546875
+ ],
+ "load_ms": 107.05368500202894,
+ "peak_rss_mb": 991.96484375,
+ "versions": {
+  "binary": "engine/build-next/embeddinggemma",
+  "cmd": [
+   "taskset",
+   "-c",
+   "0,2,4,6,8,10,12,14",
+   "engine/build-next/embeddinggemma",
+   "--bind",
+   "127.0.0.1",
+   "--port",
+   "34823",
+   "--threads",
+   "8",
+   "--model",
+   "models/gguf/embeddinggemma-2-Q8_0.gguf",
+   "--mmproj",
+   "models/gguf/mmproj-embeddinggemma-2-Q8_0.gguf",
+   "--cache-entries",
+   "0",
+   "--response-cache-mb",
+   "0",
+   "--media-cache-mb",
+   "0",
+   "--keepalive-timeout-ms",
+   "60000"
+  ],
+  "git": "2cd784b+dirty"
+ },
+ "warmup": 1,
+ "repeat": 10,
+ "argv": [
+  "bench/run_bench.py",
+  "--backend",
+  "native",
+  "--binary",
+  "engine/build-next/embeddinggemma",
+  "--name",
+  "ab_build-next",
+  "--threads",
+  "8",
+  "--cpus",
+  "P8",
+  "--items",
+  "t512,i280,a15,a30",
+  "--warmup",
+  "1",
+  "--min-repeat",
+  "5",
+  "--repeat",
+  "10",
+  "--budget-s",
+  "8",
+  "--out",
+  "reports/raw/ab_compact_build-next_r2.json"
+ ],
+ "results": [
+  {
+   "item": "t512",
+   "modality": "text",
+   "tokens": 512,
+   "expected_tokens": 512,
+   "stats": {
+    "total": {
+     "p50": 442.6890530027449,
+     "p95": 472.0296862531453,
+     "mean": 394.6984813012183,
+     "min": 209.05854399874806,
+     "max": 473.00827200338244,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 0.033810000866651535,
+     "p95": 0.033810000866651535,
+     "mean": 0.033810000866651535,
+     "min": 0.033810000866651535,
+     "max": 0.033810000866651535,
+     "n": 10
+    },
+    "rps_single": 2.533579548376421
+   },
+   "cpu_util": 0.38583147357209757,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 445.288286998868,
+     "client_encode": 0.033810000866651535,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 466.38207000121474,
+     "client_encode": 0.033810000866651535,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 439.9865039996803,
+     "client_encode": 0.033810000866651535,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 473.00827200338244,
+     "client_encode": 0.033810000866651535,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 254.96414300054312,
+     "client_encode": 0.033810000866651535,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 209.05854399874806,
+     "client_encode": 0.033810000866651535,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 281.3103570006788,
+     "client_encode": 0.033810000866651535,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 466.0631799995899,
+     "client_encode": 0.033810000866651535,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 470.83363700285554,
+     "client_encode": 0.033810000866651535,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 440.08981900662184,
+     "client_encode": 0.033810000866651535,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "i280",
+   "modality": "image",
+   "tokens": 284,
+   "expected_tokens": 284,
+   "stats": {
+    "total": {
+     "p50": 1824.2833050005138,
+     "p95": 2014.6040872000158,
+     "mean": 1702.9010780014098,
+     "min": 1344.7475210018456,
+     "max": 2024.8060219995677,
+     "n": 5
+    },
+    "preprocess": {
+     "p50": 11.47,
+     "p95": 18.976,
+     "mean": 13.320000000000002,
+     "min": 11.34,
+     "max": 20.85,
+     "n": 5
+    },
+    "inference": {
+     "p50": 1811.29,
+     "p95": 1993.686,
+     "mean": 1687.8400000000001,
+     "min": 1331.65,
+     "max": 2001.9199999999998,
+     "n": 5
+    },
+    "towers": {
+     "p50": 1553.75,
+     "p95": 1583.158,
+     "mean": 1373.8899999999999,
+     "min": 1076.24,
+     "max": 1586.34,
+     "n": 5
+    },
+    "text": {
+     "p50": 257.35,
+     "p95": 413.864,
+     "mean": 313.95,
+     "min": 240.86,
+     "max": 415.58,
+     "n": 5
+    },
+    "client_encode": {
+     "p50": 5.787782996892929,
+     "p95": 5.787782996892929,
+     "mean": 5.787782996892929,
+     "min": 5.787782996892929,
+     "max": 5.787782996892929,
+     "n": 5
+    },
+    "rps_single": 0.5872331710387068
+   },
+   "cpu_util": 0.6492265932910058,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 1346.8721940033138,
+     "client_encode": 5.787782996892929,
+     "preprocess": 11.46,
+     "towers": 1076.24,
+     "text": 257.35,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.32,
+      "decode": 10.8,
+      "resize": 0.34,
+      "vision": 1076.24,
+      "finish": 257.35
+     },
+     "inference": 1333.5900000000001
+    },
+    {
+     "total": 2024.8060219995677,
+     "client_encode": 5.787782996892929,
+     "preprocess": 20.85,
+     "towers": 1586.34,
+     "text": 415.58,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.77,
+      "decode": 19.62,
+      "resize": 0.46,
+      "vision": 1586.34,
+      "finish": 415.58
+     },
+     "inference": 2001.9199999999998
+    },
+    {
+     "total": 1824.2833050005138,
+     "client_encode": 5.787782996892929,
+     "preprocess": 11.34,
+     "towers": 1570.43,
+     "text": 240.86,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.33,
+      "decode": 10.67,
+      "resize": 0.34,
+      "vision": 1570.43,
+      "finish": 240.86
+     },
+     "inference": 1811.29
+    },
+    {
+     "total": 1344.7475210018456,
+     "client_encode": 5.787782996892929,
+     "preprocess": 11.47,
+     "towers": 1082.69,
+     "text": 248.96,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.33,
+      "decode": 10.82,
+      "resize": 0.32,
+      "vision": 1082.69,
+      "finish": 248.96
+     },
+     "inference": 1331.65
+    },
+    {
+     "total": 1973.796348001808,
+     "client_encode": 5.787782996892929,
+     "preprocess": 11.48,
+     "towers": 1553.75,
+     "text": 407.0,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.35,
+      "decode": 10.82,
+      "resize": 0.31,
+      "vision": 1553.75,
+      "finish": 407.0
+     },
+     "inference": 1960.75
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "a15",
+   "modality": "audio",
+   "tokens": 379,
+   "expected_tokens": 379,
+   "stats": {
+    "total": {
+     "p50": 735.8115100003779,
+     "p95": 794.1977451004088,
+     "mean": 631.2009049996734,
+     "min": 345.11216600239277,
+     "max": 796.6079099997878,
+     "n": 10
+    },
+    "preprocess": {
+     "p50": 11.76,
+     "p95": 21.128999999999994,
+     "mean": 13.356,
+     "min": 10.12,
+     "max": 23.37,
+     "n": 10
+    },
+    "inference": {
+     "p50": 720.025,
+     "p95": 780.199,
+     "mean": 616.251,
+     "min": 333.38,
+     "max": 783.61,
+     "n": 10
+    },
+    "towers": {
+     "p50": 340.615,
+     "p95": 378.449,
+     "mean": 312.506,
+     "min": 192.99,
+     "max": 382.49,
+     "n": 10
+    },
+    "text": {
+     "p50": 393.08000000000004,
+     "p95": 414.8795,
+     "mean": 303.745,
+     "min": 140.02,
+     "max": 418.79,
+     "n": 10
+    },
+    "client_encode": {
+     "p50": 3.8389640040695667,
+     "p95": 3.8389640040695667,
+     "mean": 3.8389640040695667,
+     "min": 3.8389640040695667,
+     "max": 3.8389640040695667,
+     "n": 10
+    },
+    "rps_single": 1.5842816321698991
+   },
+   "cpu_util": 0.43339046803804543,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 444.47296099737287,
+     "client_encode": 3.8389640040695667,
+     "preprocess": 11.149999999999999,
+     "towers": 292.09,
+     "text": 140.02,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.23,
+      "wav": 0.31,
+      "logmel": 10.61,
+      "audio": 292.09,
+      "finish": 140.02
+     },
+     "inference": 432.11
+    },
+    {
+     "total": 354.3099709972739,
+     "client_encode": 3.8389640040695667,
+     "preprocess": 10.49,
+     "towers": 197.16,
+     "text": 145.32,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.21,
+      "wav": 0.43,
+      "logmel": 9.85,
+      "audio": 197.16,
+      "finish": 145.32
+     },
+     "inference": 342.48
+    },
+    {
+     "total": 796.6079099997878,
+     "client_encode": 3.8389640040695667,
+     "preprocess": 11.75,
+     "towers": 373.51,
+     "text": 410.1,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.23,
+      "wav": 0.3,
+      "logmel": 11.22,
+      "audio": 373.51,
+      "finish": 410.1
+     },
+     "inference": 783.61
+    },
+    {
+     "total": 752.4868500009179,
+     "client_encode": 3.8389640040695667,
+     "preprocess": 18.39,
+     "towers": 339.53,
+     "text": 392.8,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.48,
+      "wav": 0.63,
+      "logmel": 17.28,
+      "audio": 339.53,
+      "finish": 392.8
+     },
+     "inference": 732.3299999999999
+    },
+    {
+     "total": 778.2128029987216,
+     "client_encode": 3.8389640040695667,
+     "preprocess": 11.77,
+     "towers": 368.74,
+     "text": 396.2,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.22,
+      "wav": 0.32,
+      "logmel": 11.23,
+      "audio": 368.74,
+      "finish": 396.2
+     },
+     "inference": 764.94
+    },
+    {
+     "total": 574.0829790011048,
+     "client_encode": 3.8389640040695667,
+     "preprocess": 23.37,
+     "towers": 341.7,
+     "text": 206.93,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.49,
+      "wav": 0.63,
+      "logmel": 22.25,
+      "audio": 341.7,
+      "finish": 206.93
+     },
+     "inference": 548.63
+    },
+    {
+     "total": 345.11216600239277,
+     "client_encode": 3.8389640040695667,
+     "preprocess": 10.42,
+     "towers": 192.99,
+     "text": 140.39,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.21,
+      "wav": 0.3,
+      "logmel": 9.91,
+      "audio": 192.99,
+      "finish": 140.39
+     },
+     "inference": 333.38
+    },
+    {
+     "total": 719.1361699998379,
+     "client_encode": 3.8389640040695667,
+     "preprocess": 10.12,
+     "towers": 288.93,
+     "text": 418.79,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.22,
+      "wav": 0.3,
+      "logmel": 9.6,
+      "audio": 288.93,
+      "finish": 418.79
+     },
+     "inference": 707.72
+    },
+    {
+     "total": 756.3352519981563,
+     "client_encode": 3.8389640040695667,
+     "preprocess": 12.93,
+     "towers": 347.92,
+     "text": 393.36,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.49,
+      "wav": 0.62,
+      "logmel": 11.82,
+      "audio": 347.92,
+      "finish": 393.36
+     },
+     "inference": 741.28
+    },
+    {
+     "total": 791.2519880011678,
+     "client_encode": 3.8389640040695667,
+     "preprocess": 13.17,
+     "towers": 382.49,
+     "text": 393.54,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.22,
+      "wav": 0.31,
+      "logmel": 12.64,
+      "audio": 382.49,
+      "finish": 393.54
+     },
+     "inference": 776.03
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "a30",
+   "modality": "audio",
+   "tokens": 754,
+   "expected_tokens": 754,
+   "stats": {
+    "total": {
+     "p50": 1050.277715999633,
+     "p95": 1170.5834622010589,
+     "mean": 937.2250424445504,
+     "min": 659.3834620006382,
+     "max": 1229.4774110019207,
+     "n": 9
+    },
+    "preprocess": {
+     "p50": 20.53,
+     "p95": 21.470000000000002,
+     "mean": 20.52111111111111,
+     "min": 18.57,
+     "max": 21.610000000000003,
+     "n": 9
+    },
+    "inference": {
+     "p50": 1026.37,
+     "p95": 1148.964,
+     "mean": 914.5766666666667,
+     "min": 636.44,
+     "max": 1209.0,
+     "n": 9
+    },
+    "towers": {
+     "p50": 496.53,
+     "p95": 534.984,
+     "mean": 442.82444444444445,
+     "min": 337.43,
+     "max": 538.34,
+     "n": 9
+    },
+    "text": {
+     "p50": 510.67,
+     "p95": 619.088,
+     "mean": 471.75222222222226,
+     "min": 293.76,
+     "max": 670.66,
+     "n": 9
+    },
+    "client_encode": {
+     "p50": 7.73717699944973,
+     "p95": 7.73717699944973,
+     "mean": 7.73717699944973,
+     "min": 7.73717699944973,
+     "max": 7.73717699944973,
+     "n": 9
+    },
+    "rps_single": 1.0669795990424185
+   },
+   "cpu_util": 0.6110508312367451,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 659.3834620006382,
+     "client_encode": 7.73717699944973,
+     "preprocess": 20.89,
+     "towers": 339.72,
+     "text": 296.72,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.45,
+      "wav": 1.05,
+      "logmel": 19.39,
+      "audio": 339.72,
+      "finish": 296.72
+     },
+     "inference": 636.44
+    },
+    {
+     "total": 874.722673997283,
+     "client_encode": 7.73717699944973,
+     "preprocess": 20.08,
+     "towers": 341.24,
+     "text": 510.67,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.43,
+      "wav": 0.5,
+      "logmel": 19.15,
+      "audio": 341.24,
+      "finish": 510.67
+     },
+     "inference": 851.9100000000001
+    },
+    {
+     "total": 1073.4626720026135,
+     "client_encode": 7.73717699944973,
+     "preprocess": 20.880000000000003,
+     "towers": 529.95,
+     "text": 520.4,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.43,
+      "wav": 0.53,
+      "logmel": 19.92,
+      "audio": 529.95,
+      "finish": 520.4
+     },
+     "inference": 1050.35
+    },
+    {
+     "total": 1060.8210010007024,
+     "client_encode": 7.73717699944973,
+     "preprocess": 20.53,
+     "towers": 496.53,
+     "text": 541.73,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.43,
+      "wav": 0.51,
+      "logmel": 19.59,
+      "audio": 496.53,
+      "finish": 541.73
+     },
+     "inference": 1038.26
+    },
+    {
+     "total": 1050.277715999633,
+     "client_encode": 7.73717699944973,
+     "preprocess": 21.610000000000003,
+     "towers": 518.53,
+     "text": 507.84,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.42,
+      "wav": 0.52,
+      "logmel": 20.67,
+      "audio": 518.53,
+      "finish": 507.84
+     },
+     "inference": 1026.37
+    },
+    {
+     "total": 672.616900999099,
+     "client_encode": 7.73717699944973,
+     "preprocess": 20.42,
+     "towers": 356.51,
+     "text": 293.76,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.42,
+      "wav": 0.52,
+      "logmel": 19.48,
+      "audio": 356.51,
+      "finish": 293.76
+     },
+     "inference": 650.27
+    },
+    {
+     "total": 732.0210059992969,
+     "client_encode": 7.73717699944973,
+     "preprocess": 20.45,
+     "towers": 337.43,
+     "text": 372.25,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.46,
+      "wav": 0.5,
+      "logmel": 19.49,
+      "audio": 337.43,
+      "finish": 372.25
+     },
+     "inference": 709.6800000000001
+    },
+    {
+     "total": 1082.242538999766,
+     "client_encode": 7.73717699944973,
+     "preprocess": 21.26,
+     "towers": 527.17,
+     "text": 531.74,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.43,
+      "wav": 0.53,
+      "logmel": 20.3,
+      "audio": 527.17,
+      "finish": 531.74
+     },
+     "inference": 1058.9099999999999
+    },
+    {
+     "total": 1229.4774110019207,
+     "client_encode": 7.73717699944973,
+     "preprocess": 18.57,
+     "towers": 538.34,
+     "text": 670.66,
+     "tokens": 754,
+     "stages": {
+      "base64": 0.39,
+      "wav": 0.47,
+      "logmel": 17.71,
+      "audio": 538.34,
+      "finish": 670.66
+     },
+     "inference": 1209.0
+    }
+   ],
+   "throughput": []
+  }
+ ]
+}

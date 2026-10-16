@@ -4,9 +4,9 @@
 # redistributed by this repository; every asset keeps its own license.
 #   cpu-max/scripts/download_assets.sh [models] [datasets]     (default: both)
 #
-# models:   GGUF files for the native engines (cpu-max/models/gguf, checked against
-#           cpu-max/models/SHA256SUMS), the official FP32 model and the ONNX
-#           Community export (Hugging Face cache).
+# models:   GGUF files for the native engines (cpu-max/models/gguf, via
+#           download_models.sh, checked against cpu-max/models/SHA256SUMS), the
+#           official FP32 model and the ONNX Community INT8 export (Hugging Face cache).
 # datasets: SciFact, Flickr30k 1k test (images extracted to cpu-max/data/flickr1k),
 #           4 Clotho test shards (Hugging Face cache) and MSR-VTT test-1k
 #           (cpu-max/data/msrvtt; the video archive is 2.2 GB).
@@ -22,9 +22,7 @@ what=("$@")
 for w in "${what[@]}"; do
   case $w in
     models)
-      "$HF" download ggml-org/embeddinggemma-2-GGUF --revision bfcd298762cc34d0357ece5ebdd31791a3a374d8 \
-          embeddinggemma-2-Q8_0.gguf mmproj-embeddinggemma-2-Q8_0.gguf --local-dir models/gguf
-      (cd models/gguf && sha256sum -c ../SHA256SUMS)
+      sh scripts/download_models.sh models/gguf     # GGUF files, pinned revision, SHA-256 checked
       "$HF" download google/embeddinggemma-2 --revision 914f7f89142e33e77833254d9c9b90c3cef7303b
       "$HF" download onnx-community/embeddinggemma-2-ONNX --revision daa72c51243991dfcaf9f9137d2c573d8f7790c0 \
           --include "*.json" --include "*.jinja" --include "onnx/model_quantized.onnx*" \

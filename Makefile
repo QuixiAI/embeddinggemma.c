@@ -681,8 +681,11 @@ $(BUILD)/test_gemma2: src/test_gemma2.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_gemma2.c $(SRCS_ENGINE) $(LDLIBS)
 
 .PHONY: test-gemma2
+# cpu-max fork: the goldens are llama.cpp outputs, i.e. upstream semantics (QuickGELU
+# vision MLP, log(max) mel floor, timestamped video); official-semantics accuracy
+# is validated against the HF FP32 model instead (scripts/validate_embeddings.py).
 test-gemma2: $(BUILD)/test_gemma2 $(BUILD)/embeddinggemma
-	python3 testdata/test_gemma2.py --binary $(BUILD)/test_gemma2 \
+	EI_GEMMA2_SEMANTICS=upstream python3 testdata/test_gemma2.py --binary $(BUILD)/test_gemma2 \
 		--server $(BUILD)/embeddinggemma --model $(GEMMA2_MODEL) --mmproj $(GEMMA2_MMPROJ)
 
 $(BUILD)/gemma2_metal.o: src/gemma2_metal.m $(HDRS_NATIVE) | $(BUILD)

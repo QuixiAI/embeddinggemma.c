@@ -1,4 +1,34 @@
-# Release Runbook
+# Releases
+
+## EmbeddingGemma-2-CPU-Max
+
+**No CPU-Max release has been published yet.** The repository is at
+`0.1.0-dev` (`CPU_MAX_VERSION`); `install.sh` builds from source and never
+downloads executables. The tags `v0.1.0` … `v0.3.1` in this repository are
+upstream's releases (fork base: `v0.3.1-8-gd8f9e33`, see `Makefile`
+`UPSTREAM_BASE`), and `VERSION` is upstream's file, kept for upstream's
+tooling below.
+
+Rules for the first and later CPU-Max releases:
+
+- Only after the benchmark report for the release commit is verified, and
+  with explicit approval of the version (`CPU_MAX_VERSION`, tag `cpu-max-vX.Y.Z`
+  to stay distinct from upstream's `vX.Y.Z` tags).
+- CI (`.github/workflows/ci.yml`) green on the release commit, including the
+  model tests.
+- Assets, if any, are CPU builds that were actually tested, named
+  `embeddinggemma-cpu-max-<platform>-<arch>` with a `SHA256SUMS`, built from the
+  tagged commit; never upstream's asset names, never GPU variants this fork
+  does not test, never model weights. `embeddinggemma-cpu-max --version` of
+  every asset must print the release version and commit.
+- Until binaries exist, the release notes point to `install.sh` (source build).
+
+The upstream runbook below is kept for reference; it publishes upstream's
+seven-binary set to QuixiAI/embeddinggemma.c and does not apply to CPU-Max.
+
+---
+
+# Upstream release runbook (QuixiAI/embeddinggemma.c)
 
 This runbook publishes one GitHub release containing raw executable files for
 every supported platform. GitHub generates source archives automatically; do

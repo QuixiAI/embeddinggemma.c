@@ -2,104 +2,80 @@
 
 **CPU-optimized multimodal inference for Google EmbeddingGemma 2.**
 
-EmbeddingGemma 2 (744 M parameters: a 270 M text backbone, a 170 M vision
-tower and a 300 M audio tower) maps text, images, audio, video frames and
-mixed inputs into one shared 768-d embedding space. This repository is a
-fork of [QuixiAI/embeddinggemma.c](https://github.com/QuixiAI/embeddinggemma.c),
-a dependency-free C inference server for the model, that makes the **whole
-model — not only the text backbone — fast on CPUs**, plus a reproducible
-benchmark and evaluation suite against the official PyTorch implementation,
-the ONNX Community int8 export and the unmodified upstream engine.
+**2.46x geometric mean speedup over the fastest tested competing CPU backend
+across 16 workloads, measured on Intel Core i7-14700HX.**
 
-It is an inference engine, not a new checkpoint: it runs the Q8_0 GGUF files
-of [`ggml-org/embeddinggemma-2-GGUF`](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF)
-unchanged.
+EmbeddingGemma 2 (744 M parameters: a 270 M text backbone, a 170 M vision
+tower and a 300 M audio tower) embeds text, images, audio, video frames and
+mixed inputs into one 768-dimensional space. This repository is a fork of
+[QuixiAI/embeddinggemma.c](https://github.com/QuixiAI/embeddinggemma.c), a
+dependency-free C inference server for the model, that makes **the whole
+model — not only the text backbone — fast on x86-64 CPUs**, together with the
+benchmark and evaluation suite used to measure it against PyTorch, ONNX
+Runtime and the unmodified upstream engine. It runs the Q8_0 GGUF files of
+[`ggml-org/embeddinggemma-2-GGUF`](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF)
+unchanged; it is an inference engine, not a new model.
+
+> **Status: pre-release (`0.1.0-dev`).** There are no CPU-Max release binaries
+> yet; build from source (below). The tags `v0.1.0` … `v0.3.1` in this
+> repository are upstream's releases, not CPU-Max releases.
 
 ## At a glance
 
-Measured on one machine — Intel Core i7-14700HX (8 P-cores + 12 E-cores,
-AVX2 + AVX-VNNI, no AVX-512), 16 GB, Ubuntu 24.04 — with engine commit
-`5dd7dbf`, warm p50 latency over HTTP, identical inputs for every backend.
-These are single-host results; they have not yet been reproduced elsewhere.
+All numbers: one machine (Intel Core i7-14700HX, 8 P-cores + 12 E-cores,
+AVX2 + AVX-VNNI, no AVX-512, 16 GB, Ubuntu 24.04), engine commit `5dd7dbf`,
+warm latency, identical inputs for every backend. **They have not been
+reproduced on other hardware yet.**
 
-* **Faster than every other CPU backend on all 16 benchmark workloads**
-  (text, images, audio, video, mixed): **2.46x geometric mean** over the
-  fastest alternative per workload, each backend at its own best thread
-  budget. Smallest margin: **1.58x** (a 1344x1920 image vs ONNX Runtime
-  int8); largest: 4.4x (5 s of audio vs PyTorch FP32).
-* **16-54x faster than the unmodified upstream engine** on images, audio
-  and video at 8 P-core threads (text: 2.0-4.2x). Upstream runs the vision
-  and audio towers in a scalar reference graph on CPU.
-* **Same embeddings as the official model**: cosine ≥ 0.99914 to the
-  Sentence Transformers FP32 output on every workload (ONNX int8:
-  ≥ 0.99850), and the same retrieval quality on Flickr30k, MSR-VTT,
-  SciFact and Clotho (98-99% identical top-1 results on the first three).
+* **Faster than all tested CPU backends on all 16 workloads** (text, images,
+  audio, video, mixed). Each backend at its own best thread budget: 2.46x
+  geometric mean over the fastest competing backend per workload (range
+  1.58x-4.40x); 2.53x over PyTorch FP32 and 4.23x over ONNX Runtime INT8 on
+  average. At a fixed budget of 8 P-core threads: 2.20x (minimum 1.35x).
+* **15.7x-54x faster than the unmodified upstream engine** on images, audio
+  and video at 8 P-core threads (text: 2.0x-4.2x), because upstream runs the
+  vision and audio towers in a scalar reference graph on CPU.
+* **Near-FP32 embedding quality**: cosine similarity to the official FP32
+  model (Sentence Transformers) of at least 0.99914 on every workload, mean
+  0.99970 (ONNX Runtime INT8: minimum 0.99850, mean 0.99938).
+* **Precision differs between backends**: CPU-Max computes with Q8_0 weights
+  and Q8_0 activations in its integer matrix multiplications (fp32
+  elsewhere), the PyTorch baseline is FP32, the ONNX Runtime baseline is the
+  INT8 export. Part of the gap to PyTorch is integer vs floating-point
+  arithmetic; the gap to ONNX Runtime INT8 is not.
 
-Full tables are in [Results](#results); every attempt, including the rejected
-ones, is in [`cpu-max/reports/optimization_log.md`](cpu-max/reports/optimization_log.md).
+## Quick start
 
-## What was optimized
-
-Upstream's SIMD CPU graph covers the text backbone only; its CPU vision and
-audio towers are a scalar reference graph (32 s for one 280-token image on
-8 P-cores). Each item below is one or more commits on top of upstream
-`d8f9e33` (the list with commit IDs and files is [`CPU_MAX.md`](CPU_MAX.md)):
-
-* **CPU vision and audio fast paths** — the reference graphs' math (Q8_0
-  weights x Q8_0 activations in the integer GEMMs; fp32 attention, norms,
-  softmax and convolutions) in fused, threaded passes. Towers 24-32x faster
-  than upstream's reference graph on the same cores.
-* **A repacked 256-bit AVX-VNNI Q8_0 GEMM** for CPUs without AVX-512
-  (Alder Lake / Raptor Lake and other hybrid parts): 8-row interleaved
-  weights, u8 activations with a precomputed offset correction, exact
-  integer dot products; ~7x upstream's tile per P-core. Used by the text,
-  vision and audio graphs.
-* **Tiled online-softmax attention** for head widths 64-512 (GQA, sliding
-  windows, packed sequences), as accurate as plain fp32; vision reads K/V as
-  contiguous per-head planes (+11-14% attention throughput at 10,080
-  patches).
-* **A packed fp32 GEMM** for the BF16/F32-weight projections (4.7x).
-* **A hybrid P/E-core aware thread pool** — P-cores first, the calling
-  thread on a P-core, short text waves kept off the E-cores — so using all
-  28 threads no longer slows short requests and speeds up larger media
-  19-32% over 8 P-core threads.
-* **Serving**: CPU media towers hand the engine to waiting text requests
-  between layers (16-token texts sent during a 1120-token image: 5.5 s →
-  9 ms median), the log-mel front end and the weight repacking run on the
-  thread pool (cold first requests close to warm speed).
-* **Memory**: GGUF pages of repacked weights are released (one resident
-  copy: −28-39% peak RSS), compact repack metadata, streamed audio
-  subsampling, chunked vision FFN, reused workspaces.
-* **Official semantics by default.** Upstream deviates from the official
-  implementation in three places (vision MLP activation, log-mel floor,
-  timestamp text before every video frame); the fork follows the official
-  model, measured below. `EI_GEMMA2_SEMANTICS=upstream` restores upstream's
-  behaviour.
-
-Every new path has an environment switch that restores upstream's
-behaviour (see [`CPU_MAX.md`](CPU_MAX.md#flags)) and keeps the portable
-fallbacks. **Not claimed here** (already in upstream): the SIMD packed-batch
-text graph and its x86 kernels, the AVX-512 VNNI repacked GEMM, NEON/i8mm,
-the spin thread pool, batching and caching, the HTTP API, and all GPU
-backends (Metal, CUDA, ROCm, XPU), which this fork does not change.
-
-## Build and run
-
-Requirements: Linux x86-64, GCC or Clang, `make`. The engine has no
-third-party dependencies.
+Prerequisites: Linux x86-64, a C11 compiler (gcc or clang), `make`, `git`,
+`curl`, `sha256sum`; `python3` (standard library only) for the example
+client. No other dependencies.
 
 ```sh
 git clone https://github.com/Yazeedx0/EmbeddingGemma-2-CPU-Max.git
 cd EmbeddingGemma-2-CPU-Max
-make                                   # upstream Makefile: -O2, runtime ISA dispatch -> build/embeddinggemma
+make                                        # -> build/embeddinggemma
+./build/embeddinggemma --version            # EmbeddingGemma-2-CPU-Max 0.1.0-dev (commit ...)
 
-# model files (1.0 GB, pinned revision, SHA-256 checked); needs `uv` for the hf CLI
-(cd cpu-max && uv sync && scripts/download_assets.sh models)
+cpu-max/scripts/download_models.sh          # 1.0 GB, SHA-256 verified, into ~/.cache/embeddinggemma.c
 
-./build/embeddinggemma --bind 127.0.0.1 --port 42666 --threads "$(nproc)" \
-    --model cpu-max/models/gguf/embeddinggemma-2-Q8_0.gguf \
-    --mmproj cpu-max/models/gguf/mmproj-embeddinggemma-2-Q8_0.gguf
+./build/embeddinggemma --bind 127.0.0.1 --port 42666 --threads "$(nproc)" &
+python3 cpu-max/examples/quickstart.py --wait 120
 ```
+
+`quickstart.py` sends a text, an image, an audio clip and a mixed request
+(the image and audio are generated by the script) and checks that every
+response is a 768-dimensional unit vector:
+
+```text
+ok   text   dims=768 norm=1.000000 tokens=12
+ok   image  dims=768 norm=1.000000 tokens=74
+ok   audio  dims=768 norm=1.000000 tokens=54
+ok   mixed  dims=768 norm=1.000000 tokens=133
+...
+all checks passed
+```
+
+A text request with curl, and your own media with the example client:
 
 ```sh
 curl -s http://127.0.0.1:42666/v1/embeddings -H 'Content-Type: application/json' \
@@ -107,94 +83,196 @@ curl -s http://127.0.0.1:42666/v1/embeddings -H 'Content-Type: application/json'
 python3 cpu-max/examples/client.py --image photo.png --audio clip.wav --frames f01.png f02.png
 ```
 
-The HTTP API (`/v1/embeddings`, `/api/embed`; content objects with text,
-image, audio and video parts) is upstream's and documented in
-[`README.upstream.md`](README.upstream.md). The server does not decode video
-containers: send frames (`ffmpeg -i clip.mp4 -vf fps=1 f%02d.png`). Text is
-embedded as given — add the task prefix (`task: search result | query: …`)
-yourself. On a hybrid CPU use every hardware thread (`--threads $(nproc)`);
-the pool places work on the P-cores first. `EI_GEMMA2_CPU_PREPACK=1` repacks
-all towers at startup (+0.7 s) so even the first request runs at warm speed,
-at the cost of keeping every tower resident.
+* The server has no authentication and listens on all interfaces by default
+  (upstream behaviour); keep `--bind 127.0.0.1` unless it sits behind your
+  own network boundary (see [`SECURITY.md`](SECURITY.md)).
+* Started without `--model`, the server uses `~/.cache/embeddinggemma.c/`
+  (or `$XDG_CACHE_HOME/embeddinggemma.c/`), where `download_models.sh` puts
+  the files; if they are missing it downloads them itself from the same
+  pinned revision, without a checksum check.
+* The HTTP API (`/v1/embeddings`, `/api/embed`, content objects with text,
+  image, audio and video parts, `dimensions` 768/512/256/128) is upstream's:
+  see [`README.upstream.md`](README.upstream.md).
+* Audio must be mono 16 kHz WAV (PCM16 or float32). The server does not decode
+  video containers: send frames (`ffmpeg -i clip.mp4 -vf fps=1 f%02d.png`).
+  Text is embedded as given; add the task prefix (`task: search result |
+  query: …`) yourself.
+* On a hybrid CPU use all hardware threads (`--threads $(nproc)`); work is
+  placed on the P-cores first. `EI_GEMMA2_CPU_PREPACK=1` prepares all towers
+  at startup (+0.7 s) so the first request of each modality runs at warm
+  speed, at the cost of keeping every tower resident.
+
+### Installer
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Yazeedx0/EmbeddingGemma-2-CPU-Max/main/install.sh | sh -s -- --with-models
+embeddinggemma-cpu-max --version
+```
+
+`install.sh` **builds from source** (CPU-Max has no prebuilt binaries yet):
+it clones this repository (`--ref` to pick a branch, tag or commit), builds
+the CPU server, refuses to install a binary that does not identify itself as
+CPU-Max, and installs it as `~/.local/bin/embeddinggemma-cpu-max`, a
+different name from upstream's `embeddinggemma`, so an existing upstream
+install is never replaced. `--with-models` downloads and verifies the model
+files. GPU variants (Metal, CUDA, ROCm, XPU) are upstream code that CPU-Max
+does not change or test; the installer rejects them and points to
+upstream's installer. `./install.sh --help` lists all options.
+
+## What CPU-Max changes
+
+Upstream's SIMD CPU graph covers only the text backbone; its CPU vision and
+audio towers are a scalar reference graph (32 s for one 280-token image on
+8 P-cores). Every engine change is a separate commit on top of upstream
+`d8f9e33`, listed with its files in [`CPU_MAX.md`](CPU_MAX.md); every
+attempt, kept or rejected, is in
+[`cpu-max/reports/optimization_log.md`](cpu-max/reports/optimization_log.md).
+
+* **CPU vision and audio fast paths** — the reference graphs' arithmetic
+  (Q8_0 weights x Q8_0 activations in the integer GEMMs; fp32 attention,
+  norms, softmax, convolutions) in fused, threaded passes: towers 24-32x
+  faster than upstream's reference graph on the same cores.
+* **A repacked 256-bit AVX-VNNI Q8_0 GEMM** for CPUs with AVX-VNNI but no
+  AVX-512 (Alder Lake / Raptor Lake and similar): exact integer dot products,
+  ~7x upstream's kernel per P-core; used by the text, vision and audio graphs.
+* **Tiled online-softmax attention** for head widths 64-512 (GQA, sliding
+  windows, packed sequences), as accurate as plain fp32; vision reads K/V as
+  contiguous per-head planes (+11-14% attention throughput at 10,080 patches).
+* **A packed fp32 GEMM** for the BF16/F32-weight projections (4.7x).
+* **A hybrid P/E-core aware thread pool**: P-cores first, the calling thread
+  on a P-core, short text kept off the E-cores — using all 28 threads no
+  longer slows short requests, and speeds up larger media 19-32% over 8
+  P-core threads.
+* **Serving**: CPU media towers hand the engine to waiting text requests
+  between layers (16-token texts sent during a 1120-token image: median wait
+  5.5 s → 9 ms); log-mel features and weight repacking run on the thread pool.
+* **Memory**: page cache of repacked weights released (−28% to −39% peak RSS
+  vs. keeping both copies), compact repack metadata, streamed audio
+  subsampling, chunked vision FFN.
+* **Official semantics by default** — see
+  [Compatibility](#compatibility-with-existing-vector-indexes).
+
+Every new path has an environment switch that restores upstream's behaviour
+([`CPU_MAX.md`](CPU_MAX.md#flags)), and the portable fallbacks remain. Not
+claimed here (already upstream): the SIMD packed-batch text graph and its
+x86 kernels, the AVX-512 VNNI repacked GEMM, NEON/i8mm, the thread pool,
+batching, caching, the HTTP API, and all GPU backends, which CPU-Max does not
+change.
+
+## Benchmark method
+
+* **Hardware**: Intel Core i7-14700HX laptop CPU (8 P-cores with SMT + 12
+  E-cores = 28 hardware threads; AVX2 + AVX-VNNI; no AVX-512 or AMX), 16 GB
+  RAM, Ubuntu 24.04, GCC 13.3, CPU-only (the machine's GPU is never used).
+  Full report: [`cpu-max/reports/hardware.json`](cpu-max/reports/hardware.json).
+* **Thread budgets**: **P8** = 8 threads pinned to one hardware thread per
+  P-core (CPUs 0,2,…,14); **ALL** = 28 threads on every hardware thread.
+  Each backend is measured at both; the headline compares each backend at
+  its own faster budget per workload.
+* **Backends**: CPU-Max and upstream `embeddinggemma.c` (Q8_0 GGUF) measured
+  end to end over HTTP with base64 media in the request; PyTorch FP32
+  (Sentence Transformers 6.1, Transformers 5.20, PyTorch 2.14 CPU) and
+  ONNX Runtime 1.23 (ONNX Community INT8 export) measured in-process, which
+  excludes HTTP and request parsing and favours them.
+* **Inputs**: 16 fixed workloads, pre-decoded at the official processor's
+  geometry so every backend receives identical pixels and samples
+  (`cpu-max/scripts/make_fixtures.py`).
+* **Statistic**: warm latency, 1 warm-up, then at least 3 and up to 10
+  measured repetitions per workload (30 s budget); tables show p50 and p95.
+* **Quiet-host guard**: the host is a shared workstation. Before each workload
+  the harness waits until other processes use at most 1.5 CPU cores
+  (measured from `/proc/stat`) and records the CPU used by other processes
+  during the measurement (`foreign_cores` in the raw data). A full run that
+  overlapped other services was discarded and is kept, with the reason, in
+  [`cpu-max/reports/raw/excluded/`](cpu-max/reports/raw/excluded/).
+* **Run policy**: CPU-Max has exactly one guarded run per budget; each
+  baseline (PyTorch, ONNX Runtime, upstream) is the **better of two runs**,
+  which can only favour the baselines.
+* **Variability**: at P8, CPU-Max's p95 is within 12% of its p50 on every
+  workload. At ALL (28 threads) CPU-Max showed occasional slow repetitions on
+  video (4 frames: p95 3.6x p50; text + video: 2.6x) with no measurable load
+  from other processes; this is not root-caused. PyTorch at ALL has much
+  larger tails (up to 19x).
 
 ## Results
 
-Engine `5dd7dbf`; **P8** = 8 threads, one per P-core; **ALL** = 28 threads.
-Native engines are measured end to end over HTTP (base64 media in the
-request); Sentence Transformers (PyTorch FP32) and ONNX Runtime in-process,
-which excludes HTTP and favours them. Before each workload the harness waits
-until other processes use ≤ 1.5 cores and records the foreign CPU load during
-the measurement; the fork has one run per budget, each baseline the better of
-two runs. Raw data: [`cpu-max/reports/raw/`](cpu-max/reports/raw/); plots:
-[`cpu-max/reports/plots/`](cpu-max/reports/plots/).
+Engine `5dd7dbf`; generated from [`cpu-max/reports/`](cpu-max/reports/) by
+`cpu-max/scripts/render_results.py` (raw per-run data in
+[`cpu-max/reports/raw/`](cpu-max/reports/raw/), plots in
+[`cpu-max/reports/plots/`](cpu-max/reports/plots/)). The retrieval rows use
+`2cd784b`, whose outputs are bit-identical to `5dd7dbf`'s.
 
 <!-- RESULTS:BEGIN -->
 <!-- generated by cpu-max/scripts/render_results.py --fork fork_5dd7dbf; do not edit by hand -->
 
-**Warm p50 latency, ms — 8 threads on the 8 P-cores (P8)**
+**Warm latency, ms, p50 (p95) — 8 threads on the 8 P-cores (P8)**
 
-| workload | this fork | Sentence Transformers FP32 | ONNX Community Q8 | QuixiAI upstream Q8 | fork vs fastest other, same budget |
+| workload | CPU-Max (Q8_0) | PyTorch FP32 (Sentence Transformers) | ONNX Runtime INT8 | upstream embeddinggemma.c (Q8_0) | fork vs fastest other, same budget (p50) |
 |---|---:|---:|---:|---:|---:|
-| text, 16 tokens | **8.6** | 20.4 | 36.8 | 17.4 | 2.03x |
-| text, 128 tokens | **29.5** | 77.5 | 84.7 | 117 | 2.63x |
-| text, 512 tokens | **134** | 250 | 292 | 556 | 1.87x |
-| image, 70 tokens (336x480) | **152** | 341 | 1,368 | 3,909 | 2.24x |
-| image, 280 tokens (672x960) | **942** | 1,829 | 3,028 | 32,082 | 1.94x |
-| image, 1120 tokens (1344x1920) | **10,140** | 13,646 | 14,321 | 552,466 | 1.35x |
-| audio, 5 s | **82.1** | 361 | 1,297 | 1,320 | 4.40x |
-| audio, 15 s | **241** | 654 | 2,014 | 3,935 | 2.71x |
-| audio, 30 s | **523** | 1,169 | 2,448 | 8,202 | 2.24x |
-| video, 4 frames | **1,482** | 3,265 | 4,332 | 42,652 | 2.20x |
-| video, 8 frames | **3,096** | 6,946 | 7,465 | 87,577 | 2.24x |
-| video, 16 frames | **6,405** | 16,418 | 14,392 | 161,199 | 2.25x |
-| text + image | **1,114** | 1,707 | 3,050 | 33,015 | 1.53x |
-| text + audio | **258** | 635 | 1,997 | 3,991 | 2.46x |
-| text + image + audio | **1,295** | 2,495 | 4,454 | 36,394 | 1.93x |
-| text + video | **3,137** | 7,276 | 7,519 | 87,103 | 2.32x |
+| text, 16 tokens | **8.6 (9.6)** | 20.4 (21.0) | 36.8 (37.4) | 17.4 (17.6) | 2.03x |
+| text, 128 tokens | **29.5 (29.7)** | 77.5 (78.5) | 84.7 (91.9) | 117 (128) | 2.63x |
+| text, 512 tokens | **134 (136)** | 250 (253) | 292 (295) | 556 (565) | 1.87x |
+| image, 70 tokens (336x480) | **152 (154)** | 341 (342) | 1,368 (1,525) | 3,909 (4,241) | 2.24x |
+| image, 280 tokens (672x960) | **942 (947)** | 1,829 (1,840) | 3,028 (3,139) | 32,082 (32,215) | 1.94x |
+| image, 1120 tokens (1344x1920) | **10,140 (10,562)** | 13,646 (13,676) | 14,321 (14,327) | 552,466 (554,508) | 1.35x |
+| audio, 5 s | **82.1 (83.1)** | 361 (406) | 1,297 (1,483) | 1,320 (1,330) | 4.40x |
+| audio, 15 s | **241 (243)** | 654 (734) | 2,014 (2,115) | 3,935 (4,244) | 2.71x |
+| audio, 30 s | **523 (524)** | 1,169 (1,490) | 2,448 (2,504) | 8,202 (8,603) | 2.24x |
+| video, 4 frames | **1,482 (1,496)** | 3,265 (3,309) | 4,332 (4,428) | 42,652 (46,146) | 2.20x |
+| video, 8 frames | **3,096 (3,145)** | 6,946 (6,960) | 7,465 (7,507) | 87,577 (95,909) | 2.24x |
+| video, 16 frames | **6,405 (6,422)** | 16,418 (17,979) | 14,392 (14,494) | 161,199 (170,245) | 2.25x |
+| text + image | **1,114 (1,178)** | 1,707 (1,716) | 3,050 (3,235) | 33,015 (34,190) | 1.53x |
+| text + audio | **258 (260)** | 635 (689) | 1,997 (2,055) | 3,991 (4,317) | 2.46x |
+| text + image + audio | **1,295 (1,308)** | 2,495 (2,604) | 4,454 (4,485) | 36,394 (37,071) | 1.93x |
+| text + video | **3,137 (3,289)** | 7,276 (9,353) | 7,519 (7,822) | 87,103 (87,788) | 2.32x |
 
-**Warm p50 latency, ms — all 28 hardware threads (ALL)**
+Same-budget geometric mean (P8, 16 workloads): 2.20x over the fastest other backend (minimum 1.35x).
 
-| workload | this fork | Sentence Transformers FP32 | ONNX Community Q8 | QuixiAI upstream Q8 | fork vs fastest other, same budget |
+**Warm latency, ms, p50 (p95) — all 28 hardware threads (ALL)**
+
+| workload | CPU-Max (Q8_0) | PyTorch FP32 (Sentence Transformers) | ONNX Runtime INT8 | upstream embeddinggemma.c (Q8_0) | fork vs fastest other, same budget (p50) |
 |---|---:|---:|---:|---:|---:|
-| text, 16 tokens | **8.9** | 28.2 | 68.0 | 21.9 | 2.47x |
-| text, 128 tokens | **29.3** | 96.0 | 158 | 108 | 3.27x |
-| text, 512 tokens | **128** | 344 | 408 | 398 | 2.69x |
-| image, 70 tokens (336x480) | **139** | 419 | 1,824 | 2,548 | 3.03x |
-| image, 280 tokens (672x960) | **783** | 3,709 | 3,294 | – | 4.21x |
-| image, 1120 tokens (1344x1920) | **7,678** | 25,366 | 12,142 | – | 1.58x |
-| audio, 5 s | **84.6** | 1,852 | 1,648 | 987 | 11.66x |
-| audio, 15 s | **237** | 4,126 | 2,470 | 2,911 | 10.40x |
-| audio, 30 s | **441** | 18,259 | 2,995 | – | 6.79x |
-| video, 4 frames | **1,271** | 12,703 | 4,579 | – | 3.60x |
-| video, 8 frames | **2,560** | 18,955 | 7,219 | – | 2.82x |
-| video, 16 frames | **5,313** | 23,168 | 14,481 | – | 2.73x |
-| text + image | **849** | 10,109 | 3,314 | – | 3.90x |
-| text + audio | **254** | 6,109 | 2,384 | 2,901 | 9.37x |
-| text + image + audio | **1,070** | 11,795 | 4,987 | – | 4.66x |
-| text + video | **2,629** | 21,358 | 7,142 | – | 2.72x |
+| text, 16 tokens | **8.9 (12.7)** | 28.2 (34.0) | 68.0 (73.3) | 21.9 (24.1) | 2.47x |
+| text, 128 tokens | **29.3 (29.7)** | 96.0 (1,849) | 158 (256) | 108 (111) | 3.27x |
+| text, 512 tokens | **128 (130)** | 344 (1,976) | 408 (499) | 398 (434) | 2.69x |
+| image, 70 tokens (336x480) | **139 (152)** | 419 (4,657) | 1,824 (2,036) | 2,548 (2,572) | 3.03x |
+| image, 280 tokens (672x960) | **783 (826)** | 3,709 (5,216) | 3,294 (3,530) | – | 4.21x |
+| image, 1120 tokens (1344x1920) | **7,678 (7,823)** | 25,366 (27,197) | 12,142 (13,083) | – | 1.58x |
+| audio, 5 s | **84.6 (86.4)** | 1,852 (3,558) | 1,648 (2,021) | 987 (1,002) | 11.66x |
+| audio, 15 s | **237 (251)** | 4,126 (8,433) | 2,470 (2,698) | 2,911 (3,032) | 10.40x |
+| audio, 30 s | **441 (461)** | 18,259 (18,894) | 2,995 (3,236) | – | 6.79x |
+| video, 4 frames | **1,271 (4,569)** | 12,703 (14,208) | 4,579 (5,060) | – | 3.60x |
+| video, 8 frames | **2,560 (3,404)** | 18,955 (19,005) | 7,219 (7,504) | – | 2.82x |
+| video, 16 frames | **5,313 (5,337)** | 23,168 (24,622) | 14,481 (15,445) | – | 2.73x |
+| text + image | **849 (872)** | 10,109 (15,189) | 3,314 (3,537) | – | 3.90x |
+| text + audio | **254 (271)** | 6,109 (10,606) | 2,384 (2,506) | 2,901 (2,918) | 9.37x |
+| text + image + audio | **1,070 (1,098)** | 11,795 (12,890) | 4,987 (5,310) | – | 4.66x |
+| text + video | **2,629 (6,952)** | 21,358 (21,682) | 7,142 (7,259) | – | 2.72x |
+
+Same-budget geometric mean (ALL, 16 workloads): 4.02x over the fastest other backend (minimum 1.58x).
 
 **Best thread budget per backend (P8 or ALL), p50 ms**
 
-| workload | this fork | Sentence Transformers FP32 | ONNX Community Q8 | QuixiAI upstream Q8 | fork vs fastest other |
+| workload | CPU-Max (Q8_0) | PyTorch FP32 (Sentence Transformers) | ONNX Runtime INT8 | upstream embeddinggemma.c (Q8_0) | fork vs fastest other |
 |---|---:|---:|---:|---:|---:|
 | text, 16 tokens | **8.6 (P8)** | 20.4 (P8) | 36.8 (P8) | 17.4 (P8) | 2.03x vs upstream |
-| text, 128 tokens | **29.3 (ALL)** | 77.5 (P8) | 84.7 (P8) | 108 (ALL) | 2.64x vs ST FP32 |
-| text, 512 tokens | **128 (ALL)** | 250 (P8) | 292 (P8) | 398 (ALL) | 1.95x vs ST FP32 |
-| image, 70 tokens (336x480) | **139 (ALL)** | 341 (P8) | 1,368 (P8) | 2,548 (ALL) | 2.46x vs ST FP32 |
-| image, 280 tokens (672x960) | **783 (ALL)** | 1,829 (P8) | 3,028 (P8) | 32,082 (P8) | 2.34x vs ST FP32 |
-| image, 1120 tokens (1344x1920) | **7,678 (ALL)** | 13,646 (P8) | 12,142 (ALL) | 552,466 (P8) | 1.58x vs ONNX Q8 |
-| audio, 5 s | **82.1 (P8)** | 361 (P8) | 1,297 (P8) | 987 (ALL) | 4.40x vs ST FP32 |
-| audio, 15 s | **237 (ALL)** | 654 (P8) | 2,014 (P8) | 2,911 (ALL) | 2.76x vs ST FP32 |
-| audio, 30 s | **441 (ALL)** | 1,169 (P8) | 2,448 (P8) | 8,202 (P8) | 2.65x vs ST FP32 |
-| video, 4 frames | **1,271 (ALL)** | 3,265 (P8) | 4,332 (P8) | 42,652 (P8) | 2.57x vs ST FP32 |
-| video, 8 frames | **2,560 (ALL)** | 6,946 (P8) | 7,219 (ALL) | 87,577 (P8) | 2.71x vs ST FP32 |
-| video, 16 frames | **5,313 (ALL)** | 16,418 (P8) | 14,392 (P8) | 161,199 (P8) | 2.71x vs ONNX Q8 |
-| text + image | **849 (ALL)** | 1,707 (P8) | 3,050 (P8) | 33,015 (P8) | 2.01x vs ST FP32 |
-| text + audio | **254 (ALL)** | 635 (P8) | 1,997 (P8) | 2,901 (ALL) | 2.50x vs ST FP32 |
-| text + image + audio | **1,070 (ALL)** | 2,495 (P8) | 4,454 (P8) | 36,394 (P8) | 2.33x vs ST FP32 |
-| text + video | **2,629 (ALL)** | 7,276 (P8) | 7,142 (ALL) | 87,103 (P8) | 2.72x vs ONNX Q8 |
+| text, 128 tokens | **29.3 (ALL)** | 77.5 (P8) | 84.7 (P8) | 108 (ALL) | 2.64x vs PyTorch FP32 |
+| text, 512 tokens | **128 (ALL)** | 250 (P8) | 292 (P8) | 398 (ALL) | 1.95x vs PyTorch FP32 |
+| image, 70 tokens (336x480) | **139 (ALL)** | 341 (P8) | 1,368 (P8) | 2,548 (ALL) | 2.46x vs PyTorch FP32 |
+| image, 280 tokens (672x960) | **783 (ALL)** | 1,829 (P8) | 3,028 (P8) | 32,082 (P8) | 2.34x vs PyTorch FP32 |
+| image, 1120 tokens (1344x1920) | **7,678 (ALL)** | 13,646 (P8) | 12,142 (ALL) | 552,466 (P8) | 1.58x vs ONNX Runtime INT8 |
+| audio, 5 s | **82.1 (P8)** | 361 (P8) | 1,297 (P8) | 987 (ALL) | 4.40x vs PyTorch FP32 |
+| audio, 15 s | **237 (ALL)** | 654 (P8) | 2,014 (P8) | 2,911 (ALL) | 2.76x vs PyTorch FP32 |
+| audio, 30 s | **441 (ALL)** | 1,169 (P8) | 2,448 (P8) | 8,202 (P8) | 2.65x vs PyTorch FP32 |
+| video, 4 frames | **1,271 (ALL)** | 3,265 (P8) | 4,332 (P8) | 42,652 (P8) | 2.57x vs PyTorch FP32 |
+| video, 8 frames | **2,560 (ALL)** | 6,946 (P8) | 7,219 (ALL) | 87,577 (P8) | 2.71x vs PyTorch FP32 |
+| video, 16 frames | **5,313 (ALL)** | 16,418 (P8) | 14,392 (P8) | 161,199 (P8) | 2.71x vs ONNX Runtime INT8 |
+| text + image | **849 (ALL)** | 1,707 (P8) | 3,050 (P8) | 33,015 (P8) | 2.01x vs PyTorch FP32 |
+| text + audio | **254 (ALL)** | 635 (P8) | 1,997 (P8) | 2,901 (ALL) | 2.50x vs PyTorch FP32 |
+| text + image + audio | **1,070 (ALL)** | 2,495 (P8) | 4,454 (P8) | 36,394 (P8) | 2.33x vs PyTorch FP32 |
+| text + video | **2,629 (ALL)** | 7,276 (P8) | 7,142 (ALL) | 87,103 (P8) | 2.72x vs ONNX Runtime INT8 |
 
-Geometric mean over the 16 workloads: **2.46x** faster than the fastest other backend for each workload (minimum 1.58x).
+Geometric mean over the 16 workloads: **2.46x** faster than the fastest other tested backend for each workload, each backend at its best budget (minimum 1.58x).
 
 **Final-embedding cosine vs the official Sentence Transformers FP32 model (same inputs)**
 
@@ -281,65 +359,79 @@ Geometric mean over the 16 workloads: **2.46x** faster than the fastest other ba
 
 <!-- RESULTS:END -->
 
-## Correctness and retrieval quality
+## Quality
 
-* **Final embeddings** match the official Sentence Transformers FP32 model
-  to cosine ≥ 0.99914 (mean 0.99970) on identical inputs; the engine keeps
-  upstream's precision (Q8_0 weights, Q8_0 activations into the integer
-  GEMMs, everything else fp32). The changes after the first fast paths are
-  bit-identical in output: the final engine's embeddings equal those of
-  `97fdcc7` byte for byte on all 16 workloads, at 8 and 28 threads.
-* **Upstream's semantics** cost it up to 0.12 cosine on video (timestamp text
-  before each frame) and change rankings: with them, only 75% of MSR-VTT
-  top-1 results agree with the FP32 model's (fork: 98%). Indexes built with
-  upstream stay comparable with `EI_GEMMA2_SEMANTICS=upstream`, which
-  reproduces upstream's embeddings to cosine ≥ 0.9992.
-* **High cosine alone does not prove equal retrieval**, so retrieval is
-  measured directly on labelled data (Flickr30k 1k test with 5,000
-  captions; a 200-video subset of MSR-VTT 1k-A; a 120-clip subset of Clotho;
-  SciFact), including agreement of each backend's rankings with FP32's.
-  Upstream's scalar media towers were too slow for Flickr and MSR-VTT;
-  there the fork with upstream semantics stands in.
-* **Weight precision**: a fake-quantization study on the FP32 model shows Q8_0
-  weights cost at most 0.0007 cosine, 4-bit weights 0.036 (text) to 0.084
-  (all towers) — so no lower-precision mode is offered.
+* **Embeddings**: against the official Sentence Transformers FP32 model on
+  the 16 workloads, CPU-Max reaches cosine similarity ≥ 0.99914 (mean
+  0.99970): near-FP32, not identical. The engine keeps upstream's precision
+  (Q8_0 weights and activations in the integer GEMMs, fp32 elsewhere).
+* **Retrieval**, because high cosine alone does not prove equal retrieval
+  quality. On four labelled sets the fork's recall matches FP32's within the
+  noise of these sample sizes, and its top-1 result equals FP32's for 99.3%
+  of Flickr30k queries, 98.0% of MSR-VTT queries and 98.3% of SciFact
+  queries — but **only for 80.2% of Clotho (audio) queries**. Clotho's 120
+  clips are near-ties (R@1 ≈ 0.13 for every backend, upstream agrees with
+  FP32 on 81%), so its rankings flip on tiny score differences; treat audio
+  ranking stability as the weakest measured point. The sets are small
+  (Flickr30k 1k test with 5,000 captions; 200 MSR-VTT 1k-A videos; 120
+  Clotho clips; SciFact with 300 queries and 5,183 documents): they
+  support "no measurable loss on these sets", not model-wide guarantees.
+* **Weight precision**: rounding the FP32 model's weights to Q8_0 costs at
+  most 0.0007 cosine; 4-bit weights cost 0.036 (text) to 0.084 (all towers),
+  so CPU-Max offers no lower-precision mode.
 * **Tests**: kernels against float64 references (`src/test_gemma2_vnni256.c`,
   `src/test_gemma2_attn.c`), fast towers against the reference towers
-  (`src/test_gemma2_media.c`), the whole server with upstream's own suite
-  (`make test-gemma2`), and responses under concurrent mixed load against the
-  same requests sent alone (`cpu-max/bench/stress_mixed.py`).
+  (`src/test_gemma2_media.c`), the server with upstream's suite
+  (`make test-gemma2`), and concurrent mixed load against the same requests
+  sent alone (`cpu-max/bench/stress_mixed.py`). Changes after the first fast
+  paths were checked to be bit-identical in output.
+
+## Compatibility with existing vector indexes
+
+Upstream deviates from the official model in three places: the vision MLP
+activation (QuickGELU instead of the configured `gelu_pytorch_tanh`, because
+the GGUF lacks the flag), the log-mel floor, and `MM:SS` timestamp text
+inserted before every video frame. CPU-Max follows the official model by
+default. **Embeddings from CPU-Max and from upstream are therefore not
+interchangeable** for images, audio and especially video: upstream's video
+embeddings are as far as cosine 0.876 from the official model's (CPU-Max:
+≥ 0.9998), and with upstream semantics only 75% of MSR-VTT top-1 results
+agree with FP32's. Do not mix them in one vector index: re-embed
+the corpus, or run CPU-Max with `EI_GEMMA2_SEMANTICS=upstream`, which
+reproduces upstream's embeddings to cosine ≥ 0.9992. Text embeddings are
+unaffected.
 
 ## Limitations and trade-offs
 
-* **One test machine.** All numbers come from a single Intel i7-14700HX
-  (AVX-VNNI, no AVX-512). CPUs with AVX-512 VNNI use upstream's repacked
-  GEMM for the integer GEMMs; ARM and pre-AVX2 x86 run the portable
-  fallbacks. Neither was built or measured here, and the GPU backends were
-  not built either.
-* **Memory**: peak RSS is 4-19% above upstream's (repacked weights are
-  anonymous memory where upstream reads the mapped GGUF), e.g. 936 vs
-  808 MB for text + image + audio (fresh server per workload). For scale:
-  over a whole benchmark run (all workloads in one process) PyTorch FP32
-  peaks at ~4.8 GB and ONNX Runtime at 4.8-5.3 GB.
-* **Concurrency**: on the CPU backend media requests run one at a time
-  (each already uses every core); text requests are interleaved between
-  tower layers, which slows a running media request by the text work done.
-* **Remaining bottlenecks** (ranked, with evidence, in
-  [`cpu-max/reports/bottlenecks.md`](cpu-max/reports/bottlenecks.md)):
-  vision attention (84% of a 1120-token image, fp32 FMA at about half the
-  issue rate), text attention for long inputs, the Q8 GEMMs.
-* **Embedding compatibility**: the default (official semantics) differs from
-  upstream's output for images, audio and especially video; see above.
+* **One machine, x86-64 only.** All results come from one i7-14700HX. CPUs
+  with AVX-512 VNNI use upstream's repacked GEMM for the integer GEMMs and
+  were not measured; CPUs without AVX-VNNI use upstream's AVX2 kernels for
+  them. ARM64 and macOS builds use upstream's portable/NEON code paths: they
+  compile in CI, but are not tested or benchmarked by CPU-Max. The GPU
+  backends are untouched and untested here.
+* **Media requests are serialized**: on the CPU backend one media request is
+  processed at a time (each uses every core); text requests are interleaved
+  between tower layers, which slows a running media request by the text work
+  done.
+* **Higher peak memory than upstream**: 4-19% more peak RSS per workload
+  (e.g. 936 vs 808 MB for text + image + audio), because repacked weights
+  are anonymous memory where upstream reads the mapped GGUF. For scale, over
+  a whole benchmark run PyTorch FP32 peaks at ~4.8 GB and ONNX Runtime at
+  4.8-5.3 GB.
+* **Remaining bottlenecks**, ranked with evidence in
+  [`cpu-max/reports/bottlenecks.md`](cpu-max/reports/bottlenecks.md): vision
+  attention (84% of a 1120-token image, fp32 FMA at about half the issue
+  rate), long-text attention, the Q8 GEMMs.
 
 ## Reproduce the benchmarks
 
-Everything beyond the engine lives in [`cpu-max/`](cpu-max/) (Python 3.12 via
-[uv](https://docs.astral.sh/uv/), CPU-only PyTorch; `ffmpeg` and `unzip` on
-the system). Downloads are pinned to the revisions used for the results.
+The suite lives in [`cpu-max/`](cpu-max/) (Python 3.12 via
+[uv](https://docs.astral.sh/uv/), CPU-only PyTorch; `ffmpeg` and `unzip`).
+Downloads are pinned to the revisions used for the results.
 
 ```sh
 cd cpu-max
-uv sync                                    # Sentence Transformers, Transformers, ONNX Runtime (CPU)
+uv sync                                    # PyTorch (CPU), Sentence Transformers, ONNX Runtime
 scripts/download_assets.sh                 # models + datasets (~5 GB; MSR-VTT archive 2.2 GB)
 scripts/setup_upstream.sh                  # unmodified upstream d8f9e33 as a git worktree, built
 (cd .. && make build/embeddinggemma build/test_gemma2_media build/test_gemma2_vnni256 \
@@ -354,53 +446,56 @@ scripts/run_upstream_P8.sh                 # upstream's scalar media towers at P
     reports/raw/final_upstream_{P8_t8_fast,ALL_t28}.json --speedup-vs quixi_upstream --out reports/benchmarks
 .venv/bin/python scripts/validate_embeddings.py --ref reports/raw/final_st_fp32_P8_t8.npz \
     --run fork=reports/raw/final_fork_<commit>_P8_t8.npz --out reports/quality_embeddings
-
 .venv/bin/python scripts/prepare_retrieval_data.py && scripts/run_retrieval.sh   # about 3 hours
 .venv/bin/python scripts/quant_study.py
 scripts/profile_final.sh P8                # per-stage profiles
-.venv/bin/python bench/hol_blocking.py --binary ../build/embeddinggemma --threads 8 --cpus P8 \
-    --media i280 --text t16 --out reports/raw/hol.json
 .venv/bin/python scripts/render_results.py --fork fork_<commit> > reports/results.md
 .venv/bin/python scripts/plot_bench.py --fork fork_<commit> --budget P8
 ```
 
-The benchmark host must be otherwise idle; `bench/run_bench.py --quiet-cores`
-waits for that and records the foreign load per measurement. Budgets
-(`P8`, `ALL`, …) are CPU lists for this machine (`bench/run_bench.py`,
-`BUDGETS`); adapt them to other CPUs.
+The machine must be otherwise idle; `bench/run_bench.py --quiet-cores`
+waits for that and records the foreign load per measurement. The budgets
+(`P8`, `ALL`, …) are CPU lists for the i7-14700HX in `bench/run_bench.py`
+(`BUDGETS`); adapt them to other CPUs. Artifact notes (which raw file feeds
+which table, and known anomalies) are in
+[`cpu-max/reports/README.md`](cpu-max/reports/README.md).
 
 ## Repository layout
 
 | path | contents |
 |---|---|
-| `src/`, `Makefile`, `testdata/`, `perf/`, `scripts/` | the engine: upstream's tree plus the CPU-Max commits (`CPU_MAX.md`) |
-| `README.upstream.md`, `CONTRIBUTING.md`, `EXTRACTION.md`, … | upstream's documentation, unchanged |
-| `cpu-max/bench/` | benchmark harness (backends, latency/throughput/memory runs, head-of-line probe, concurrency stress) |
-| `cpu-max/scripts/` | asset downloads, fixtures, run matrices, retrieval and quality evaluation, summaries, plots |
+| `src/`, `Makefile`, `testdata/`, `perf/`, `scripts/` | the engine: upstream's tree plus the CPU-Max commits ([`CPU_MAX.md`](CPU_MAX.md)) |
+| `install.sh` | source-build installer for CPU-Max |
+| `README.upstream.md`, `CONTRIBUTING.md`, `RELEASE.md`, … | upstream's documentation (with CPU-Max notes at the top where relevant) |
+| `cpu-max/bench/` | benchmark harness: latency, throughput, memory, head-of-line probe, concurrency stress |
+| `cpu-max/scripts/` | model and dataset downloads, fixtures, run queues, quality and retrieval evaluation, tables, plots |
 | `cpu-max/reports/` | results (JSON/CSV), optimization log, bottleneck analysis, plots, raw per-run data |
-| `cpu-max/examples/` | minimal HTTP client |
+| `cpu-max/examples/` | quick-start smoke test and a minimal client |
 
 ## Relationship to upstream
 
 This is an official GitHub fork of
 [QuixiAI/embeddinggemma.c](https://github.com/QuixiAI/embeddinggemma.c),
-based on its commit `d8f9e33`, with upstream's full history preserved.
-Every engine change is a separate commit on top of it
-(`git log d8f9e33..HEAD`), the upstream source tree keeps its layout, and
-its README is kept as [`README.upstream.md`](README.upstream.md). The unmodified
-upstream engine is the main baseline of every benchmark here. This is an
-independent project, not affiliated with or endorsed by QuixiAI or Google.
+based on its commit `d8f9e33` (upstream `main`, eight commits after release
+`v0.3.1`), with upstream's full history preserved. Every engine change is a separate commit on top of it
+(`git log d8f9e33..HEAD -- src Makefile`); upstream's README is kept as
+[`README.upstream.md`](README.upstream.md). The unmodified upstream engine is
+the main baseline of every benchmark here. CPU-Max is an independent
+project, not affiliated with or endorsed by QuixiAI or Google.
+
+Contributions: see the CPU-Max section of [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Security issues: [`SECURITY.md`](SECURITY.md).
 
 ## License and acknowledgments
 
 * The engine is © QuixiAI under the MIT license ([`LICENSE`](LICENSE)); the
-  changes and the `cpu-max/` suite in this fork are released under the same
+  CPU-Max changes and the `cpu-max/` suite are released under the same
   license.
-* **EmbeddingGemma 2** is by Google DeepMind and is subject to the
-  [Gemma terms of use](https://ai.google.dev/gemma/terms); model weights are
-  not included in this repository. The GGUF conversion is by
-  [ggml-org](https://huggingface.co/ggml-org), the int8 ONNX export by the
-  [ONNX Community](https://huggingface.co/onnx-community).
+* **EmbeddingGemma 2** is by **Google DeepMind** and subject to the
+  [Gemma terms of use](https://ai.google.dev/gemma/terms); no model weights
+  are included in this repository. The GGUF conversion is by
+  [ggml-org](https://huggingface.co/ggml-org); the INT8 ONNX export used as a
+  baseline is by the [ONNX Community](https://huggingface.co/onnx-community).
 * `stb_image` (public domain / MIT) is vendored by upstream.
 * Baselines and evaluation use [Sentence Transformers](https://www.sbert.net/),
   [Transformers](https://github.com/huggingface/transformers),

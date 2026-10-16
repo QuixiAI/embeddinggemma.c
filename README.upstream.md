@@ -1,3 +1,8 @@
+> **Note (EmbeddingGemma-2-CPU-Max):** this is upstream's README, kept for its
+> engine and HTTP API documentation. Its install command installs **upstream's**
+> release binaries from QuixiAI/embeddinggemma.c, not CPU-Max. To install
+> CPU-Max, see [`README.md`](README.md) (source build via `install.sh`).
+
 # embeddinggemma.c
 
 **The fastest way to serve EmbeddingGemma. Anywhere.**

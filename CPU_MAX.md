@@ -40,6 +40,11 @@ caching, and all GPU backends.
 | `6d1ce48` | log-mel frames on the engine pool, Hann window table (bit-identical) | `src/media.c`, `src/gemma2_audio_fast.c` |
 | `e114de5` | CPU media towers yield the engine to waiting text waves between layers (no head-of-line blocking) | `src/server.c`, `src/media.c`, `src/media.h`, `src/http_media.h`, towers |
 | `d74e061` | weight repack/packing runs on the caller's pool (cold first requests near warm speed) | `src/gemma2_vnni256.c`, `src/gemma2_sgemm_x86.c`, `src/gemma2_fast.c` |
+| `8cc7700` | build identity: `--version` and a startup line naming CPU-Max, its version, commit and upstream base | `src/cpu_max_version.h`, `src/server.c`, `Makefile`, `CPU_MAX_VERSION` |
+| `c4607c7` | portable builds: AVX-VNNI detected via CPUID (clang < 19), repack caches only on x86 (aarch64/macOS builds) | `src/gemma2_fast_x86.c`, `src/gemma2_vnni256.c`, `src/gemma2_sgemm_x86.c` |
+
+Benchmarks in `cpu-max/reports/` were measured at `5dd7dbf`; the two commits
+above change no inference arithmetic (embeddings re-checked byte for byte).
 
 All numerics keep upstream's choices: Q8_0 weights with Q8_0 activations
 for the integer GEMMs, fp32 attention, norms, softmax and accumulation.

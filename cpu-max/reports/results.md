@@ -1,67 +1,71 @@
-**Warm p50 latency, ms — 8 threads on the 8 P-cores (P8)**
+**Warm latency, ms, p50 (p95) — 8 threads on the 8 P-cores (P8)**
 
-| workload | this fork | Sentence Transformers FP32 | ONNX Community Q8 | QuixiAI upstream Q8 | fork vs fastest other, same budget |
+| workload | CPU-Max (Q8_0) | PyTorch FP32 (Sentence Transformers) | ONNX Runtime INT8 | upstream embeddinggemma.c (Q8_0) | fork vs fastest other, same budget (p50) |
 |---|---:|---:|---:|---:|---:|
-| text, 16 tokens | **8.6** | 20.4 | 36.8 | 17.4 | 2.03x |
-| text, 128 tokens | **29.5** | 77.5 | 84.7 | 117 | 2.63x |
-| text, 512 tokens | **134** | 250 | 292 | 556 | 1.87x |
-| image, 70 tokens (336x480) | **152** | 341 | 1,368 | 3,909 | 2.24x |
-| image, 280 tokens (672x960) | **942** | 1,829 | 3,028 | 32,082 | 1.94x |
-| image, 1120 tokens (1344x1920) | **10,140** | 13,646 | 14,321 | 552,466 | 1.35x |
-| audio, 5 s | **82.1** | 361 | 1,297 | 1,320 | 4.40x |
-| audio, 15 s | **241** | 654 | 2,014 | 3,935 | 2.71x |
-| audio, 30 s | **523** | 1,169 | 2,448 | 8,202 | 2.24x |
-| video, 4 frames | **1,482** | 3,265 | 4,332 | 42,652 | 2.20x |
-| video, 8 frames | **3,096** | 6,946 | 7,465 | 87,577 | 2.24x |
-| video, 16 frames | **6,405** | 16,418 | 14,392 | 161,199 | 2.25x |
-| text + image | **1,114** | 1,707 | 3,050 | 33,015 | 1.53x |
-| text + audio | **258** | 635 | 1,997 | 3,991 | 2.46x |
-| text + image + audio | **1,295** | 2,495 | 4,454 | 36,394 | 1.93x |
-| text + video | **3,137** | 7,276 | 7,519 | 87,103 | 2.32x |
+| text, 16 tokens | **8.6 (9.6)** | 20.4 (21.0) | 36.8 (37.4) | 17.4 (17.6) | 2.03x |
+| text, 128 tokens | **29.5 (29.7)** | 77.5 (78.5) | 84.7 (91.9) | 117 (128) | 2.63x |
+| text, 512 tokens | **134 (136)** | 250 (253) | 292 (295) | 556 (565) | 1.87x |
+| image, 70 tokens (336x480) | **152 (154)** | 341 (342) | 1,368 (1,525) | 3,909 (4,241) | 2.24x |
+| image, 280 tokens (672x960) | **942 (947)** | 1,829 (1,840) | 3,028 (3,139) | 32,082 (32,215) | 1.94x |
+| image, 1120 tokens (1344x1920) | **10,140 (10,562)** | 13,646 (13,676) | 14,321 (14,327) | 552,466 (554,508) | 1.35x |
+| audio, 5 s | **82.1 (83.1)** | 361 (406) | 1,297 (1,483) | 1,320 (1,330) | 4.40x |
+| audio, 15 s | **241 (243)** | 654 (734) | 2,014 (2,115) | 3,935 (4,244) | 2.71x |
+| audio, 30 s | **523 (524)** | 1,169 (1,490) | 2,448 (2,504) | 8,202 (8,603) | 2.24x |
+| video, 4 frames | **1,482 (1,496)** | 3,265 (3,309) | 4,332 (4,428) | 42,652 (46,146) | 2.20x |
+| video, 8 frames | **3,096 (3,145)** | 6,946 (6,960) | 7,465 (7,507) | 87,577 (95,909) | 2.24x |
+| video, 16 frames | **6,405 (6,422)** | 16,418 (17,979) | 14,392 (14,494) | 161,199 (170,245) | 2.25x |
+| text + image | **1,114 (1,178)** | 1,707 (1,716) | 3,050 (3,235) | 33,015 (34,190) | 1.53x |
+| text + audio | **258 (260)** | 635 (689) | 1,997 (2,055) | 3,991 (4,317) | 2.46x |
+| text + image + audio | **1,295 (1,308)** | 2,495 (2,604) | 4,454 (4,485) | 36,394 (37,071) | 1.93x |
+| text + video | **3,137 (3,289)** | 7,276 (9,353) | 7,519 (7,822) | 87,103 (87,788) | 2.32x |
 
-**Warm p50 latency, ms — all 28 hardware threads (ALL)**
+Same-budget geometric mean (P8, 16 workloads): 2.20x over the fastest other backend (minimum 1.35x).
 
-| workload | this fork | Sentence Transformers FP32 | ONNX Community Q8 | QuixiAI upstream Q8 | fork vs fastest other, same budget |
+**Warm latency, ms, p50 (p95) — all 28 hardware threads (ALL)**
+
+| workload | CPU-Max (Q8_0) | PyTorch FP32 (Sentence Transformers) | ONNX Runtime INT8 | upstream embeddinggemma.c (Q8_0) | fork vs fastest other, same budget (p50) |
 |---|---:|---:|---:|---:|---:|
-| text, 16 tokens | **8.9** | 28.2 | 68.0 | 21.9 | 2.47x |
-| text, 128 tokens | **29.3** | 96.0 | 158 | 108 | 3.27x |
-| text, 512 tokens | **128** | 344 | 408 | 398 | 2.69x |
-| image, 70 tokens (336x480) | **139** | 419 | 1,824 | 2,548 | 3.03x |
-| image, 280 tokens (672x960) | **783** | 3,709 | 3,294 | – | 4.21x |
-| image, 1120 tokens (1344x1920) | **7,678** | 25,366 | 12,142 | – | 1.58x |
-| audio, 5 s | **84.6** | 1,852 | 1,648 | 987 | 11.66x |
-| audio, 15 s | **237** | 4,126 | 2,470 | 2,911 | 10.40x |
-| audio, 30 s | **441** | 18,259 | 2,995 | – | 6.79x |
-| video, 4 frames | **1,271** | 12,703 | 4,579 | – | 3.60x |
-| video, 8 frames | **2,560** | 18,955 | 7,219 | – | 2.82x |
-| video, 16 frames | **5,313** | 23,168 | 14,481 | – | 2.73x |
-| text + image | **849** | 10,109 | 3,314 | – | 3.90x |
-| text + audio | **254** | 6,109 | 2,384 | 2,901 | 9.37x |
-| text + image + audio | **1,070** | 11,795 | 4,987 | – | 4.66x |
-| text + video | **2,629** | 21,358 | 7,142 | – | 2.72x |
+| text, 16 tokens | **8.9 (12.7)** | 28.2 (34.0) | 68.0 (73.3) | 21.9 (24.1) | 2.47x |
+| text, 128 tokens | **29.3 (29.7)** | 96.0 (1,849) | 158 (256) | 108 (111) | 3.27x |
+| text, 512 tokens | **128 (130)** | 344 (1,976) | 408 (499) | 398 (434) | 2.69x |
+| image, 70 tokens (336x480) | **139 (152)** | 419 (4,657) | 1,824 (2,036) | 2,548 (2,572) | 3.03x |
+| image, 280 tokens (672x960) | **783 (826)** | 3,709 (5,216) | 3,294 (3,530) | – | 4.21x |
+| image, 1120 tokens (1344x1920) | **7,678 (7,823)** | 25,366 (27,197) | 12,142 (13,083) | – | 1.58x |
+| audio, 5 s | **84.6 (86.4)** | 1,852 (3,558) | 1,648 (2,021) | 987 (1,002) | 11.66x |
+| audio, 15 s | **237 (251)** | 4,126 (8,433) | 2,470 (2,698) | 2,911 (3,032) | 10.40x |
+| audio, 30 s | **441 (461)** | 18,259 (18,894) | 2,995 (3,236) | – | 6.79x |
+| video, 4 frames | **1,271 (4,569)** | 12,703 (14,208) | 4,579 (5,060) | – | 3.60x |
+| video, 8 frames | **2,560 (3,404)** | 18,955 (19,005) | 7,219 (7,504) | – | 2.82x |
+| video, 16 frames | **5,313 (5,337)** | 23,168 (24,622) | 14,481 (15,445) | – | 2.73x |
+| text + image | **849 (872)** | 10,109 (15,189) | 3,314 (3,537) | – | 3.90x |
+| text + audio | **254 (271)** | 6,109 (10,606) | 2,384 (2,506) | 2,901 (2,918) | 9.37x |
+| text + image + audio | **1,070 (1,098)** | 11,795 (12,890) | 4,987 (5,310) | – | 4.66x |
+| text + video | **2,629 (6,952)** | 21,358 (21,682) | 7,142 (7,259) | – | 2.72x |
+
+Same-budget geometric mean (ALL, 16 workloads): 4.02x over the fastest other backend (minimum 1.58x).
 
 **Best thread budget per backend (P8 or ALL), p50 ms**
 
-| workload | this fork | Sentence Transformers FP32 | ONNX Community Q8 | QuixiAI upstream Q8 | fork vs fastest other |
+| workload | CPU-Max (Q8_0) | PyTorch FP32 (Sentence Transformers) | ONNX Runtime INT8 | upstream embeddinggemma.c (Q8_0) | fork vs fastest other |
 |---|---:|---:|---:|---:|---:|
 | text, 16 tokens | **8.6 (P8)** | 20.4 (P8) | 36.8 (P8) | 17.4 (P8) | 2.03x vs upstream |
-| text, 128 tokens | **29.3 (ALL)** | 77.5 (P8) | 84.7 (P8) | 108 (ALL) | 2.64x vs ST FP32 |
-| text, 512 tokens | **128 (ALL)** | 250 (P8) | 292 (P8) | 398 (ALL) | 1.95x vs ST FP32 |
-| image, 70 tokens (336x480) | **139 (ALL)** | 341 (P8) | 1,368 (P8) | 2,548 (ALL) | 2.46x vs ST FP32 |
-| image, 280 tokens (672x960) | **783 (ALL)** | 1,829 (P8) | 3,028 (P8) | 32,082 (P8) | 2.34x vs ST FP32 |
-| image, 1120 tokens (1344x1920) | **7,678 (ALL)** | 13,646 (P8) | 12,142 (ALL) | 552,466 (P8) | 1.58x vs ONNX Q8 |
-| audio, 5 s | **82.1 (P8)** | 361 (P8) | 1,297 (P8) | 987 (ALL) | 4.40x vs ST FP32 |
-| audio, 15 s | **237 (ALL)** | 654 (P8) | 2,014 (P8) | 2,911 (ALL) | 2.76x vs ST FP32 |
-| audio, 30 s | **441 (ALL)** | 1,169 (P8) | 2,448 (P8) | 8,202 (P8) | 2.65x vs ST FP32 |
-| video, 4 frames | **1,271 (ALL)** | 3,265 (P8) | 4,332 (P8) | 42,652 (P8) | 2.57x vs ST FP32 |
-| video, 8 frames | **2,560 (ALL)** | 6,946 (P8) | 7,219 (ALL) | 87,577 (P8) | 2.71x vs ST FP32 |
-| video, 16 frames | **5,313 (ALL)** | 16,418 (P8) | 14,392 (P8) | 161,199 (P8) | 2.71x vs ONNX Q8 |
-| text + image | **849 (ALL)** | 1,707 (P8) | 3,050 (P8) | 33,015 (P8) | 2.01x vs ST FP32 |
-| text + audio | **254 (ALL)** | 635 (P8) | 1,997 (P8) | 2,901 (ALL) | 2.50x vs ST FP32 |
-| text + image + audio | **1,070 (ALL)** | 2,495 (P8) | 4,454 (P8) | 36,394 (P8) | 2.33x vs ST FP32 |
-| text + video | **2,629 (ALL)** | 7,276 (P8) | 7,142 (ALL) | 87,103 (P8) | 2.72x vs ONNX Q8 |
+| text, 128 tokens | **29.3 (ALL)** | 77.5 (P8) | 84.7 (P8) | 108 (ALL) | 2.64x vs PyTorch FP32 |
+| text, 512 tokens | **128 (ALL)** | 250 (P8) | 292 (P8) | 398 (ALL) | 1.95x vs PyTorch FP32 |
+| image, 70 tokens (336x480) | **139 (ALL)** | 341 (P8) | 1,368 (P8) | 2,548 (ALL) | 2.46x vs PyTorch FP32 |
+| image, 280 tokens (672x960) | **783 (ALL)** | 1,829 (P8) | 3,028 (P8) | 32,082 (P8) | 2.34x vs PyTorch FP32 |
+| image, 1120 tokens (1344x1920) | **7,678 (ALL)** | 13,646 (P8) | 12,142 (ALL) | 552,466 (P8) | 1.58x vs ONNX Runtime INT8 |
+| audio, 5 s | **82.1 (P8)** | 361 (P8) | 1,297 (P8) | 987 (ALL) | 4.40x vs PyTorch FP32 |
+| audio, 15 s | **237 (ALL)** | 654 (P8) | 2,014 (P8) | 2,911 (ALL) | 2.76x vs PyTorch FP32 |
+| audio, 30 s | **441 (ALL)** | 1,169 (P8) | 2,448 (P8) | 8,202 (P8) | 2.65x vs PyTorch FP32 |
+| video, 4 frames | **1,271 (ALL)** | 3,265 (P8) | 4,332 (P8) | 42,652 (P8) | 2.57x vs PyTorch FP32 |
+| video, 8 frames | **2,560 (ALL)** | 6,946 (P8) | 7,219 (ALL) | 87,577 (P8) | 2.71x vs PyTorch FP32 |
+| video, 16 frames | **5,313 (ALL)** | 16,418 (P8) | 14,392 (P8) | 161,199 (P8) | 2.71x vs ONNX Runtime INT8 |
+| text + image | **849 (ALL)** | 1,707 (P8) | 3,050 (P8) | 33,015 (P8) | 2.01x vs PyTorch FP32 |
+| text + audio | **254 (ALL)** | 635 (P8) | 1,997 (P8) | 2,901 (ALL) | 2.50x vs PyTorch FP32 |
+| text + image + audio | **1,070 (ALL)** | 2,495 (P8) | 4,454 (P8) | 36,394 (P8) | 2.33x vs PyTorch FP32 |
+| text + video | **2,629 (ALL)** | 7,276 (P8) | 7,142 (ALL) | 87,103 (P8) | 2.72x vs ONNX Runtime INT8 |
 
-Geometric mean over the 16 workloads: **2.46x** faster than the fastest other backend for each workload (minimum 1.58x).
+Geometric mean over the 16 workloads: **2.46x** faster than the fastest other tested backend for each workload, each backend at its best budget (minimum 1.58x).
 
 **Final-embedding cosine vs the official Sentence Transformers FP32 model (same inputs)**
 

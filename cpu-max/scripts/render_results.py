@@ -23,9 +23,10 @@ ITEMS = [("t16", "text, 16 tokens"), ("t128", "text, 128 tokens"), ("t512", "tex
          ("a30", "audio, 30 s"), ("v4", "video, 4 frames"), ("v8", "video, 8 frames"), ("v16", "video, 16 frames"),
          ("m_ti", "text + image"), ("m_ta", "text + audio"), ("m_tia", "text + image + audio"),
          ("m_tv", "text + video")]
-BASES = [("st_fp32", "Sentence Transformers FP32"), ("onnx_q8", "ONNX Community Q8"),
-         ("quixi_upstream", "QuixiAI upstream Q8")]
-SHORT = {"Sentence Transformers FP32": "ST FP32", "ONNX Community Q8": "ONNX Q8", "QuixiAI upstream Q8": "upstream"}
+BASES = [("st_fp32", "PyTorch FP32 (Sentence Transformers)"), ("onnx_q8", "ONNX Runtime INT8"),
+         ("quixi_upstream", "upstream embeddinggemma.c (Q8_0)")]
+SHORT = {"PyTorch FP32 (Sentence Transformers)": "PyTorch FP32", "ONNX Runtime INT8": "ONNX Runtime INT8",
+         "upstream embeddinggemma.c (Q8_0)": "upstream"}
 
 
 def load(name: str):
@@ -42,24 +43,34 @@ def ms(v: float | None) -> str:
 def latency(fork: str) -> list[str]:
     rows = load("benchmarks.json")["rows"]
     by = {(r["backend"], r["budget"], r["item"]): r["p50_ms"] for r in rows}
+    p95 = {(r["backend"], r["budget"], r["item"]): r["p95_ms"] for r in rows}
     out = []
     for budget, title in (("P8", "8 threads on the 8 P-cores (P8)"), ("ALL", "all 28 hardware threads (ALL)")):
-        out += [f"**Warm p50 latency, ms — {title}**", "",
-                "| workload | this fork | " + " | ".join(n for _, n in BASES) + " | fork vs fastest other, same budget |",
+        out += [f"**Warm latency, ms, p50 (p95) — {title}**", "",
+                "| workload | CPU-Max (Q8_0) | " + " | ".join(n for _, n in BASES) + " | fork vs fastest other, same budget (p50) |",
                 "|---|---:|" + "---:|" * len(BASES) + "---:|"]
+        logs = []
         for item, label in ITEMS:
             f = by.get((fork, budget, item))
-            others = [(by.get((b, budget, item)), n) for b, n in BASES]
+            others = [(by.get((b, budget, item)), n, p95.get((b, budget, item))) for b, n in BASES]
             if f is None:
                 continue
-            avail = [(v, n) for v, n in others if v is not None]
+            avail = [(v, n) for v, n, _ in others if v is not None]
             best = min(avail) if avail else None
+            if best:
+                logs.append(math.log(best[0] / f))
             sp = f"{best[0] / f:.2f}x" if best else "–"
-            out.append(f"| {label} | **{ms(f)}** | " + " | ".join(ms(v) for v, _ in others) + f" | {sp} |")
+            cell = lambda v, q: f"{ms(v)} ({ms(q)})" if v is not None else "–"
+            out.append(f"| {label} | **{cell(f, p95[(fork, budget, item)])}** | "
+                       + " | ".join(cell(v, q) for v, _, q in others) + f" | {sp} |")
+        if logs:
+            out += ["", f"Same-budget geometric mean ({budget}, {len(logs)} workloads): "
+                        f"{math.exp(sum(logs) / len(logs)):.2f}x over the fastest other backend "
+                        f"(minimum {math.exp(min(logs)):.2f}x)."]
         out.append("")
     # Best configuration per backend (P8 or ALL, whichever is faster for that backend and workload).
     out += ["**Best thread budget per backend (P8 or ALL), p50 ms**", "",
-            "| workload | this fork | " + " | ".join(n for _, n in BASES) + " | fork vs fastest other |",
+            "| workload | CPU-Max (Q8_0) | " + " | ".join(n for _, n in BASES) + " | fork vs fastest other |",
             "|---|---:|" + "---:|" * len(BASES) + "---:|"]
     logs = []
     for item, label in ITEMS:
@@ -77,7 +88,8 @@ def latency(fork: str) -> list[str]:
         out.append(f"| {label} | **{cell(f)}** | " + " | ".join(cell(v) for v, _ in others)
                    + f" | {best[0] / f[0]:.2f}x vs {SHORT[best[1]]} |")
     out += ["", f"Geometric mean over the {len(logs)} workloads: **{math.exp(sum(logs) / len(logs)):.2f}x** faster than the "
-            f"fastest other backend for each workload (minimum {math.exp(min(logs)):.2f}x).", ""]
+            f"fastest other tested backend for each workload, each backend at its best budget "
+            f"(minimum {math.exp(min(logs)):.2f}x).", ""]
     return out
 
 

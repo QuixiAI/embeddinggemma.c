@@ -95,8 +95,8 @@ def speedup(rows, fork, bases, names, budget):
     ax.axhline(1, color=INK2, linewidth=1)
     ax.set_yscale("log")
     ax.set_xticks(range(len(items)), [LABEL[i] for i in items], rotation=45, ha="right")
-    ax.set_ylabel("fork speedup (p50, log)", color=INK2, fontsize=8)
-    ax.set_title(f"End-to-end speedup of the fork ({budget})", color=INK, fontsize=10, loc="left")
+    ax.set_ylabel("CPU-Max speedup (p50, log)", color=INK2, fontsize=8)
+    ax.set_title(f"End-to-end speedup of CPU-Max ({budget}, p50)", color=INK, fontsize=10, loc="left")
     ax.legend(frameon=False, fontsize=8, labelcolor=INK)
     fig.tight_layout()
     fig.savefig(OUT / f"speedup_{budget}.png", dpi=150)
@@ -188,8 +188,8 @@ def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     data = json.loads((ROOT / "reports" / "benchmarks.json").read_text())
     rows = {(r["backend"], r["budget"], r["item"]): r for r in data["rows"]}
-    names = {args.fork: "fork (this work)", "st_fp32": "Sentence Transformers FP32", "onnx_q8": "ONNX Community Q8",
-             "quixi_upstream": "QuixiAI upstream Q8"}
+    names = {args.fork: "CPU-Max (Q8_0)", "st_fp32": "PyTorch FP32 (Sentence Transformers)", "onnx_q8": "ONNX Runtime INT8",
+             "quixi_upstream": "upstream embeddinggemma.c (Q8_0)"}
     backends = [b for b in (args.fork, "st_fp32", "onnx_q8", "quixi_upstream") if any(k[0] == b for k in rows)]
     latency(rows, backends, names, args.budget)
     speedup(rows, args.fork, [(b, i) for i, b in enumerate(backends) if b != args.fork], names, args.budget)
@@ -202,7 +202,7 @@ def main() -> None:
         if r.get("item_peak_rss_mb") and not r["backend"].endswith("_prepack"):  # prepack: table only
             mem.setdefault(r["backend"], {})[r["item"]] = r["item_peak_rss_mb"]
     if mem:
-        names.update({k: "fork, weight-page release off" if k.endswith("_norelease") else names.get(k, k) for k in mem})
+        names.update({k: "CPU-Max, weight-page release off" if k.endswith("_norelease") else names.get(k, k) for k in mem})
         memory(mem, names)
     print("wrote", sorted(p.name for p in OUT.glob("*.png")))
 

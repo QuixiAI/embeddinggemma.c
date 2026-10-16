@@ -1,6 +1,7 @@
 /* cpu-max fork: exactness and throughput of the Q8_0 GEMM routes.
  *
  *   test_gemma2_vnni256 [NxMxK ...]     (default: the vision/audio/text shapes)
+ *   fNxMxK / FNxMxK: the float-weight GEMM with BF16 / F32 weights (EI_GEMMA2_CPU_SGEMM=0: upstream)
  *
  * Random Q8_0 weights and activations; the result of ei_gemma2_fast_gemm_q8
  * (whatever route the dispatch picks: set EI_GEMMA2_CPU_VNNI256=0 for the
@@ -45,6 +46,51 @@ int main(int argc, char **argv) {
     bool ok = true;
     for (int c = 0; c < n_cases; c++) {
         int n, m, k;
+        if (cases[c][0] == 'f' || cases[c][0] == 'F') { /* float-weight GEMM: f = BF16, F = F32 weights */
+            bool bf16 = cases[c][0] == 'f';
+            if (sscanf(cases[c] + 1, "%dx%dx%d", &n, &m, &k) != 3)
+                ei_die("bad case %s", cases[c]);
+            float *wf = ei_xmalloc((size_t)m * k * sizeof(float)), *x = ei_xmalloc((size_t)n * k * sizeof(float));
+            uint16_t *wb = ei_xmalloc((size_t)m * k * sizeof(uint16_t));
+            for (size_t i = 0; i < (size_t)m * k; i++) {
+                float f = frand() * 0.1f;
+                uint32_t bits;
+                memcpy(&bits, &f, 4);
+                wb[i] = (uint16_t)(bits >> 16);
+                bits = (uint32_t)wb[i] << 16;
+                memcpy(&wf[i], &bits, 4); /* the exact value the BF16 tensor holds */
+            }
+            for (size_t i = 0; i < (size_t)n * k; i++)
+                x[i] = frand() * 3.0f;
+            ei_tensor *wt = ei_xmalloc(sizeof *wt);
+            *wt = (ei_tensor){.n_dims = 2, .ne = {(uint64_t)k, (uint64_t)m, 1, 1},
+                              .type = bf16 ? EI_T_BF16 : EI_T_F32, .data = bf16 ? (void *)wb : (void *)wf};
+            float *yf = ei_xmalloc((size_t)n * m * sizeof(float));
+            double times[5];
+            for (int rep = 0; rep < 6; rep++) {
+                double t0 = now_ms();
+                ei_gemma2_fast_gemm_f(pool, wt, x, n, yf);
+                if (rep)
+                    times[rep - 1] = now_ms() - t0;
+            }
+            qsort(times, 5, sizeof *times, cmp_double);
+            double max_rel = 0;
+            for (int t = 0; t < n; t += n > 64 ? 29 : 1)
+                for (int r = 0; r < m; r += m > 256 ? 11 : 1) {
+                    double ref = 0, mag = 0;
+                    for (int z = 0; z < k; z++)
+                        ref += (double)wf[(size_t)r * k + z] * x[(size_t)t * k + z],
+                            mag += fabs((double)wf[(size_t)r * k + z] * x[(size_t)t * k + z]);
+                    double rel = fabs(yf[(size_t)t * m + r] - ref) / (mag > 0 ? mag : 1);
+                    max_rel = rel > max_rel ? rel : max_rel;
+                }
+            printf("%-16s median %8.3f ms  %8.1f GMAC/s  max_rel_err %.2e (float weights, %s)\n", cases[c], times[2],
+                   (double)n * m * k / (times[2] * 1e6), max_rel, bf16 ? "BF16" : "F32");
+            if (!(max_rel < 1e-5))
+                ok = false;
+            free(x), free(yf);
+            continue;
+        }
         if (sscanf(cases[c], "%dx%dx%d", &n, &m, &k) != 3 || k % 32)
             ei_die("bad case %s (NxMxK, K multiple of 32)", cases[c]);
         ei_block_q8_0 *wq = ei_xmalloc((size_t)m * k / 32 * sizeof *wq);

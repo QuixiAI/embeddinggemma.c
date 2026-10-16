@@ -99,7 +99,7 @@ HDRS_NATIVE := $(wildcard src/*.h src/vendor/*.h)
 SRCS_CORE := src/gguf.c
 SRCS_MODEL := $(SRCS_CORE) src/model.c
 SRCS_TOKENIZER := $(SRCS_MODEL) src/tokenizer.c
-SRCS_ENGINE := $(SRCS_TOKENIZER) src/quants.c src/kernels.c src/parallel.c src/engine.c src/gemma2.c src/gemma2_fast.c src/gemma2_fast_x86.c src/gemma2_vision_fast.c src/gemma2_audio_fast.c src/gemma2_media_x86.c src/gemma2_vnni256.c src/media.c src/response_cache.c
+SRCS_ENGINE := $(SRCS_TOKENIZER) src/quants.c src/kernels.c src/parallel.c src/engine.c src/gemma2.c src/gemma2_fast.c src/gemma2_fast_x86.c src/gemma2_vision_fast.c src/gemma2_audio_fast.c src/gemma2_media_x86.c src/gemma2_vnni256.c src/gemma2_sgemm_x86.c src/media.c src/response_cache.c
 SRCS_SERVICE := src/inference_service.c
 SRCS_SERVER := src/server.c src/float_format.c
 
@@ -754,5 +754,5 @@ test-gemma2-vnni256: $(BUILD)/test_gemma2_vnni256
 	./$(BUILD)/test_gemma2_vnni256
 
 # cpu-max fork: tiled attention kernel vs its scalar reference.
-$(BUILD)/test_gemma2_attn: src/test_gemma2_attn.c src/gemma2_media_x86.c src/gemma2_fast_x86.c $(HDRS_NATIVE) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ src/test_gemma2_attn.c src/gemma2_media_x86.c src/gemma2_fast_x86.c src/quants.c src/kernels.c src/gguf.c src/parallel.c $(LDLIBS)
+$(BUILD)/test_gemma2_attn: src/test_gemma2_attn.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/test_gemma2_attn.c $(SRCS_ENGINE) $(LDLIBS)

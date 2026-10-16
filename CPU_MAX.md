@@ -1,11 +1,13 @@
 # cpu-max: CPU media fast paths and AVX-VNNI kernels for EmbeddingGemma 2
 
-This branch (`cpu-max`) is a fork of
+This repository is a fork of
 [QuixiAI/embeddinggemma.c](https://github.com/QuixiAI/embeddinggemma.c) at
 upstream commit `d8f9e33` (MIT license, retained in `LICENSE`; copyright
-QuixiAI). Every change is a separate commit on top of upstream, so
-`git log d8f9e33..cpu-max` and `git diff d8f9e33 cpu-max` show exactly what
-differs. The model graph, GGUF files and HTTP API are upstream's; the changes are CPU
+QuixiAI). Every engine change is a separate commit on top of upstream, so
+`git log d8f9e33..HEAD -- src Makefile` and `git diff d8f9e33 HEAD -- src Makefile`
+show exactly what differs in the engine. The benchmark suite, evaluations and
+reports are in [`cpu-max/`](cpu-max/); the project overview is `README.md`
+(upstream's README is kept as `README.upstream.md`). The model graph, GGUF files and HTTP API are upstream's; the changes are CPU
 execution paths, kernels, tests, flags, and three semantic defaults that now
 follow the official implementation (see Flags).
 
@@ -16,28 +18,28 @@ The SIMD packed-batch *text* graph (`gemma2_fast.c`), its x86 kernels
 i8mm, the spin thread pool, CPU workers with L3-aware pinning, batching and
 caching, and all GPU backends.
 
-## What this branch adds
+## What this fork adds
 
 | commit | change | files |
 |---|---|---|
-| `b0978d2` | `EI_GEMMA2_REF_PROFILE=1`: op-class timers in the reference vision/audio graphs | `src/gemma2.c` |
-| `7e6ff24` | CPU **vision** fast path (upstream ran it in the scalar reference graph); repacked **256-bit AVX-VNNI Q8_0 GEMM** for CPUs without AVX-512 | `src/gemma2_vision_fast.c`, `src/gemma2_media_x86.c`, `src/gemma2_vnni256.c`, hooks in `src/gemma2.c`, `src/gemma2_fast.c` |
-| `3765d9d` | CPU **audio** fast path | `src/gemma2_audio_fast.c` |
-| `685ad10` | tiled online-softmax attention for head widths 64-512 (GQA, windows, packed bounds); the text graph uses it on x86 | `src/gemma2_media_x86.c`, `src/gemma2_fast.c` |
-| `aa62f82` | packed fp32 GEMM for the BF16/F32-weight projections | `src/gemma2_sgemm_x86.c`, `src/gemma2_fast.c` |
-| `abd4e2a` | fidelity flags (official activation, log-mel, video layout) | `src/media.c`, `src/http_media.h` |
-| `08fb375` | VNNI256 for waves of <= 8 tokens; release GGUF pages of repacked weights | `src/gemma2_fast.c`, `src/gemma2_release.h`, `src/gguf.c` |
-| `4141ac4` | official semantics by default (`EI_GEMMA2_SEMANTICS=upstream` restores upstream) | `src/gemma2_vision_fast.c`, `src/gemma2.c`, `src/media.c`, `src/http_media.h` |
-| `320dee5` | hybrid P/E-core aware CPU pool (P-cores first, caller on a P-core, small waves capped to P-cores) | `src/parallel.c`, `src/engine.c`, `src/gemma2_fast.c`, towers |
-| `e7cabc7` | `make test-gemma2` runs the llama.cpp goldens with upstream semantics | `Makefile` |
-| `e150672` | attention block-size hooks for tuning (`EI_G2M_QB`, `-DG2M_KB`); defaults unchanged | `src/gemma2_media_x86.c` |
-| `019382b` | fp16 scales / int16 sums in the VNNI256 repack; streamed audio subsampling (less resident memory, bit-identical) | `src/gemma2_vnni256.c`, `src/gemma2_audio_fast.c` |
-| `563ee14` | vision attention reads head-major K/V planes (bit-identical, faster at large images) | `src/gemma2_vision_fast.c`, `src/test_gemma2_attn.c` |
-| `d495f8d` | `EI_GEMMA2_CPU_PREPACK=1`: repack CPU weights at startup | `src/server.c` |
-| `97a6b53` | vision attention writes into the free V buffer (one workspace buffer less) | `src/gemma2_vision_fast.c` |
-| `3a2d2d5` | log-mel frames on the engine pool, Hann window table (bit-identical) | `src/media.c`, `src/gemma2_audio_fast.c` |
-| `466a818` | CPU media towers yield the engine to waiting text waves between layers (no head-of-line blocking) | `src/server.c`, `src/media.c`, `src/media.h`, `src/http_media.h`, towers |
-| `1ba40e2` | weight repack/packing runs on the caller's pool (cold first requests near warm speed) | `src/gemma2_vnni256.c`, `src/gemma2_sgemm_x86.c`, `src/gemma2_fast.c` |
+| `8120079` | `EI_GEMMA2_REF_PROFILE=1`: op-class timers in the reference vision/audio graphs | `src/gemma2.c` |
+| `3ec5d16` | CPU **vision** fast path (upstream ran it in the scalar reference graph); repacked **256-bit AVX-VNNI Q8_0 GEMM** for CPUs without AVX-512 | `src/gemma2_vision_fast.c`, `src/gemma2_media_x86.c`, `src/gemma2_vnni256.c`, hooks in `src/gemma2.c`, `src/gemma2_fast.c` |
+| `78a761a` | CPU **audio** fast path | `src/gemma2_audio_fast.c` |
+| `d5f92ff` | tiled online-softmax attention for head widths 64-512 (GQA, windows, packed bounds); the text graph uses it on x86 | `src/gemma2_media_x86.c`, `src/gemma2_fast.c` |
+| `b80e57a` | packed fp32 GEMM for the BF16/F32-weight projections | `src/gemma2_sgemm_x86.c`, `src/gemma2_fast.c` |
+| `eb60d91` | fidelity flags (official activation, log-mel, video layout) | `src/media.c`, `src/http_media.h` |
+| `1a3e206` | VNNI256 for waves of <= 8 tokens; release GGUF pages of repacked weights | `src/gemma2_fast.c`, `src/gemma2_release.h`, `src/gguf.c` |
+| `fcb176f` | official semantics by default (`EI_GEMMA2_SEMANTICS=upstream` restores upstream) | `src/gemma2_vision_fast.c`, `src/gemma2.c`, `src/media.c`, `src/http_media.h` |
+| `97fdcc7` | hybrid P/E-core aware CPU pool (P-cores first, caller on a P-core, small waves capped to P-cores) | `src/parallel.c`, `src/engine.c`, `src/gemma2_fast.c`, towers |
+| `aaf445d` | `make test-gemma2` runs the llama.cpp goldens with upstream semantics | `Makefile` |
+| `2cd784b` | attention block-size hooks for tuning (`EI_G2M_QB`, `-DG2M_KB`); defaults unchanged | `src/gemma2_media_x86.c` |
+| `a77b187` | fp16 scales / int16 sums in the VNNI256 repack; streamed audio subsampling (less resident memory, bit-identical) | `src/gemma2_vnni256.c`, `src/gemma2_audio_fast.c` |
+| `d9da7bf` | vision attention reads head-major K/V planes (bit-identical, faster at large images) | `src/gemma2_vision_fast.c`, `src/test_gemma2_attn.c` |
+| `e3dfb02` | `EI_GEMMA2_CPU_PREPACK=1`: repack CPU weights at startup | `src/server.c` |
+| `f665036` | vision attention writes into the free V buffer (one workspace buffer less) | `src/gemma2_vision_fast.c` |
+| `6d1ce48` | log-mel frames on the engine pool, Hann window table (bit-identical) | `src/media.c`, `src/gemma2_audio_fast.c` |
+| `e114de5` | CPU media towers yield the engine to waiting text waves between layers (no head-of-line blocking) | `src/server.c`, `src/media.c`, `src/media.h`, `src/http_media.h`, towers |
+| `d74e061` | weight repack/packing runs on the caller's pool (cold first requests near warm speed) | `src/gemma2_vnni256.c`, `src/gemma2_sgemm_x86.c`, `src/gemma2_fast.c` |
 
 All numerics keep upstream's choices: Q8_0 weights with Q8_0 activations
 for the integer GEMMs, fp32 attention, norms, softmax and accumulation.
@@ -57,7 +59,7 @@ Defaults are on where the hardware supports them; `0` restores upstream.
 | `EI_GEMMA2_CPU_RELEASE_WEIGHTS` | 1 | drop GGUF pages of repacked weights |
 | `EI_CPU_HYBRID` | 1 on hybrid CPUs | pin the gemma2 CPU pool P-cores first (`0`: upstream's unpinned pool) |
 | `EI_GEMMA2_CPU_HYBRID_TOKENS` | 512 | text waves below this run on the P-core threads only |
-| `EI_GEMMA2_CPU_PREPACK` | 0 | repack text/vision/audio weights before listening (all towers resident from startup; the remaining first-request cost is small since `1ba40e2`) |
+| `EI_GEMMA2_CPU_PREPACK` | 0 | repack text/vision/audio weights before listening (all towers resident from startup; the remaining first-request cost is small since `d74e061`) |
 | `EI_GEMMA2_CPU_YIELD` | 1 | CPU media towers hand the engine to waiting text waves between layers (`0`: a text wave waits for the whole tower) |
 | `EI_GEMMA2_CPU_PROFILE` | 0 | per-stage timers (text, vision, audio) |
 | `EI_G2M_QB` | per head width | attention query block override (tuning only) |
@@ -71,7 +73,7 @@ Why the default changed: against the official Sentence Transformers FP32
 embeddings on the benchmark workloads, upstream semantics reach cosine
 0.8746 (video with timestamps) to 0.9998; official semantics reach
 >= 0.99914 on every workload (mean 0.99970).  Measurements:
-`reports/quality_embeddings.*` in the parent project.
+`cpu-max/reports/quality_embeddings.*`.
 
 ## Tests
 

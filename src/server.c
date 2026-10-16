@@ -1849,6 +1849,43 @@ static bool execute_engine_batch_slot(void *opaque, size_t slot, const int32_t *
                                              err_len);
 }
 
+/* cpu-max: EI_GEMMA2_CPU_PREPACK=1 runs a one-token text, a 48x48 image and
+ * a short silent clip through the CPU graphs before the server listens, so
+ * the one-time weight repack (0.3-0.4 s per tower) is not paid by the first
+ * request of each modality. Off by default: the repacked copies of towers a
+ * deployment never uses would stay resident. */
+static void cpu_prepack(ei_engine *e, const ei_gguf *projector) {
+    const char *v = getenv("EI_GEMMA2_CPU_PREPACK");
+    if (!v || !strcmp(v, "0") || !e->model.embeddinggemma2 || strcmp(ei_engine_backend(e), "cpu"))
+        return;
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    char err[256];
+    float out[768], *soft = NULL;
+    size_t n = 0, offsets[2] = {0, 1};
+    int32_t id = e->model.bos_id;
+    bool ok = ei_gemma2_embed_batch_fast(&e->model.gguf, e->thread_pool, &id, NULL, offsets, 1, out, err,
+                                         sizeof err);
+    if (ok && projector) {
+        uint8_t rgb[48 * 48 * 3];
+        memset(rgb, 128, sizeof rgb);
+        ok = ei_gemma2_vision(projector, e->thread_pool, rgb, 48, 48, &soft, &n, err, sizeof err);
+        free(soft), soft = NULL;
+    }
+    if (ok && projector) {
+        float mel[16 * 128];
+        for (size_t i = 0; i < 16 * 128; i++)
+            mel[i] = -6.9f; /* log(0.001): silence */
+        ok = ei_gemma2_audio(projector, e->thread_pool, mel, 16, &soft, &n, err, sizeof err);
+        free(soft);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    if (!ok)
+        ei_die("EI_GEMMA2_CPU_PREPACK: %s", err);
+    fprintf(stderr, "prepacked CPU weights (text%s) in %.0f ms\n", projector ? ", vision, audio" : "",
+            (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) * 1e-6);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
@@ -2002,6 +2039,8 @@ int main(int argc, char **argv) {
         }
 #endif
     }
+    if (second && ei_gemma2_cpu_fast())
+        cpu_prepack(&engine, opts.projector);
     // Each keep-alive connection holds an HTTP worker, so workers cap the
     // requests in flight; give every executor enough to fill its waves.
     if (!opts.workers_explicit && opts.workers < 32 * engine.executor_count) {

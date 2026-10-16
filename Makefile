@@ -752,3 +752,7 @@ $(BUILD)/test_gemma2_vnni256: src/test_gemma2_vnni256.c $(SRCS_ENGINE) $(HDRS_NA
 .PHONY: test-gemma2-vnni256
 test-gemma2-vnni256: $(BUILD)/test_gemma2_vnni256
 	./$(BUILD)/test_gemma2_vnni256
+
+# cpu-max fork: tiled attention kernel vs its scalar reference.
+$(BUILD)/test_gemma2_attn: src/test_gemma2_attn.c src/gemma2_media_x86.c src/gemma2_fast_x86.c $(HDRS_NATIVE) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/test_gemma2_attn.c src/gemma2_media_x86.c src/gemma2_fast_x86.c src/quants.c src/kernels.c src/gguf.c src/parallel.c $(LDLIBS)

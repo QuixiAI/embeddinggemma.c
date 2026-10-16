@@ -9,6 +9,27 @@
 /* Query block of one attention task (queries [q0, q0 + nq), nq <= G2M_ATTN_QB). */
 enum { G2M_ATTN_QB = 64, G2M_ATTN_KB = 64 };
 
+/* Online-softmax attention for one head and a block of queries [q0, q0 + nq),
+ * nq <= g2m_attn_qblock(d). Head width d: multiple of 16, <= 512 (fp32, any d
+ * via the scalar path). Rows of q / k,v / out are qstride / kvstride / ostride
+ * floats apart and the head starts at column qcol / kvcol / ocol. Query i sees
+ * keys [lo[i], hi[i]) when lo/hi are given (sliding windows, packed
+ * sequences), else [klo, khi); klo/khi must bound every lo/hi. Scores are
+ * scaled by `scale`. Masked keys contribute exactly zero. */
+#include <stdbool.h>
+typedef struct {
+    const float *q, *k, *v;
+    float *out;
+    size_t qstride, kvstride, ostride, qcol, kvcol, ocol;
+    int d, q0, nq;
+    const int32_t *lo, *hi;
+    int klo, khi;
+    float scale;
+} g2m_attn_args;
+int g2m_attn_qblock(int d);
+void g2m_attn(const g2m_attn_args *a);
+/* Scalar implementation (the non-AVX2 fallback; used by tests as the reference). */
+void g2m_attn_reference(const g2m_attn_args *a);
 /* Full bidirectional softmax attention, scale 1, for one 64-wide head:
  * rows of q/k/v/out are `stride` floats apart; the head starts at column
  * `col`. Keys [k0, k1) are visible to every query of the task. */

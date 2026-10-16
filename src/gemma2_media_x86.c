@@ -17,39 +17,42 @@
 
 /* ---- portable fallbacks -------------------------------------------------- */
 
-static void attn64_scalar(const float *q, const float *k, const float *v, float *out, size_t stride,
-                          size_t col, int q0, int nq, int k0, int k1) {
-    float scores[G2M_ATTN_KB];
-    for (int i = 0; i < nq; i++) {
-        const float *qi = q + (size_t)(q0 + i) * stride + col;
-        float m = -INFINITY, l = 0, o[64] = {0};
-        for (int b = k0; b < k1; b += G2M_ATTN_KB) {
-            int kn = k1 - b < G2M_ATTN_KB ? k1 - b : G2M_ATTN_KB;
+int g2m_attn_qblock(int d) { return d <= 128 ? 64 : d <= 256 ? 32 : 16; }
+
+void g2m_attn_reference(const g2m_attn_args *a) {
+    float scores[G2M_ATTN_KB], o[512];
+    for (int i = 0; i < a->nq; i++) {
+        const float *qi = a->q + (size_t)(a->q0 + i) * a->qstride + a->qcol;
+        int lo = a->lo ? a->lo[i] : a->klo, hi = a->hi ? a->hi[i] : a->khi;
+        float m = -INFINITY, l = 0;
+        memset(o, 0, (size_t)a->d * sizeof(float));
+        for (int b = lo; b < hi; b += G2M_ATTN_KB) {
+            int kn = hi - b < G2M_ATTN_KB ? hi - b : G2M_ATTN_KB;
             float mb = -INFINITY;
             for (int j = 0; j < kn; j++) {
-                const float *kj = k + (size_t)(b + j) * stride + col;
+                const float *kj = a->k + (size_t)(b + j) * a->kvstride + a->kvcol;
                 float s = 0;
-                for (int d = 0; d < 64; d++)
-                    s += qi[d] * kj[d];
+                for (int dd = 0; dd < a->d; dd++)
+                    s += qi[dd] * a->scale * kj[dd];
                 scores[j] = s;
                 mb = s > mb ? s : mb;
             }
             float mn = mb > m ? mb : m, alpha = expf(m - mn);
             l *= alpha;
-            for (int d = 0; d < 64; d++)
-                o[d] *= alpha;
+            for (int dd = 0; dd < a->d; dd++)
+                o[dd] *= alpha;
             for (int j = 0; j < kn; j++) {
                 float p = expf(scores[j] - mn);
                 l += p;
-                const float *vj = v + (size_t)(b + j) * stride + col;
-                for (int d = 0; d < 64; d++)
-                    o[d] += p * vj[d];
+                const float *vj = a->v + (size_t)(b + j) * a->kvstride + a->kvcol;
+                for (int dd = 0; dd < a->d; dd++)
+                    o[dd] += p * vj[dd];
             }
             m = mn;
         }
-        float *oi = out + (size_t)(q0 + i) * stride + col;
-        for (int d = 0; d < 64; d++)
-            oi[d] = o[d] / l;
+        float *oi = a->out + (size_t)(a->q0 + i) * a->ostride + a->ocol;
+        for (int dd = 0; dd < a->d; dd++)
+            oi[dd] = l > 0 ? o[dd] / l : 0.0f;
     }
 }
 
@@ -61,8 +64,10 @@ static void attn64_scalar(const float *q, const float *k, const float *v, float 
 #define UNROLL _Pragma("GCC unroll 8")
 
 /* exp via x = n ln2 + r, |r| <= ln2/2, degree-7 Taylor in Horner form.
- * Inputs below -87.3 return ~1.2e-38 (2^-126), never a denormal or NaN. */
+ * Inputs below -87.3 (including -inf, e.g. masked attention scores) and NaN
+ * return exactly 0; inputs above 88.7 saturate. */
 AVX2 static inline __m256 exp8(__m256 x) {
+    const __m256 live = _mm256_cmp_ps(x, _mm256_set1_ps(-87.3f), _CMP_GE_OQ);
     x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-87.3f)), _mm256_set1_ps(88.7f));
     __m256 n = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341f)),
                                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
@@ -77,77 +82,100 @@ AVX2 static inline __m256 exp8(__m256 x) {
     p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
     p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
     __m256i e = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
-    return _mm256_mul_ps(p, _mm256_castsi256_ps(e));
+    return _mm256_and_ps(_mm256_mul_ps(p, _mm256_castsi256_ps(e)), live);
 }
 
-AVX2 static void attn64_avx2(const float *q, const float *k, const float *v, float *out, size_t stride,
-                             size_t col, int q0, int nq, int k0, int k1) {
-    enum { QB = G2M_ATTN_QB, KB = G2M_ATTN_KB };
-    _Alignas(32) float qt[64][QB];
-    _Alignas(32) float ot[64][QB];
-    _Alignas(32) float st[KB][QB];
-    _Alignas(32) float m[QB], l[QB], alpha[QB];
-    const int np = (nq + 15) & ~15; /* query lanes, padded to whole 16-wide tiles */
-    for (int d = 0; d < 64; d++)
-        for (int i = 0; i < np; i++)
-            qt[d][i] = i < nq ? q[(size_t)(q0 + i) * stride + col + d] : 0.0f;
-    memset(ot, 0, sizeof ot);
-    for (int i = 0; i < np; i++)
-        m[i] = -INFINITY, l[i] = 0;
+/* Scratch per thread: Q^T and O^T hold d x QB floats (<= 8192 each by the
+ * choice of QB), S^T/P^T KB x QB. 80 KB, so not on small worker stacks. */
+static _Thread_local _Alignas(32) float tl_qt[8192], tl_ot[8192], tl_st[G2M_ATTN_KB * 64];
 
-    for (int b = k0; b < k1; b += KB) {
-        const int kn = k1 - b < KB ? k1 - b : KB;
+AVX2 static void attn_avx2(const g2m_attn_args *a) {
+    enum { KB = G2M_ATTN_KB };
+    const int d = a->d, QB = g2m_attn_qblock(d), nq = a->nq;
+    float *qt = tl_qt, *ot = tl_ot, *st = tl_st;
+    _Alignas(32) float m[64], l[64], alpha[64], lof[64], hif[64];
+    const int np = (nq + 15) & ~15; /* query lanes, padded to whole 16-wide tiles */
+    for (int dd = 0; dd < d; dd++)
+        for (int i = 0; i < np; i++)
+            qt[dd * QB + i] = i < nq ? a->q[(size_t)(a->q0 + i) * a->qstride + a->qcol + dd] * a->scale : 0.0f;
+    memset(ot, 0, (size_t)d * QB * sizeof(float));
+    for (int i = 0; i < np; i++) {
+        m[i] = -INFINITY, l[i] = 0;
+        /* Padded lanes see every key (their q is zero, the results are dropped). */
+        lof[i] = a->lo && i < nq ? (float)a->lo[i] : (float)a->klo;
+        hif[i] = a->hi && i < nq ? (float)a->hi[i] : (float)a->khi;
+    }
+    const bool masked = a->lo != NULL;
+    const float *kbase = a->k + a->kvcol, *vbase = a->v + a->kvcol;
+
+    for (int b = a->klo; b < a->khi; b += KB) {
+        const int kn = a->khi - b < KB ? a->khi - b : KB;
         /* S^T = K_blk . Q^T: 4 keys x 16 queries per register tile. */
         for (int j0 = 0; j0 < kn; j0 += 4) {
             const float *kr[4];
             UNROLL for (int c = 0; c < 4; c++)
-                kr[c] = k + (size_t)(b + (j0 + c < kn ? j0 + c : kn - 1)) * stride + col;
+                kr[c] = kbase + (size_t)(b + (j0 + c < kn ? j0 + c : kn - 1)) * a->kvstride;
             for (int i0 = 0; i0 < np; i0 += 16) {
                 __m256 acc[4][2];
                 UNROLL for (int c = 0; c < 4; c++)
                     acc[c][0] = acc[c][1] = _mm256_setzero_ps();
-                _Pragma("GCC unroll 4") for (int d = 0; d < 64; d++) {
-                    __m256 a0 = _mm256_load_ps(&qt[d][i0]), a1 = _mm256_load_ps(&qt[d][i0 + 8]);
+                const float *qp = qt + i0;
+                _Pragma("GCC unroll 4") for (int dd = 0; dd < d; dd++, qp += QB) {
+                    __m256 a0 = _mm256_load_ps(qp), a1 = _mm256_load_ps(qp + 8);
                     UNROLL for (int c = 0; c < 4; c++) {
-                        __m256 kb = _mm256_broadcast_ss(kr[c] + d);
+                        __m256 kb = _mm256_broadcast_ss(kr[c] + dd);
                         acc[c][0] = _mm256_fmadd_ps(kb, a0, acc[c][0]);
                         acc[c][1] = _mm256_fmadd_ps(kb, a1, acc[c][1]);
                     }
                 }
                 for (int c = 0; c < 4 && j0 + c < kn; c++) {
-                    _mm256_store_ps(&st[j0 + c][i0], acc[c][0]);
-                    _mm256_store_ps(&st[j0 + c][i0 + 8], acc[c][1]);
+                    _mm256_store_ps(st + (j0 + c) * QB + i0, acc[c][0]);
+                    _mm256_store_ps(st + (j0 + c) * QB + i0 + 8, acc[c][1]);
                 }
             }
         }
-        /* Online softmax, 8 query lanes at a time. */
+        /* Mask, then online softmax, 8 query lanes at a time. */
         for (int i0 = 0; i0 < np; i0 += 8) {
             __m256 mb = _mm256_set1_ps(-INFINITY);
-            for (int j = 0; j < kn; j++)
-                mb = _mm256_max_ps(mb, _mm256_load_ps(&st[j][i0]));
-            __m256 mo = _mm256_load_ps(&m[i0]), mn = _mm256_max_ps(mo, mb);
-            __m256 al = exp8(_mm256_sub_ps(mo, mn)), sum = _mm256_setzero_ps();
+            if (masked) {
+                const __m256 lov = _mm256_load_ps(lof + i0), hiv = _mm256_load_ps(hif + i0);
+                for (int j = 0; j < kn; j++) {
+                    __m256 key = _mm256_set1_ps((float)(b + j)), sv = _mm256_load_ps(st + j * QB + i0);
+                    __m256 ok = _mm256_and_ps(_mm256_cmp_ps(key, lov, _CMP_GE_OQ), _mm256_cmp_ps(key, hiv, _CMP_LT_OQ));
+                    sv = _mm256_blendv_ps(_mm256_set1_ps(-INFINITY), sv, ok);
+                    _mm256_store_ps(st + j * QB + i0, sv);
+                    mb = _mm256_max_ps(mb, sv);
+                }
+            } else
+                for (int j = 0; j < kn; j++)
+                    mb = _mm256_max_ps(mb, _mm256_load_ps(st + j * QB + i0));
+            __m256 mo = _mm256_load_ps(m + i0), mn = _mm256_max_ps(mo, mb);
+            /* A lane with no visible key yet keeps m = -inf; subtract a finite
+             * floor so exp sees -inf - floor = -inf -> 0, never inf - inf. */
+            __m256 ms = _mm256_max_ps(mn, _mm256_set1_ps(-3.0e38f));
+            __m256 al = exp8(_mm256_sub_ps(mo, ms)), sum = _mm256_setzero_ps();
             for (int j = 0; j < kn; j++) {
-                __m256 p = exp8(_mm256_sub_ps(_mm256_load_ps(&st[j][i0]), mn));
-                _mm256_store_ps(&st[j][i0], p);
-                sum = _mm256_add_ps(sum, p);
+                __m256 pv = exp8(_mm256_sub_ps(_mm256_load_ps(st + j * QB + i0), ms));
+                _mm256_store_ps(st + j * QB + i0, pv);
+                sum = _mm256_add_ps(sum, pv);
             }
-            _mm256_store_ps(&l[i0], _mm256_fmadd_ps(_mm256_load_ps(&l[i0]), al, sum));
-            _mm256_store_ps(&m[i0], mn);
-            _mm256_store_ps(&alpha[i0], al);
+            _mm256_store_ps(l + i0, _mm256_fmadd_ps(_mm256_load_ps(l + i0), al, sum));
+            _mm256_store_ps(m + i0, mn);
+            _mm256_store_ps(alpha + i0, al);
         }
         /* O^T = O^T * alpha + V_blk^T . P^T: 4 dims x 16 queries per tile. */
-        for (int d0 = 0; d0 < 64; d0 += 4)
+        for (int d0 = 0; d0 < d; d0 += 4)
             for (int i0 = 0; i0 < np; i0 += 16) {
-                __m256 al0 = _mm256_load_ps(&alpha[i0]), al1 = _mm256_load_ps(&alpha[i0 + 8]);
+                __m256 al0 = _mm256_load_ps(alpha + i0), al1 = _mm256_load_ps(alpha + i0 + 8);
                 __m256 acc[4][2];
                 UNROLL for (int c = 0; c < 4; c++) {
-                    acc[c][0] = _mm256_mul_ps(_mm256_load_ps(&ot[d0 + c][i0]), al0);
-                    acc[c][1] = _mm256_mul_ps(_mm256_load_ps(&ot[d0 + c][i0 + 8]), al1);
+                    acc[c][0] = _mm256_mul_ps(_mm256_load_ps(ot + (d0 + c) * QB + i0), al0);
+                    acc[c][1] = _mm256_mul_ps(_mm256_load_ps(ot + (d0 + c) * QB + i0 + 8), al1);
                 }
-                const float *vr = v + (size_t)b * stride + col + d0;
-                for (int j = 0; j < kn; j++, vr += stride) {
-                    __m256 p0 = _mm256_load_ps(&st[j][i0]), p1 = _mm256_load_ps(&st[j][i0 + 8]);
+                const float *vr = vbase + (size_t)b * a->kvstride + d0;
+                const float *pp = st + i0;
+                for (int j = 0; j < kn; j++, vr += a->kvstride, pp += QB) {
+                    __m256 p0 = _mm256_load_ps(pp), p1 = _mm256_load_ps(pp + 8);
                     UNROLL for (int c = 0; c < 4; c++) {
                         __m256 vb = _mm256_broadcast_ss(vr + c);
                         acc[c][0] = _mm256_fmadd_ps(vb, p0, acc[c][0]);
@@ -155,15 +183,15 @@ AVX2 static void attn64_avx2(const float *q, const float *k, const float *v, flo
                     }
                 }
                 UNROLL for (int c = 0; c < 4; c++) {
-                    _mm256_store_ps(&ot[d0 + c][i0], acc[c][0]);
-                    _mm256_store_ps(&ot[d0 + c][i0 + 8], acc[c][1]);
+                    _mm256_store_ps(ot + (d0 + c) * QB + i0, acc[c][0]);
+                    _mm256_store_ps(ot + (d0 + c) * QB + i0 + 8, acc[c][1]);
                 }
             }
     }
     for (int i = 0; i < nq; i++) {
-        float inv = 1.0f / l[i], *o = out + (size_t)(q0 + i) * stride + col;
-        for (int d = 0; d < 64; d++)
-            o[d] = ot[d][i] * inv;
+        float inv = l[i] > 0 ? 1.0f / l[i] : 0.0f, *o = a->out + (size_t)(a->q0 + i) * a->ostride + a->ocol;
+        for (int dd = 0; dd < d; dd++)
+            o[dd] = ot[dd * QB + i] * inv;
     }
 }
 
@@ -199,15 +227,22 @@ AVX2 static void exp_avx2(float *x, int n) {
 }
 #endif
 
-void g2m_attn64(const float *q, const float *k, const float *v, float *out, size_t stride, size_t col,
-                int q0, int nq, int k0, int k1) {
+void g2m_attn(const g2m_attn_args *a) {
 #if defined(__x86_64__) || defined(_M_X64)
-    if (g2x_level() >= G2X_AVX2) {
-        attn64_avx2(q, k, v, out, stride, col, q0, nq, k0, k1);
+    if (g2x_level() >= G2X_AVX2 && a->d % 16 == 0 && a->d <= 512) {
+        attn_avx2(a);
         return;
     }
 #endif
-    attn64_scalar(q, k, v, out, stride, col, q0, nq, k0, k1);
+    g2m_attn_reference(a);
+}
+
+void g2m_attn64(const float *q, const float *k, const float *v, float *out, size_t stride, size_t col,
+                int q0, int nq, int k0, int k1) {
+    g2m_attn_args a = {.q = q, .k = k, .v = v, .out = out, .qstride = stride, .kvstride = stride,
+                       .ostride = stride, .qcol = col, .kvcol = col, .ocol = col, .d = 64, .q0 = q0, .nq = nq,
+                       .klo = k0, .khi = k1, .scale = 1.0f};
+    g2m_attn(&a);
 }
 
 void g2m_quick_gelu_mul(float *g, const float *u, int n) {

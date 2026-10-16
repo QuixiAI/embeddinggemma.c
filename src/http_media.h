@@ -225,6 +225,8 @@ static bool embed_structured(const server_opts *opts, const sv_string *input, fl
         m.cuda = opts->engine->gemma2_cuda_media ? opts->engine->gemma2_cuda_media
                                                  : opts->engine->gemma2_cuda;
         m.lock = &inference_mutex;
+        if (!m.metal && !m.cuda)
+            m.outer_lock = &cpu_media_mutex; /* see cpu_tower_yield */
     }
     const char *p = input->s;
     bool ok = false;

@@ -36,6 +36,50 @@
 #include <unistd.h>
 
 static pthread_mutex_t inference_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* cpu-max fork: on the CPU backend a media tower holds inference_mutex for
+ * seconds (a 1120-token image), and every text wave queued behind it waited
+ * for the whole tower. Media requests now also take cpu_media_mutex (before
+ * inference_mutex, so one media request at a time is inside the towers), and
+ * a tower calls cpu_tower_yield() between layers: when text waves are
+ * waiting it releases inference_mutex until one of them holds it, then waits
+ * its turn again. Text waves never take cpu_media_mutex or a tower lock, so
+ * the handoff cannot deadlock. EI_GEMMA2_CPU_YIELD=0 restores the plain lock. */
+static pthread_mutex_t cpu_media_mutex = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int text_waiters; /* text waves blocked on inference_mutex */
+static pthread_mutex_t handoff_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t handoff_cond = PTHREAD_COND_INITIALIZER;
+static uint64_t handoffs; /* text waves that acquired inference_mutex (handoff_mutex) */
+
+static void text_engine_lock(void) {
+    atomic_fetch_add_explicit(&text_waiters, 1, memory_order_relaxed);
+    pthread_mutex_lock(&inference_mutex);
+    atomic_fetch_sub_explicit(&text_waiters, 1, memory_order_relaxed);
+    pthread_mutex_lock(&handoff_mutex);
+    handoffs++;
+    pthread_cond_broadcast(&handoff_cond);
+    pthread_mutex_unlock(&handoff_mutex);
+}
+
+/* Called by a CPU media tower that holds inference_mutex (and cpu_media_mutex). */
+static void cpu_tower_yield(void) {
+    if (!atomic_load_explicit(&text_waiters, memory_order_relaxed))
+        return;
+    pthread_mutex_lock(&handoff_mutex);
+    const uint64_t seen = handoffs;
+    pthread_mutex_unlock(&inference_mutex);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += 50 * 1000000L; /* bounded: a waiter that never shows up */
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    while (handoffs == seen && atomic_load_explicit(&text_waiters, memory_order_relaxed))
+        if (pthread_cond_timedwait(&handoff_cond, &handoff_mutex, &deadline) == ETIMEDOUT)
+            break;
+    pthread_mutex_unlock(&handoff_mutex);
+    pthread_mutex_lock(&inference_mutex);
+}
 // GPU media contexts (vision/audio towers and the mixed-input text forward):
 // each slot is a clone sharing the device, pipelines and weights with its own
 // queue, workspace and lock, so media requests overlap on the GPU instead of
@@ -1834,7 +1878,7 @@ static bool execute_engine_batch(void *opaque, const int32_t *ids,
     if (!engine->model.embeddinggemma2 || media_slot_count)
         return ei_engine_embed_tokens_batch(engine, ids, offsets, batch_size, out, err, err_len);
     // CPU backend: media towers share the engine's thread pool with text waves.
-    pthread_mutex_lock(&inference_mutex);
+    text_engine_lock();
     bool ok = ei_engine_embed_tokens_batch(opaque, ids, offsets, batch_size, out, err, err_len);
     pthread_mutex_unlock(&inference_mutex);
     return ok;
@@ -2041,6 +2085,11 @@ int main(int argc, char **argv) {
     }
     if (second && ei_gemma2_cpu_fast())
         cpu_prepack(&engine, opts.projector);
+    if (second && cpu_backend && !media_slot_count) {
+        const char *yield = getenv("EI_GEMMA2_CPU_YIELD");
+        if (!(yield && !strcmp(yield, "0")))
+            ei_gemma2_set_cpu_yield(cpu_tower_yield);
+    }
     // Each keep-alive connection holds an HTTP worker, so workers cap the
     // requests in flight; give every executor enough to fill its waves.
     if (!opts.workers_explicit && opts.workers < 32 * engine.executor_count) {

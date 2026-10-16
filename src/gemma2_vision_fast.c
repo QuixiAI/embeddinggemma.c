@@ -63,6 +63,13 @@ bool ei_gemma2_cpu_media_fast(void) {
 /* EI_GEMMA2_SEMANTICS=upstream restores upstream's three deviations from the
  * official model; the default ("official") follows the Transformers
  * implementation (measured against its FP32 embeddings: reports/). */
+static void (*cpu_yield_hook)(void); /* set once at startup */
+void ei_gemma2_set_cpu_yield(void (*hook)(void)) { cpu_yield_hook = hook; }
+void ei_gemma2_cpu_yield(void) {
+    if (cpu_yield_hook)
+        cpu_yield_hook();
+}
+
 bool ei_gemma2_official_semantics(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -332,6 +339,8 @@ bool ei_gemma2_vision_fast(const ei_gguf *g, ei_thread_pool *pool, const uint8_t
         char name[128];
 #define V(suffix) (snprintf(name, sizeof name, "v.blk.%d." suffix ".weight", l), tensor_of(g, name))
 #define VF32(suffix) (snprintf(name, sizeof name, "v.blk.%d." suffix ".weight", l), f32_of(g, name))
+        if (l)
+            ei_gemma2_cpu_yield(); /* between layers: waiting text waves may run */
         VP(VP_ROWS, rows(pool, n, (row_job){.op = ROW_NORM_QUANT, .w = w, .nw = VF32("ln1")}));
         VP(VP_GEMM_QKV, ei_gemma2_fast_gemm_q8(gemm_ctx, pool, V("attn_q"), w->xq, n, w->q);
            ei_gemma2_fast_gemm_q8(gemm_ctx, pool, V("attn_k"), w->xq, n, w->k);
@@ -340,6 +349,7 @@ bool ei_gemma2_vision_fast(const ei_gguf *g, ei_thread_pool *pool, const uint8_t
         VP(VP_ROWS, rows(pool, n, (row_job){.op = ROW_QKV_POST, .w = w, .qn = qn, .kn = kn, .cols = cols, .n = n});
            rows(pool, n, (row_job){.op = ROW_V_HEADS, .w = w, .n = n}));
         VP(VP_ATTN, ei_parallel_for(pool, VHEADS * aj.blocks, 1, attn_tasks, &aj));
+        ei_gemma2_cpu_yield();
         VP(VP_ROWS, rows(pool, n, (row_job){.op = ROW_QUANT, .w = w, .src = w->v}));
         VP(VP_GEMM_O, ei_gemma2_fast_gemm_q8(gemm_ctx, pool, V("attn_out"), w->xq, n, w->h));
         VP(VP_ROWS, rows(pool, n, (row_job){.op = ROW_POST_ADD, .w = w, .nw = VF32("attn_post_norm")}));
@@ -351,6 +361,8 @@ bool ei_gemma2_vision_fast(const ei_gguf *g, ei_thread_pool *pool, const uint8_t
         const ei_tensor *up = V("ffn_up"), *gate = V("ffn_gate"), *down = V("ffn_down");
         for (int c0 = 0; c0 < n; c0 += FFN_CHUNK) {
             int cn = n - c0 < FFN_CHUNK ? n - c0 : FFN_CHUNK;
+            if (c0)
+                ei_gemma2_cpu_yield();
             const ei_block_q8_0 *xin = ln2q + (size_t)c0 * (VD / 32);
             VP(VP_GEMM_FFN, ei_gemma2_fast_gemm_q8(gemm_ctx, pool, up, xin, cn, w->up);
                ei_gemma2_fast_gemm_q8(gemm_ctx, pool, gate, xin, cn, w->gate));

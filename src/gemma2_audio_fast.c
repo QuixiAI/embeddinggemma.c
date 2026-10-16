@@ -487,6 +487,8 @@ bool ei_gemma2_audio_fast(const ei_gguf *g, ei_thread_pool *pool, const float *m
 
     for (int l = 0; l < 12; ++l) {
         char base[96], name[128];
+        if (l)
+            ei_gemma2_cpu_yield(); /* between layers: waiting text waves may run */
 #define CL(suffix) (snprintf(base, sizeof base, "a.blk.%d." suffix, l), clinear_of(g, base))
 #define AF32(suffix) (snprintf(name, sizeof name, "a.blk.%d." suffix ".weight", l), f32_of(g, name))
         clinear up = CL("ffn_up"), down = CL("ffn_down"), q = CL("attn_q"), k = CL("attn_k"), v = CL("attn_v");

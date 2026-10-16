@@ -40,6 +40,11 @@ bool ei_gemma2_cpu_media_fast(void);
 /* cpu-max fork: official (default) vs upstream semantics (EI_GEMMA2_SEMANTICS=upstream):
  * vision MLP activation, log-mel floor, video frame timestamps. */
 bool ei_gemma2_official_semantics(void);
+/* cpu-max fork: the CPU media towers call ei_gemma2_cpu_yield() between
+ * layers; a server that shares the engine pool with text waves installs a
+ * hook there that lets waiting waves run (EI_GEMMA2_CPU_YIELD=0: never). */
+void ei_gemma2_set_cpu_yield(void (*hook)(void));
+void ei_gemma2_cpu_yield(void);
 bool ei_gemma2_vision_tanh_gelu(const ei_gguf *g);
 bool ei_gemma2_vision_ref(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb, int width,
                           int height, float **output, size_t *tokens, char *err, size_t err_len);

@@ -37,6 +37,7 @@ caching, and all GPU backends.
 | `97a6b53` | vision attention writes into the free V buffer (one workspace buffer less) | `src/gemma2_vision_fast.c` |
 | `3a2d2d5` | log-mel frames on the engine pool, Hann window table (bit-identical) | `src/media.c`, `src/gemma2_audio_fast.c` |
 | `466a818` | CPU media towers yield the engine to waiting text waves between layers (no head-of-line blocking) | `src/server.c`, `src/media.c`, `src/media.h`, `src/http_media.h`, towers |
+| `1ba40e2` | weight repack/packing runs on the caller's pool (cold first requests near warm speed) | `src/gemma2_vnni256.c`, `src/gemma2_sgemm_x86.c`, `src/gemma2_fast.c` |
 
 All numerics keep upstream's choices: Q8_0 weights with Q8_0 activations
 for the integer GEMMs, fp32 attention, norms, softmax and accumulation.
@@ -56,7 +57,7 @@ Defaults are on where the hardware supports them; `0` restores upstream.
 | `EI_GEMMA2_CPU_RELEASE_WEIGHTS` | 1 | drop GGUF pages of repacked weights |
 | `EI_CPU_HYBRID` | 1 on hybrid CPUs | pin the gemma2 CPU pool P-cores first (`0`: upstream's unpinned pool) |
 | `EI_GEMMA2_CPU_HYBRID_TOKENS` | 512 | text waves below this run on the P-core threads only |
-| `EI_GEMMA2_CPU_PREPACK` | 0 | repack text/vision/audio weights before listening (first request of each modality runs at warm speed; all towers resident from startup) |
+| `EI_GEMMA2_CPU_PREPACK` | 0 | repack text/vision/audio weights before listening (all towers resident from startup; the remaining first-request cost is small since `1ba40e2`) |
 | `EI_GEMMA2_CPU_YIELD` | 1 | CPU media towers hand the engine to waiting text waves between layers (`0`: a text wave waits for the whole tower) |
 | `EI_GEMMA2_CPU_PROFILE` | 0 | per-stage timers (text, vision, audio) |
 | `EI_G2M_QB` | per head width | attention query block override (tuning only) |

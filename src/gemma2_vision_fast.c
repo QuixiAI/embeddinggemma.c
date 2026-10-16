@@ -142,13 +142,14 @@ static void rope_table(vision_ws *w, int positions) {
 
 /* ---- row passes ------------------------------------------------------------- */
 
-typedef enum { ROW_NORM_QUANT, ROW_QKV_POST, ROW_QUANT, ROW_POST_ADD, ROW_GELU_QUANT, ROW_POOL } row_op;
+typedef enum { ROW_NORM_QUANT, ROW_QKV_POST, ROW_V_HEADS, ROW_QUANT, ROW_POST_ADD, ROW_GELU_QUANT, ROW_POOL } row_op;
 typedef struct {
     row_op op;
     vision_ws *w;
     const float *nw, *qn, *kn; /* norm weights */
     float *src, *dst;
     int cols, out_cols, t0;    /* ROW_GELU_QUANT: first token of the chunk */
+    int n;                     /* ROW_QKV_POST / ROW_V_HEADS: tokens (head-major planes) */
     bool tanh_gelu;
 } row_job;
 
@@ -182,19 +183,21 @@ static void row_tokens(void *opaque, int32_t begin, int32_t end) {
             rms(tmp, w->x + (size_t)t * VD, VD, j->nw);
             ei_gemma2_fast_quant_row(tmp, w->xq + (size_t)t * (VD / 32), VD);
             break;
-        case ROW_QKV_POST: {
+        case ROW_QKV_POST: { /* q in place; k -> h as [head][n][64] (see attn_tasks) */
             const float *cx = w->rope + (size_t)(t % j->cols) * 32, *cy = w->rope + (size_t)(t / j->cols) * 32;
             for (int hd = 0; hd < VHEADS; hd++) {
-                float *qr = w->q + (size_t)t * VD + hd * 64, *kr = w->k + (size_t)t * VD + hd * 64;
-                float *vr = w->v + (size_t)t * VD + hd * 64;
+                float *qr = w->q + (size_t)t * VD + hd * 64, *kh = w->h + ((size_t)hd * j->n + t) * 64;
                 rms(qr, qr, 64, j->qn);
-                rms(kr, kr, 64, j->kn);
-                rms(vr, vr, 64, NULL);
+                rms(kh, w->k + (size_t)t * VD + hd * 64, 64, j->kn);
                 rope_head(qr, cx, cy);
-                rope_head(kr, cx, cy);
+                rope_head(kh, cx, cy);
             }
             break;
         }
+        case ROW_V_HEADS: /* v -> the k buffer (free after ROW_QKV_POST) as [head][n][64] */
+            for (int hd = 0; hd < VHEADS; hd++)
+                rms(w->k + ((size_t)hd * j->n + t) * 64, w->v + (size_t)t * VD + hd * 64, 64, NULL);
+            break;
         case ROW_QUANT:
             ei_gemma2_fast_quant_row(j->src + (size_t)t * VD, w->xq + (size_t)t * (VD / 32), VD);
             break;
@@ -272,13 +275,23 @@ typedef struct {
     const vision_ws *w;
     int n, blocks;
 } attn_job;
+/* Q and the output are token-major [n][768]; K (in h) and V (in k) are
+ * head-major [12][n][64], so the K/V stream of a query block is contiguous:
+ * read in place from the token-major buffers, every key of a head sat on its
+ * own 4 KB page (3 KB row stride) and the per-head stream at 10080 patches
+ * (5.2 MB) defeated the L2 prefetchers. */
 static void attn_tasks(void *opaque, int32_t begin, int32_t end) {
     attn_job *j = opaque;
     for (int task = begin; task < end; task++) {
         const int qb = g2m_attn_qblock(64);
         int hd = task / j->blocks, q0 = task % j->blocks * qb;
         int nq = j->n - q0 < qb ? j->n - q0 : qb;
-        g2m_attn64(j->w->q, j->w->k, j->w->v, j->w->a, VD, (size_t)hd * 64, q0, nq, 0, j->n);
+        const size_t plane = (size_t)hd * j->n * 64;
+        g2m_attn_args a = {.q = j->w->q, .k = j->w->h + plane, .v = j->w->k + plane, .out = j->w->a,
+                           .qstride = VD, .kvstride = 64, .ostride = VD, .qcol = (size_t)hd * 64, .kvcol = 0,
+                           .ocol = (size_t)hd * 64, .d = 64, .q0 = q0, .nq = nq, .klo = 0, .khi = j->n,
+                           .scale = 1.0f};
+        g2m_attn(&a);
     }
 }
 
@@ -325,7 +338,8 @@ bool ei_gemma2_vision_fast(const ei_gguf *g, ei_thread_pool *pool, const uint8_t
            ei_gemma2_fast_gemm_q8(gemm_ctx, pool, V("attn_k"), w->xq, n, w->k);
            ei_gemma2_fast_gemm_q8(gemm_ctx, pool, V("attn_v"), w->xq, n, w->v));
         const float *qn = VF32("attn_q_norm"), *kn = VF32("attn_k_norm");
-        VP(VP_ROWS, rows(pool, n, (row_job){.op = ROW_QKV_POST, .w = w, .qn = qn, .kn = kn, .cols = cols}));
+        VP(VP_ROWS, rows(pool, n, (row_job){.op = ROW_QKV_POST, .w = w, .qn = qn, .kn = kn, .cols = cols, .n = n});
+           rows(pool, n, (row_job){.op = ROW_V_HEADS, .w = w, .n = n}));
         VP(VP_ATTN, ei_parallel_for(pool, VHEADS * aj.blocks, 1, attn_tasks, &aj));
         VP(VP_ROWS, rows(pool, n, (row_job){.op = ROW_QUANT, .w = w, .src = w->a}));
         VP(VP_GEMM_O, ei_gemma2_fast_gemm_q8(gemm_ctx, pool, V("attn_out"), w->xq, n, w->h));

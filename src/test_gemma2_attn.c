@@ -6,12 +6,16 @@
  * fp32 or above 1e-3. */
 #if defined(__linux__)
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE /* madvise */
 #endif
 #include "gemma2_media_x86.h"
 #include "common.h"
 #include "parallel.h"
 #include <time.h>
 #include <math.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,27 +102,42 @@ static void run(int d, int n, int heads, int kvh, int window, int split, double 
 typedef struct {
     const float *q, *k, *v;
     float *o;
-    int n, d, heads, blocks;
+    int n, d, heads, blocks, headmajor;
 } bench_job;
 static void bench_tasks(void *opaque, int32_t begin, int32_t end) {
     bench_job *j = opaque;
     int qb = g2m_attn_qblock(j->d);
     for (int task = begin; task < end; task++) {
         int hd = task / j->blocks, q0 = task % j->blocks * qb, nq = j->n - q0 < qb ? j->n - q0 : qb;
-        size_t st = (size_t)j->heads * j->d;
-        g2m_attn_args a = {.q = j->q, .k = j->k, .v = j->v, .out = j->o, .qstride = st, .kvstride = st, .ostride = st,
-                           .qcol = (size_t)hd * j->d, .kvcol = (size_t)hd * j->d, .ocol = (size_t)hd * j->d, .d = j->d,
-                           .q0 = q0, .nq = nq, .klo = 0, .khi = j->n, .scale = 1.0f};
+        size_t st = (size_t)j->heads * j->d, col = (size_t)hd * j->d, base = 0;
+        if (j->headmajor) /* [heads][n][d]: each head's rows contiguous */
+            st = j->d, col = 0, base = (size_t)hd * j->n * j->d;
+        g2m_attn_args a = {.q = j->q + base, .k = j->k + base, .v = j->v + base, .out = j->o, .qstride = st,
+                           .kvstride = st, .ostride = (size_t)j->heads * j->d, .qcol = col, .kvcol = col,
+                           .ocol = (size_t)hd * j->d, .d = j->d, .q0 = q0, .nq = nq, .klo = 0, .khi = j->n, .scale = 1.0f};
         g2m_attn(&a);
     }
 }
 static int bench(int n, int d, int heads) {
     size_t st = (size_t)heads * d;
-    float *q = ei_xmalloc(n * st * 4), *k = ei_xmalloc(n * st * 4), *v = ei_xmalloc(n * st * 4), *o = ei_xmalloc(n * st * 4);
+    /* EI_ATTN_BENCH_HEADMAJOR=1: Q/K/V as [heads][n][d]; EI_ATTN_BENCH_THP=1: 2 MB-aligned, MADV_HUGEPAGE. */
+    const char *hm = getenv("EI_ATTN_BENCH_HEADMAJOR"), *thp = getenv("EI_ATTN_BENCH_THP");
+    float *buf[4];
+    size_t bytes = ((size_t)n * st * 4 + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
+    for (int i = 0; i < 4; i++) {
+        buf[i] = aligned_alloc(2u << 20, bytes);
+        if (!buf[i])
+            ei_die("out of memory");
+#if defined(__linux__)
+        if (thp && atoi(thp))
+            madvise(buf[i], bytes, MADV_HUGEPAGE);
+#endif
+    }
+    float *q = buf[0], *k = buf[1], *v = buf[2], *o = buf[3];
     for (size_t i = 0; i < n * st; i++)
         q[i] = frand() * 0.3f, k[i] = frand() * 0.3f, v[i] = frand();
     ei_thread_pool *pool = ei_thread_pool_create_spin(0, 50);
-    bench_job j = {q, k, v, o, n, d, heads, (n + g2m_attn_qblock(d) - 1) / g2m_attn_qblock(d)};
+    bench_job j = {q, k, v, o, n, d, heads, (n + g2m_attn_qblock(d) - 1) / g2m_attn_qblock(d), hm && atoi(hm)};
     double best = 1e30;
     for (int r = 0; r < 5; r++) {
         struct timespec a, b;

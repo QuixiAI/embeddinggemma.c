@@ -1,0 +1,41 @@
+chart,item,series,value,cpumax_p50_ms,other_p50_ms
+speedup-vs-fastest,a5,vs PyTorch FP32,4.402,82.08,361.32
+speedup-vs-fastest,a15,vs PyTorch FP32,2.7561,237.43,654.38
+speedup-vs-fastest,m_tv,vs ONNX Runtime INT8,2.7169,2628.77,7142.17
+speedup-vs-fastest,v8,vs PyTorch FP32,2.7135,2559.7,6945.71
+speedup-vs-fastest,v16,vs ONNX Runtime INT8,2.7088,5313.14,14392.11
+speedup-vs-fastest,a30,vs PyTorch FP32,2.6497,441.12,1168.83
+speedup-vs-fastest,t128,vs PyTorch FP32,2.6417,29.34,77.51
+speedup-vs-fastest,v4,vs PyTorch FP32,2.5687,1271.06,3265.0
+speedup-vs-fastest,m_ta,vs PyTorch FP32,2.4982,254.35,635.42
+speedup-vs-fastest,i70,vs PyTorch FP32,2.4586,138.51,340.54
+speedup-vs-fastest,i280,vs PyTorch FP32,2.3362,783.05,1829.37
+speedup-vs-fastest,m_tia,vs PyTorch FP32,2.3315,1070.1,2494.94
+speedup-vs-fastest,t16,vs upstream (Q8_0),2.0256,8.58,17.38
+speedup-vs-fastest,m_ti,vs PyTorch FP32,2.0103,849.36,1707.47
+speedup-vs-fastest,t512,vs PyTorch FP32,1.9538,127.93,249.95
+speedup-vs-fastest,i1120,vs ONNX Runtime INT8,1.5814,7678.24,12142.15
+speedup-vs-pytorch-onnx,t512,vs PyTorch FP32,1.9538,127.93,249.95
+speedup-vs-pytorch-onnx,t512,vs ONNX Runtime INT8,2.2846,127.93,292.28
+speedup-vs-pytorch-onnx,i280,vs PyTorch FP32,2.3362,783.05,1829.37
+speedup-vs-pytorch-onnx,i280,vs ONNX Runtime INT8,3.8673,783.05,3028.26
+speedup-vs-pytorch-onnx,i1120,vs PyTorch FP32,1.7772,7678.24,13645.84
+speedup-vs-pytorch-onnx,i1120,vs ONNX Runtime INT8,1.5814,7678.24,12142.15
+speedup-vs-pytorch-onnx,a30,vs PyTorch FP32,2.6497,441.12,1168.83
+speedup-vs-pytorch-onnx,a30,vs ONNX Runtime INT8,5.5487,441.12,2447.63
+speedup-vs-pytorch-onnx,v16,vs PyTorch FP32,3.0901,5313.14,16418.28
+speedup-vs-pytorch-onnx,v16,vs ONNX Runtime INT8,2.7088,5313.14,14392.11
+speedup-vs-pytorch-onnx,m_tia,vs PyTorch FP32,2.3315,1070.1,2494.94
+speedup-vs-pytorch-onnx,m_tia,vs ONNX Runtime INT8,4.1622,1070.1,4453.93
+retrieval,flickr,CPU-Max Q8_0 R@1,0.863,,
+retrieval,flickr,FP32 (official) R@1,0.8636,,
+retrieval,flickr,CPU-Max top-1 = FP32 top-1,0.9928,,
+retrieval,msrvtt,CPU-Max Q8_0 R@1,0.635,,
+retrieval,msrvtt,FP32 (official) R@1,0.62,,
+retrieval,msrvtt,CPU-Max top-1 = FP32 top-1,0.98,,
+retrieval,scifact,CPU-Max Q8_0 R@1,0.77,,
+retrieval,scifact,FP32 (official) R@1,0.7733333333333333,,
+retrieval,scifact,CPU-Max top-1 = FP32 top-1,0.9833333333333333,,
+retrieval,clotho,CPU-Max Q8_0 R@1,0.13051823416506717,,
+retrieval,clotho,FP32 (official) R@1,0.1324376199616123,,
+retrieval,clotho,CPU-Max top-1 = FP32 top-1,0.8023032629558541,,

@@ -1,3 +1,6 @@
+#if defined(__linux__)
+#define _DEFAULT_SOURCE /* madvise under -std=c11 (gemma2_release.h) */
+#endif
 /* cpu-max fork: packed fp32 GEMM, y[n][m] = x[n][k] . w[m][k]^T.
  *
  * Upstream's float-weight GEMM (gemma2_fast.c gemm_f) converts four weight
@@ -9,6 +12,7 @@
  * the summation order differs from the reference. */
 #include "gemma2_sgemm_x86.h"
 #include "gemma2_fast_x86.h"
+#include "gemma2_release.h"
 #include "quants.h"
 
 #include <stdlib.h>
@@ -65,6 +69,7 @@ const void *g2s_weight_of(const void *key, const void *data, int type, int m, in
         for (int z = 0; z < k; z++)
             for (int c = 0; c < 16; c++)
                 w->p[((size_t)pn * k + z) * 16 + c] = element(data, type, (size_t)(pn * 16 + c) * k + z);
+    g2_release_source(data, (size_t)m * k * (type == EI_T_F32 ? 4 : 2));
     w->key = key;
     w->m = m;
     w->k = k;

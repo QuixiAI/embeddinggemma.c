@@ -6,8 +6,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Query block of one attention task (queries [q0, q0 + nq), nq <= G2M_ATTN_QB). */
-enum { G2M_ATTN_QB = 64, G2M_ATTN_KB = 64 };
+/* Key block of the tiled kernels. Query blocks depend on the head width and
+ * kernel variant: callers must size tasks with g2m_attn_qblock(d). */
+enum { G2M_ATTN_KB = 64 };
 
 /* Online-softmax attention for one head and a block of queries [q0, q0 + nq),
  * nq <= g2m_attn_qblock(d). Head width d: multiple of 16, <= 512 (fp32, any d

@@ -255,8 +255,9 @@ typedef struct {
 static void attn_tasks(void *opaque, int32_t begin, int32_t end) {
     attn_job *j = opaque;
     for (int task = begin; task < end; task++) {
-        int hd = task / j->blocks, q0 = task % j->blocks * G2M_ATTN_QB;
-        int nq = j->n - q0 < G2M_ATTN_QB ? j->n - q0 : G2M_ATTN_QB;
+        const int qb = g2m_attn_qblock(64);
+        int hd = task / j->blocks, q0 = task % j->blocks * qb;
+        int nq = j->n - q0 < qb ? j->n - q0 : qb;
         g2m_attn64(j->w->q, j->w->k, j->w->v, j->w->a, VD, (size_t)hd * 64, q0, nq, 0, j->n);
     }
 }
@@ -295,7 +296,7 @@ bool ei_gemma2_vision_fast(const ei_gguf *g, ei_thread_pool *pool, const uint8_t
        ei_gemma2_fast_gemm_f(pool, &patch, w->q, n, w->x);
        ei_parallel_for(pool, n, 16, pos_tokens, &po));
 
-    attn_job aj = {w, n, (n + G2M_ATTN_QB - 1) / G2M_ATTN_QB};
+    attn_job aj = {w, n, (n + g2m_attn_qblock(64) - 1) / g2m_attn_qblock(64)};
     for (int l = 0; l < 16; l++) {
         char name[128];
 #define V(suffix) (snprintf(name, sizeof name, "v.blk.%d." suffix ".weight", l), tensor_of(g, name))

@@ -495,6 +495,14 @@ static void v256_acts(void *opaque, int32_t begin, int32_t end) {
     v256_job *j = opaque;
     g2x_acts(j->xq, begin, end, j->k, j->xu, j->xs);
 }
+/* Short waves (<= 8 tokens): one task per 8-row group. */
+static void v256_groups(void *opaque, int32_t begin, int32_t end) {
+    v256_job *j = opaque;
+    for (int g = begin; g < end; g++)
+        for (int t = 0; t < j->n; t += G2V_TILE_TOKENS)
+            g2v_tile(j->w, g, j->xu, j->xs, t, j->n - t < G2V_TILE_TOKENS ? j->n - t : G2V_TILE_TOKENS, j->k,
+                     j->y, j->m);
+}
 static void v256_rows(void *opaque, int32_t begin, int32_t end) {
     v256_job *j = opaque;
     for (int task = begin; task < end; task++) {
@@ -510,8 +518,13 @@ static void v256_rows(void *opaque, int32_t begin, int32_t end) {
 static bool gemm_q8_x86_vnni256(workspace *ws, ei_thread_pool *pool, const ei_tensor *w,
                                 const ei_block_q8_0 *xq, int n, float *y) {
     int k = (int)w->ne[0], m = (int)w->ne[1];
-    // Short waves stay on the 4-row tile with its short-wave task width.
-    if (!g2v_enabled() || n <= 8 || k % 32 || m % 8)
+    // EI_GEMMA2_CPU_VNNI256_SHORT=0 keeps waves of <= 8 tokens on upstream's tile.
+    static int short_waves = -1;
+    if (short_waves < 0) {
+        const char *e = getenv("EI_GEMMA2_CPU_VNNI256_SHORT");
+        short_waves = !(e && !strcmp(e, "0"));
+    }
+    if (!g2v_enabled() || (n <= 8 && !short_waves) || k % 32 || m % 8)
         return false;
     pthread_mutex_lock(&weight_cache_lock);
     const void *pw = g2v_weight_of(w, w->data, m, k);
@@ -525,6 +538,11 @@ static bool gemm_q8_x86_vnni256(workspace *ws, ei_thread_pool *pool, const ei_te
         ws->x512_cap = (size_t)n * k;
     }
     v256_job j = {pw, xq, ws->x512_u, ws->x512_s, y, k, m, n, (m / 8 + 3) / 4};
+    if (n <= 8) {
+        g2x_acts(xq, 0, n, k, ws->x512_u, ws->x512_s);
+        PROF(0, ei_parallel_for(pool, m / 8, short_grain(pool, m / 8, n), v256_groups, &j));
+        return true;
+    }
     PROF(0, ei_parallel_for(pool, n, 16, v256_acts, &j));
     PROF(0, ei_parallel_for(pool, j.row_tasks * ((n + 31) / 32), 1, v256_rows, &j));
     return true;

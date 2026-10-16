@@ -61,6 +61,8 @@ typedef struct {
 /* Load and index a GGUF file; dies with a message on any malformation. */
 void ei_gguf_open(ei_gguf *g, const char *path);
 void ei_gguf_close(ei_gguf *g);
+/* True when [p, p + n) lies inside an open GGUF's read-only mapping (cpu-max fork). */
+bool ei_gguf_in_mapping(const void *p, size_t n);
 
 /* Lookups (die when `required`, else return NULL/defaults). */
 const ei_kv     *ei_gguf_kv(const ei_gguf *g, const char *key, bool required);

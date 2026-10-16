@@ -4,8 +4,13 @@
  * Both are compared with a float64 ground truth (max |diff| in a row / row RMS);
  * exits 1 if the tiled kernel is more than 2x less accurate than plain scalar
  * fp32 or above 1e-3. */
+#if defined(__linux__)
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "gemma2_media_x86.h"
 #include "common.h"
+#include "parallel.h"
+#include <time.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,7 +94,51 @@ static void run(int d, int n, int heads, int kvh, int window, int split, double 
     free(q), free(k), free(v), free(o1), free(o2), free(exact), free(sc);
 }
 
-int main(void) {
+/* bench N D HEADS: all heads x query blocks of full attention, pool of EI_THREADS. */
+typedef struct {
+    const float *q, *k, *v;
+    float *o;
+    int n, d, heads, blocks;
+} bench_job;
+static void bench_tasks(void *opaque, int32_t begin, int32_t end) {
+    bench_job *j = opaque;
+    int qb = g2m_attn_qblock(j->d);
+    for (int task = begin; task < end; task++) {
+        int hd = task / j->blocks, q0 = task % j->blocks * qb, nq = j->n - q0 < qb ? j->n - q0 : qb;
+        size_t st = (size_t)j->heads * j->d;
+        g2m_attn_args a = {.q = j->q, .k = j->k, .v = j->v, .out = j->o, .qstride = st, .kvstride = st, .ostride = st,
+                           .qcol = (size_t)hd * j->d, .kvcol = (size_t)hd * j->d, .ocol = (size_t)hd * j->d, .d = j->d,
+                           .q0 = q0, .nq = nq, .klo = 0, .khi = j->n, .scale = 1.0f};
+        g2m_attn(&a);
+    }
+}
+static int bench(int n, int d, int heads) {
+    size_t st = (size_t)heads * d;
+    float *q = ei_xmalloc(n * st * 4), *k = ei_xmalloc(n * st * 4), *v = ei_xmalloc(n * st * 4), *o = ei_xmalloc(n * st * 4);
+    for (size_t i = 0; i < n * st; i++)
+        q[i] = frand() * 0.3f, k[i] = frand() * 0.3f, v[i] = frand();
+    ei_thread_pool *pool = ei_thread_pool_create_spin(0, 50);
+    bench_job j = {q, k, v, o, n, d, heads, (n + g2m_attn_qblock(d) - 1) / g2m_attn_qblock(d)};
+    double best = 1e30;
+    for (int r = 0; r < 5; r++) {
+        struct timespec a, b;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        ei_parallel_for(pool, heads * j.blocks, 1, bench_tasks, &j);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) * 1e-6;
+        best = ms < best ? ms : best;
+    }
+    double macs = 2.0 * n * (double)n * d * heads;
+    printf("attention n=%d d=%d heads=%d threads=%d: best %.2f ms, %.1f GMAC/s\n", n, d, heads,
+           ei_thread_pool_threads(pool), best, macs / (best * 1e6));
+    ei_thread_pool_destroy(pool);
+    free(q), free(k), free(v), free(o);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 5 && !strcmp(argv[1], "bench"))
+        return bench(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]));
     struct { int d, n, heads, kvh, window, split; } cases[] = {
         {64, 630, 12, 12, 0, 630},   /* vision i70 */
         {64, 77, 12, 12, 0, 77},     /* partial blocks */

@@ -1,3 +1,6 @@
+#if defined(__linux__)
+#define _DEFAULT_SOURCE /* madvise under -std=c11 (gemma2_release.h) */
+#endif
 /* cpu-max fork: repacked 256-bit AVX-VNNI Q8_0 x Q8_0 GEMM.
  *
  * Upstream's x86 Q8 tile (gemma2_fast_x86.c, q8_tile_avxvnni) computes each
@@ -20,6 +23,7 @@
  * to fp32 summation order. */
 #include "gemma2_vnni256.h"
 #include "gemma2_fast_x86.h"
+#include "gemma2_release.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -80,6 +84,7 @@ const void *g2v_weight_of(const void *key, const ei_block_q8_0 *blocks, int m, i
                 w->c[((size_t)g * kb + p) * 8 + r] = -128 * sum;
             }
         }
+    g2_release_source(blocks, (size_t)m * kb * sizeof(ei_block_q8_0));
     w->key = key;
     w->m = m;
     w->k = k;

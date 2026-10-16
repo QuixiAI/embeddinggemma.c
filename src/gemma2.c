@@ -349,6 +349,13 @@ bool ei_gemma2_embed(const ei_gguf *g, ei_thread_pool *pool, const int32_t *ids,
 /* Gemma4 vision tower: RGB patch projection, axial RoPE, 3x3 mean pool. */
 bool ei_gemma2_vision(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb, int width,
                       int height, float **output, size_t *tokens, char *err, size_t err_len) {
+    if (ei_gemma2_cpu_media_fast())
+        return ei_gemma2_vision_fast(g, pool, rgb, width, height, output, tokens, err, err_len);
+    return ei_gemma2_vision_ref(g, pool, rgb, width, height, output, tokens, err, err_len);
+}
+/* The unchanged upstream reference graph (EI_GEMMA2_CPU_MEDIA_FAST=0). */
+bool ei_gemma2_vision_ref(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb, int width,
+                          int height, float **output, size_t *tokens, char *err, size_t err_len) {
     if (width < 48 || height < 48 || width % 48 || height % 48 ||
         (size_t)width * height > 1120 * 48 * 48) {
         snprintf(err, err_len,

@@ -1,0 +1,23 @@
+/* cpu-max fork: SIMD kernels for the EmbeddingGemma 2 CPU media towers
+ * (vision/audio). x86-64 AVX2+FMA bodies are selected at run time with
+ * portable C fallbacks, so generic builds stay generic. */
+#ifndef EI_GEMMA2_MEDIA_X86_H
+#define EI_GEMMA2_MEDIA_X86_H
+#include <stddef.h>
+#include <stdint.h>
+
+/* Query block of one attention task (queries [q0, q0 + nq), nq <= G2M_ATTN_QB). */
+enum { G2M_ATTN_QB = 64, G2M_ATTN_KB = 64 };
+
+/* Full bidirectional softmax attention, scale 1, for one 64-wide head:
+ * rows of q/k/v/out are `stride` floats apart; the head starts at column
+ * `col`. Keys [k0, k1) are visible to every query of the task. */
+void g2m_attn64(const float *q, const float *k, const float *v, float *out, size_t stride, size_t col,
+                int q0, int nq, int k0, int k1);
+/* g[i] = act(g[i]) * u[i] (u NULL: act only); act = x * sigmoid(1.702 x) (QuickGELU). */
+void g2m_quick_gelu_mul(float *g, const float *u, int n);
+/* y[i] = x[i] / (1 + exp(-x[i])) (SiLU), in place when y == x. */
+void g2m_silu(float *y, const float *x, int n);
+/* The attention kernel's vector exp, in place (accuracy checked by test_gemma2_media). */
+void g2m_exp_inplace(float *x, int n);
+#endif

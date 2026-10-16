@@ -1,6 +1,52 @@
+#if defined(__linux__)
+#define _POSIX_C_SOURCE 200809L /* clock_gettime under -std=c11 */
+#endif
 #include "gemma2.h"
 #include "kernels.h"
 #include <math.h>
+#include <time.h>
+
+/* EI_GEMMA2_REF_PROFILE=1 (cpu-max fork): wall time per operation class of the
+ * reference graphs, printed per tower call. Off by default; no effect when off. */
+enum { RP_QUANT, RP_MM_Q8, RP_MM_F32, RP_ATTN, RP_NORM, RP_ROPE, RP_ACT, RP_ELEM, RP_CONV, RP_ALLOC, RP_N };
+static const char *rp_names[RP_N] = {"act_quant", "mm_q8", "mm_f32", "attention", "norm", "rope",
+                                     "activation", "elementwise", "conv", "alloc"};
+static double rp_ms[RP_N];
+static int rp_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("EI_GEMMA2_REF_PROFILE");
+        on = e && strcmp(e, "0") != 0;
+    }
+    return on;
+}
+static double rp_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+}
+#define RP(cat, ...)                                                                               \
+    do {                                                                                           \
+        if (!rp_on()) {                                                                            \
+            __VA_ARGS__;                                                                           \
+        } else {                                                                                   \
+            double rp_t0_ = rp_now();                                                              \
+            __VA_ARGS__;                                                                           \
+            rp_ms[cat] += rp_now() - rp_t0_;                                                       \
+        }                                                                                          \
+    } while (0)
+static void rp_report(const char *tower, size_t tokens, double total) {
+    if (!rp_on())
+        return;
+    double sum = 0;
+    for (int i = 0; i < RP_N; i++)
+        sum += rp_ms[i];
+    fprintf(stderr, "ref-profile %s tokens=%zu total=%.1f ms:", tower, tokens, total);
+    for (int i = 0; i < RP_N; i++)
+        fprintf(stderr, " %s=%.1f(%.1f%%)", rp_names[i], rp_ms[i], 100 * rp_ms[i] / (total > 0 ? total : 1));
+    fprintf(stderr, " other=%.1f\n", total - sum);
+    memset(rp_ms, 0, sizeof rp_ms);
+}
 
 /* Tensor storage is [input, output]; activations are contiguous token rows. */
 static const ei_tensor *tensor(const ei_gguf *g, const char *name) {
@@ -144,14 +190,14 @@ static void mm(ei_thread_pool *pool, const ei_tensor *w, const float *x, int n, 
     ei_block_q8_0 *q = NULL;
     if (w->type == EI_T_Q8_0) {
         q = ei_xcalloc((size_t)n * k / 32, sizeof(*q));
-        for (int t = 0; t < n; ++t)
-            ei_quantize_row_q8_0(x + (size_t)t * k, q + (size_t)t * k / 32, k);
+        RP(RP_QUANT, for (int t = 0; t < n; ++t)
+                         ei_quantize_row_q8_0(x + (size_t)t * k, q + (size_t)t * k / 32, k));
     }
     mm_job job = {w, x, q, y, k, m};
-    ei_parallel_for(pool, n * m, 32, mm_rows, &job);
+    RP(w->type == EI_T_Q8_0 ? RP_MM_Q8 : RP_MM_F32, ei_parallel_for(pool, n * m, 32, mm_rows, &job));
     free(q);
 }
-static void norm(float *x, int n, int d, const ei_tensor *w) {
+static void norm_body(float *x, int n, int d, const ei_tensor *w) {
     for (int t = 0; t < n; ++t) {
         float *r = x + (size_t)t * d;
         double ss = 0;
@@ -162,6 +208,7 @@ static void norm(float *x, int n, int d, const ei_tensor *w) {
             r[z] *= scale * (w ? value(w, z) : 1.0f);
     }
 }
+static void norm(float *x, int n, int d, const ei_tensor *w) { RP(RP_NORM, norm_body(x, n, d, w)); }
 static void rope(float *x, int n, int heads, int d, float base) {
     for (int t = 0; t < n; ++t)
         for (int h = 0; h < heads; ++h) {
@@ -216,7 +263,7 @@ static void attention_rows(void *opaque, int32_t begin, int32_t end) {
 static void attention(ei_thread_pool *pool, const float *q, const float *k, const float *v, int n,
                       int heads, int kv, int d, int window, float *out) {
     attn_job j = {q, k, v, out, n, heads, kv, d, window};
-    ei_parallel_for(pool, n * heads, 1, attention_rows, &j);
+    RP(RP_ATTN, ei_parallel_for(pool, n * heads, 1, attention_rows, &j));
 }
 bool ei_gemma2_embed(const ei_gguf *g, ei_thread_pool *pool, const int32_t *ids,
                      const float *inputs, size_t count, float out[768], char *err, size_t err_len) {
@@ -302,21 +349,29 @@ bool ei_gemma2_embed(const ei_gguf *g, ei_thread_pool *pool, const int32_t *ids,
 /* Gemma4 vision tower: RGB patch projection, axial RoPE, 3x3 mean pool. */
 bool ei_gemma2_vision(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb, int width,
                       int height, float **output, size_t *tokens, char *err, size_t err_len) {
+    if (ei_gemma2_cpu_media_fast())
+        return ei_gemma2_vision_fast(g, pool, rgb, width, height, output, tokens, err, err_len);
+    return ei_gemma2_vision_ref(g, pool, rgb, width, height, output, tokens, err, err_len);
+}
+/* The unchanged upstream reference graph (EI_GEMMA2_CPU_MEDIA_FAST=0). */
+bool ei_gemma2_vision_ref(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb, int width,
+                          int height, float **output, size_t *tokens, char *err, size_t err_len) {
     if (width < 48 || height < 48 || width % 48 || height % 48 ||
         (size_t)width * height > 1120 * 48 * 48) {
         snprintf(err, err_len,
                  "vision input must be aligned to 48 pixels and at most 1120 soft tokens");
         return false;
     }
+    double rp_total = rp_on() ? rp_now() : 0;
     int cols = width / 16, rows = height / 16, n = cols * rows;
-    bool use_gelu = ei_gguf_kv_bool(g, "clip.use_gelu", false);
+    bool use_gelu = ei_gemma2_vision_tanh_gelu(g); /* cpu-max: official/upstream semantics switch */
     float *patches = alloc_f((size_t)n * 768), *x = alloc_f((size_t)n * 768),
           *h = alloc_f((size_t)n * 768);
     float *q = alloc_f((size_t)n * 768), *k = alloc_f((size_t)n * 768),
           *v = alloc_f((size_t)n * 768);
     float *a = alloc_f((size_t)n * 768), *up = alloc_f((size_t)n * 3072),
           *gate = alloc_f((size_t)n * 3072);
-    for (int t = 0; t < n; ++t)
+    RP(RP_ELEM, for (int t = 0; t < n; ++t)
         for (int c = 0; c < 3; ++c)
             for (int y = 0; y < 16; ++y)
                 for (int z = 0; z < 16; ++z)
@@ -324,23 +379,23 @@ bool ei_gemma2_vision(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb
                         2.0f *
                             rgb[((size_t)(t / cols * 16 + y) * width + t % cols * 16 + z) * 3 + c] /
                             255.0f -
-                        1;
+                        1);
     ei_tensor patch = *tensor(g, "v.patch_embd.weight");
     patch.ne[0] = 768;
     patch.ne[1] = 768;
-    for (size_t i = 0; i < (size_t)n * 768; ++i)
-        patches[i] = ei_fp16_to_fp32(ei_fp32_to_fp16(patches[i]));
+    RP(RP_ELEM, for (size_t i = 0; i < (size_t)n * 768; ++i)
+        patches[i] = ei_fp16_to_fp32(ei_fp32_to_fp16(patches[i])));
     mm(pool, &patch, patches, n, x);
     free(patches);
     const ei_tensor *pos = tensor(g, "v.position_embd.weight");
-    for (int t = 0; t < n; ++t)
+    RP(RP_ELEM, for (int t = 0; t < n; ++t)
         for (int z = 0; z < 768; ++z)
             x[(size_t)t * 768 + z] += value(pos, (size_t)(t % cols) * 768 + z) +
-                                      value(pos, ((size_t)10240 + t / cols) * 768 + z);
+                                      value(pos, ((size_t)10240 + t / cols) * 768 + z));
     for (int l = 0; l < 16; ++l) {
         char name[128];
 #define V(suffix) (snprintf(name, sizeof name, "v.blk.%d." suffix ".weight", l), tensor(g, name))
-        memcpy(h, x, (size_t)n * 768 * sizeof(float));
+        RP(RP_ELEM, memcpy(h, x, (size_t)n * 768 * sizeof(float)));
         norm(h, n, 768, V("ln1"));
         mm(pool, V("attn_q"), h, n, q);
         mm(pool, V("attn_k"), h, n, k);
@@ -348,7 +403,7 @@ bool ei_gemma2_vision(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb
         norm(q, n * 12, 64, V("attn_q_norm"));
         norm(k, n * 12, 64, V("attn_k_norm"));
         norm(v, n * 12, 64, NULL);
-        for (int t = 0; t < n; ++t)
+        RP(RP_ROPE, for (int t = 0; t < n; ++t)
             for (int head = 0; head < 12; ++head)
                 for (int axis = 0; axis < 2; ++axis)
                     for (int z = 0; z < 16; ++z) {
@@ -361,36 +416,36 @@ bool ei_gemma2_vision(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb
                         q[i + 16] = qa * si + qb * co;
                         k[i] = ka * co - kb * si;
                         k[i + 16] = ka * si + kb * co;
-                    }
+                    });
         attention(pool, q, k, v, n, 12, 12, 64, 0, a);
         mm(pool, V("attn_out"), a, n, h);
         norm(h, n, 768, V("attn_post_norm"));
-        for (size_t i = 0; i < (size_t)n * 768; ++i)
-            x[i] += h[i];
-        memcpy(h, x, (size_t)n * 768 * sizeof(float));
+        RP(RP_ELEM, for (size_t i = 0; i < (size_t)n * 768; ++i)
+            x[i] += h[i]);
+        RP(RP_ELEM, memcpy(h, x, (size_t)n * 768 * sizeof(float)));
         norm(h, n, 768, V("ln2"));
         mm(pool, V("ffn_up"), h, n, up);
         mm(pool, V("ffn_gate"), h, n, gate);
-        for (size_t i = 0; i < (size_t)n * 3072; ++i)
+        RP(RP_ACT, for (size_t i = 0; i < (size_t)n * 3072; ++i)
             gate[i] =
                 (use_gelu ? ei_gelu_tanh(gate[i]) : gate[i] / (1.0f + expf(-1.702f * gate[i]))) *
-                up[i];
+                up[i]);
         mm(pool, V("ffn_down"), gate, n, h);
         norm(h, n, 768, V("ffn_post_norm"));
-        for (size_t i = 0; i < (size_t)n * 768; ++i)
-            x[i] += h[i];
+        RP(RP_ELEM, for (size_t i = 0; i < (size_t)n * 768; ++i)
+            x[i] += h[i]);
 #undef V
     }
     int out_cols = cols / 3, out_rows = rows / 3, nt = out_cols * out_rows;
     memset(h, 0, (size_t)nt * 768 * sizeof(float));
-    for (int t = 0; t < nt; ++t)
+    RP(RP_ELEM, for (int t = 0; t < nt; ++t)
         for (int yy = 0; yy < 3; ++yy)
             for (int xx = 0; xx < 3; ++xx)
                 for (int z = 0; z < 768; ++z)
                     h[(size_t)t * 768 + z] +=
                         x[((size_t)(t / out_cols * 3 + yy) * cols + t % out_cols * 3 + xx) * 768 +
                           z] /
-                        9.0f * sqrtf(768.0f);
+                        9.0f * sqrtf(768.0f));
     norm(h, nt, 768, NULL);
     *output = alloc_f((size_t)nt * 512);
     *tokens = nt;
@@ -403,6 +458,7 @@ bool ei_gemma2_vision(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb
     free(a);
     free(up);
     free(gate);
+    rp_report("vision", (size_t)n, rp_on() ? rp_now() - rp_total : 0);
     return true;
 }
 
@@ -421,25 +477,33 @@ static void clipped_mm(const ei_gguf *g, ei_thread_pool *pool, const char *name,
     const ei_tensor *w = tensor(g, name);
     size_t count = (size_t)n * w->ne[0];
     float *clamped = alloc_f(count);
-    for (size_t i = 0; i < count; ++i)
-        clamped[i] = fminf(hi, fmaxf(lo, x[i]));
+    RP(RP_ELEM, for (size_t i = 0; i < count; ++i)
+        clamped[i] = fminf(hi, fmaxf(lo, x[i])));
     mm(pool, w, clamped, n, y);
     free(clamped);
     snprintf(key, sizeof key, "%.*s.output_min", (int)len, name);
     lo = scalar_or(g, key, -INFINITY);
     snprintf(key, sizeof key, "%.*s.output_max", (int)len, name);
     hi = scalar_or(g, key, INFINITY);
-    for (size_t i = 0; i < (size_t)n * w->ne[1]; ++i)
-        y[i] = fminf(hi, fmaxf(lo, y[i]));
+    RP(RP_ELEM, for (size_t i = 0; i < (size_t)n * w->ne[1]; ++i)
+        y[i] = fminf(hi, fmaxf(lo, y[i])));
 }
 static float silu(float x) { return x / (1.0f + expf(-x)); }
 /* Audio features are time-major, 128 HTK log-magnitude mel bins. */
 bool ei_gemma2_audio(const ei_gguf *g, ei_thread_pool *pool, const float *mel, int frames,
                      float **output, size_t *tokens, char *err, size_t err_len) {
+    if (ei_gemma2_cpu_media_fast())
+        return ei_gemma2_audio_fast(g, pool, mel, frames, output, tokens, err, err_len);
+    return ei_gemma2_audio_ref(g, pool, mel, frames, output, tokens, err, err_len);
+}
+/* The unchanged upstream reference graph (EI_GEMMA2_CPU_MEDIA_FAST=0). */
+bool ei_gemma2_audio_ref(const ei_gguf *g, ei_thread_pool *pool, const float *mel, int frames,
+                         float **output, size_t *tokens, char *err, size_t err_len) {
     if (frames < 1 || frames > 3000) {
         snprintf(err, err_len, "audio chunk must contain 1..3000 mel frames");
         return false;
     }
+    double rp_total = rp_on() ? rp_now() : 0;
     int nt = frames, nf = 128, nc = 1;
     float *cur = alloc_f((size_t)nt * nf);
     memcpy(cur, mel, (size_t)nt * nf * sizeof(float));
@@ -449,7 +513,7 @@ bool ei_gemma2_audio(const ei_gguf *g, ei_thread_pool *pool, const float *mel, i
         const ei_tensor *w = tensor(g, name);
         int ot = (nt + 1) / 2, of = (nf + 1) / 2, oc = (int)w->ne[3];
         float *next = alloc_f((size_t)ot * of * oc);
-        for (int t = 0; t < ot; ++t)
+        RP(RP_CONV, for (int t = 0; t < ot; ++t)
             for (int f = 0; f < of; ++f)
                 for (int o = 0; o < oc; ++o) {
                     float sum = 0;
@@ -463,10 +527,10 @@ bool ei_gemma2_audio(const ei_gguf *g, ei_thread_pool *pool, const float *mel, i
                                        value(w, ((size_t)o * nc + c) * 9 + ky * 3 + kx);
                         }
                     next[((size_t)t * of + f) * oc + o] = sum;
-                }
+                });
         snprintf(name, sizeof name, "a.conv1d.%d.norm.weight", layer);
         const ei_tensor *weight = tensor(g, name);
-        for (int t = 0; t < ot * of; ++t) {
+        RP(RP_NORM, for (int t = 0; t < ot * of; ++t) {
             float *r = next + (size_t)t * oc;
             double mean = 0, var = 0;
             for (int c = 0; c < oc; ++c)
@@ -477,7 +541,7 @@ bool ei_gemma2_audio(const ei_gguf *g, ei_thread_pool *pool, const float *mel, i
             float scale = 1.0f / sqrtf((float)(var / oc) + 1e-6f);
             for (int c = 0; c < oc; ++c)
                 r[c] = fmaxf(0, ((float)(r[c] - mean)) * scale * value(weight, c));
-        }
+        });
         free(cur);
         cur = next;
         nt = ot;
@@ -505,28 +569,28 @@ bool ei_gemma2_audio(const ei_gguf *g, ei_thread_pool *pool, const float *mel, i
         snprintf(name, sizeof name, "a.blk.%d." suffix ".weight", l);                              \
         clipped_mm(g, pool, name, input, n, output);                                               \
     } while (0)
-        memcpy(h, x, count * sizeof(float));
+        RP(RP_ELEM, memcpy(h, x, count * sizeof(float)));
         norm(h, n, 1024, A("ffn_norm"));
         AM("ffn_up", h, up);
-        for (size_t i = 0; i < (size_t)n * 4096; ++i)
-            up[i] = silu(up[i]);
+        RP(RP_ACT, for (size_t i = 0; i < (size_t)n * 4096; ++i)
+            up[i] = silu(up[i]));
         AM("ffn_down", up, h);
         norm(h, n, 1024, A("ffn_post_norm"));
-        for (size_t i = 0; i < count; ++i)
-            x[i] += 0.5f * h[i];
-        memcpy(h, x, count * sizeof(float));
+        RP(RP_ELEM, for (size_t i = 0; i < count; ++i)
+            x[i] += 0.5f * h[i]);
+        RP(RP_ELEM, memcpy(h, x, count * sizeof(float)));
         norm(h, n, 1024, A("attn_pre_norm"));
         AM("attn_q", h, q);
         AM("attn_k", h, k);
         AM("attn_v", h, v);
         const ei_tensor *qs = A("per_dim_scale");
-        for (size_t i = 0; i < count; ++i) {
+        RP(RP_ELEM, for (size_t i = 0; i < count; ++i) {
             q[i] *= value(qs, i % 128) / (sqrtf(128.0f) * logf(2.0f));
             k[i] *= log1pf(expf(1.0f)) / logf(2.0f);
-        }
+        });
         mm(pool, A("attn_k_rel"), pos, 13, rpe);
-        memset(a, 0, count * sizeof(float));
-        for (int t = 0; t < n; ++t)
+        RP(RP_ELEM, memset(a, 0, count * sizeof(float)));
+        RP(RP_ATTN, for (int t = 0; t < n; ++t)
             for (int head = 0; head < 8; ++head) {
                 float scores[12], mx = -INFINITY;
                 int lo = t > 11 ? t - 11 : 0;
@@ -550,52 +614,52 @@ bool ei_gemma2_audio(const ei_gguf *g, ei_thread_pool *pool, const float *mel, i
                     for (int z = 0; z < 128; ++z)
                         a[(size_t)t * 1024 + head * 128 + z] +=
                             scores[s - lo] / total * v[(size_t)s * 1024 + head * 128 + z];
-            }
+            });
         AM("attn_out", a, h);
         norm(h, n, 1024, A("attn_post_norm"));
-        for (size_t i = 0; i < count; ++i)
-            x[i] += h[i];
+        RP(RP_ELEM, for (size_t i = 0; i < count; ++i)
+            x[i] += h[i]);
         /* GGUF conversion swaps norm_conv and conv_norm; match the reference loader. */
-        memcpy(h, x, count * sizeof(float));
+        RP(RP_ELEM, memcpy(h, x, count * sizeof(float)));
         norm(h, n, 1024, A("conv_norm"));
         AM("conv_pw1", h, up);
-        for (int t = 0; t < n; ++t)
+        RP(RP_ACT, for (int t = 0; t < n; ++t)
             for (int z = 0; z < 1024; ++z)
                 h[(size_t)t * 1024 + z] =
-                    up[(size_t)t * 2048 + z] / (1 + expf(-up[(size_t)t * 2048 + 1024 + z]));
+                    up[(size_t)t * 2048 + z] / (1 + expf(-up[(size_t)t * 2048 + 1024 + z])));
         const ei_tensor *dw = A("conv_dw");
-        for (int t = 0; t < n; ++t)
+        RP(RP_CONV, for (int t = 0; t < n; ++t)
             for (int z = 0; z < 1024; ++z) {
                 float sum = 0;
                 for (int j = 0; j < 5; ++j)
                     if (t + j >= 4)
                         sum += h[(size_t)(t + j - 4) * 1024 + z] * value(dw, z * 5 + j);
                 a[(size_t)t * 1024 + z] = sum;
-            }
+            });
         norm(a, n, 1024, A("norm_conv"));
-        for (size_t i = 0; i < count; ++i)
-            a[i] = silu(a[i]);
+        RP(RP_ACT, for (size_t i = 0; i < count; ++i)
+            a[i] = silu(a[i]));
         AM("conv_pw2", a, h);
-        for (size_t i = 0; i < count; ++i)
-            x[i] += h[i];
-        memcpy(h, x, count * sizeof(float));
+        RP(RP_ELEM, for (size_t i = 0; i < count; ++i)
+            x[i] += h[i]);
+        RP(RP_ELEM, memcpy(h, x, count * sizeof(float)));
         norm(h, n, 1024, A("ffn_norm_1"));
         AM("ffn_up_1", h, up);
-        for (size_t i = 0; i < (size_t)n * 4096; ++i)
-            up[i] = silu(up[i]);
+        RP(RP_ACT, for (size_t i = 0; i < (size_t)n * 4096; ++i)
+            up[i] = silu(up[i]));
         AM("ffn_down_1", up, h);
         norm(h, n, 1024, A("ffn_post_norm_1"));
-        for (size_t i = 0; i < count; ++i)
-            x[i] += 0.5f * h[i];
+        RP(RP_ELEM, for (size_t i = 0; i < count; ++i)
+            x[i] += 0.5f * h[i]);
         norm(x, n, 1024, A("ln2"));
 #undef AM
 #undef A
     }
     clipped_mm(g, pool, "a.pre_encode.out.weight", x, n, up);
     const ei_tensor *bias = tensor(g, "a.pre_encode.out.bias");
-    for (int t = 0; t < n; ++t)
+    RP(RP_ELEM, for (int t = 0; t < n; ++t)
         for (int z = 0; z < 1536; ++z)
-            up[(size_t)t * 1536 + z] += value(bias, z);
+            up[(size_t)t * 1536 + z] += value(bias, z));
     norm(up, n, 1536, NULL);
     *output = alloc_f((size_t)n * 512);
     *tokens = n;
@@ -609,5 +673,6 @@ bool ei_gemma2_audio(const ei_gguf *g, ei_thread_pool *pool, const float *mel, i
     free(up);
     free(pos);
     free(rpe);
+    rp_report("audio", (size_t)frames, rp_on() ? rp_now() - rp_total : 0);
     return true;
 }

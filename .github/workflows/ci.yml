@@ -4,21 +4,101 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
+# Read-only token; no secrets are used by any job.
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   portable:
-    name: Portable checks (${{ matrix.os }})
+    name: Upstream model-free checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-24.04, macos-14]
     steps:
-      - uses: actions/checkout@v4
-      - name: Run model-free checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Model-free checks
         run: make check
       - name: Build CPU server
         run: make
+      - name: Build identity
+        run: ./build/embeddinggemma --version
+
+  cpu-max-linux:
+    name: CPU-Max kernels and builds (Linux x86-64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner CPU features
+        # Hosted runners vary (AVX2, sometimes AVX-512, rarely AVX-VNNI); the tests
+        # below cover whatever dispatch level is available plus forced fallbacks.
+        run: |
+          grep -m1 "model name" /proc/cpuinfo
+          grep -m1 -o -w -E 'avx2|avx_vnni|avx512f|avx512_vnni' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+      - name: Build server and CPU-Max tests (gcc, -Werror)
+        run: make -j"$(nproc)" build/embeddinggemma build/test_gemma2_vnni256 build/test_gemma2_attn
+      - name: Kernel tests at each x86 dispatch level (default, AVX2, scalar)
+        run: |
+          for level in default avx2 scalar; do
+            echo "== EI_GEMMA2_CPU_X86=$level"
+            if [ "$level" = default ]; then unset EI_GEMMA2_CPU_X86; else export EI_GEMMA2_CPU_X86=$level; fi
+            ./build/test_gemma2_vnni256
+            ./build/test_gemma2_attn
+          done
+      - name: Clang build
+        run: make -j"$(nproc)" BUILD=build-clang CC=clang build-clang/embeddinggemma
+      - name: aarch64 cross build (portable fallbacks)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          make -j"$(nproc)" BUILD=build-arm64 CC=aarch64-linux-gnu-gcc build-arm64/embeddinggemma
+          file build-arm64/embeddinggemma
+
+  model-tests:
+    name: Model tests and HTTP smoke test (Q8_0 GGUF, cached)
+    needs: cpu-max-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      MODELS: ${{ github.workspace }}/.models
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Restore model files
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .models
+          key: gguf-embeddinggemma-2-${{ hashFiles('cpu-max/models/SHA256SUMS') }}
+      - name: Download and verify model files (1.0 GB, pinned revision)
+        run: cpu-max/scripts/download_models.sh "$MODELS"
+      - name: Build
+        run: make -j"$(nproc)" build/embeddinggemma build/test_gemma2
+      - name: Integration suite (tokenizer, towers vs reference graphs, HTTP)
+        run: |
+          make test-gemma2 GEMMA2_MODEL="$MODELS/embeddinggemma-2-Q8_0.gguf" \
+              GEMMA2_MMPROJ="$MODELS/mmproj-embeddinggemma-2-Q8_0.gguf"
+      - name: HTTP smoke test (text, image, audio, mixed)
+        run: |
+          ./build/embeddinggemma --bind 127.0.0.1 --port 42666 --threads "$(nproc)" \
+              --model "$MODELS/embeddinggemma-2-Q8_0.gguf" \
+              --mmproj "$MODELS/mmproj-embeddinggemma-2-Q8_0.gguf" > server.log 2>&1 &
+          server=$!
+          python3 cpu-max/examples/quickstart.py --wait 180
+          kill "$server"
+      - name: Server log
+        if: failure()
+        run: cat server.log || true

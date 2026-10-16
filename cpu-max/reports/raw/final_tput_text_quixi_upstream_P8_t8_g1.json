@@ -1,0 +1,295 @@
+{
+ "backend": "quixi_upstream",
+ "kind": "native",
+ "threads": 8,
+ "cpus": "P8",
+ "cpu_list": [
+  0,
+  2,
+  4,
+  6,
+  8,
+  10,
+  12,
+  14
+ ],
+ "started": "2026-10-16T13:31:16",
+ "host": "redacted",
+ "load_before": [
+  8.06689453125,
+  16.11083984375,
+  14.3193359375
+ ],
+ "load_after": [
+  10.083984375,
+  16.14306640625,
+  14.35693359375
+ ],
+ "load_ms": 104.39367999881506,
+ "peak_rss_mb": 378.20703125,
+ "versions": {
+  "binary": "third_party/embeddinggemma.c/build/embeddinggemma",
+  "cmd": [
+   "taskset",
+   "-c",
+   "0,2,4,6,8,10,12,14",
+   "third_party/embeddinggemma.c/build/embeddinggemma",
+   "--bind",
+   "127.0.0.1",
+   "--port",
+   "47385",
+   "--threads",
+   "8",
+   "--model",
+   "models/gguf/embeddinggemma-2-Q8_0.gguf",
+   "--mmproj",
+   "models/gguf/mmproj-embeddinggemma-2-Q8_0.gguf",
+   "--cache-entries",
+   "0",
+   "--response-cache-mb",
+   "0",
+   "--media-cache-mb",
+   "0",
+   "--keepalive-timeout-ms",
+   "60000"
+  ],
+  "git": "d8f9e33"
+ },
+ "warmup": 1,
+ "repeat": 3,
+ "argv": [
+  "bench/run_bench.py",
+  "--backend",
+  "native",
+  "--binary",
+  "third_party/embeddinggemma.c/build/embeddinggemma",
+  "--name",
+  "quixi_upstream",
+  "--threads",
+  "8",
+  "--cpus",
+  "P8",
+  "--items",
+  "t16,t128",
+  "--warmup",
+  "1",
+  "--min-repeat",
+  "3",
+  "--repeat",
+  "3",
+  "--concurrency",
+  "4,16",
+  "--requests",
+  "64",
+  "--quiet-cores",
+  "1.5",
+  "--quiet-wait-s",
+  "180",
+  "--out",
+  "reports/raw/final_tput_text_quixi_upstream_P8_t8.json"
+ ],
+ "results": [
+  {
+   "item": "t16",
+   "modality": "text",
+   "tokens": 16,
+   "expected_tokens": 16,
+   "stats": {
+    "total": {
+     "p50": 17.508108995854855,
+     "p95": 17.605214504152535,
+     "mean": 17.5234593351682,
+     "min": 17.446265004575253,
+     "max": 17.6160040050745,
+     "n": 3
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "client_encode": {
+     "p50": 0.030785992741584778,
+     "p95": 0.030785992741584778,
+     "mean": 0.030785992741584778,
+     "min": 0.030785992741584778,
+     "max": 0.030785992741584778,
+     "n": 3
+    },
+    "rps_single": 57.066357782054986
+   },
+   "cpu_util": 0.8697949833801274,
+   "norm": 0.9999998807907104,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "background_cores_before": 0.5298084683786257,
+   "foreign_cores": 0.16971609404146734,
+   "trials": [
+    {
+     "total": 17.446265004575253,
+     "client_encode": 0.030785992741584778,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 17.508108995854855,
+     "client_encode": 0.030785992741584778,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 17.6160040050745,
+     "client_encode": 0.030785992741584778,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    }
+   ],
+   "throughput": [
+    {
+     "concurrency": 4,
+     "mode": "concurrent_http",
+     "requests": 64,
+     "wall_s": 1.0370868050013087,
+     "rps": 61.71132415470202,
+     "p50": 62.11296799665433,
+     "p95": 74.6976452988747,
+     "cpu_util": 0.9401334539192886
+    },
+    {
+     "concurrency": 16,
+     "mode": "concurrent_http",
+     "requests": 64,
+     "wall_s": 0.535966316005215,
+     "rps": 119.41048922070182,
+     "p50": 131.29913899683743,
+     "p95": 149.52313649991993,
+     "cpu_util": 0.902575377508039
+    }
+   ]
+  },
+  {
+   "item": "t128",
+   "modality": "text",
+   "tokens": 128,
+   "expected_tokens": 128,
+   "stats": {
+    "total": {
+     "p50": 133.50605800002813,
+     "p95": 146.9623972028494,
+     "mean": 137.96320333331823,
+     "min": 131.9260059967637,
+     "max": 148.45754600316286,
+     "n": 3
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "client_encode": {
+     "p50": 0.015167005360126495,
+     "p95": 0.015167005360126495,
+     "mean": 0.015167005360126495,
+     "min": 0.015167005360126495,
+     "max": 0.015167005360126495,
+     "n": 3
+    },
+    "rps_single": 7.24830951905347
+   },
+   "cpu_util": 0.9038136320986667,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "background_cores_before": 0.23987867559385914,
+   "foreign_cores": 1.3795050174026764,
+   "trials": [
+    {
+     "total": 148.45754600316286,
+     "client_encode": 0.015167005360126495,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 133.50605800002813,
+     "client_encode": 0.015167005360126495,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 131.9260059967637,
+     "client_encode": 0.015167005360126495,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    }
+   ],
+   "throughput": [
+    {
+     "concurrency": 4,
+     "mode": "concurrent_http",
+     "requests": 64,
+     "wall_s": 8.218121956000687,
+     "rps": 7.787667345733248,
+     "p50": 507.38377000016044,
+     "p95": 567.5733373005642,
+     "cpu_util": 0.9444067685480028
+    },
+    {
+     "concurrency": 16,
+     "mode": "concurrent_http",
+     "requests": 64,
+     "wall_s": 3.679785221000202,
+     "rps": 17.392319430698777,
+     "p50": 956.9934619976266,
+     "p95": 1025.153492701065,
+     "cpu_util": 0.9643905246826918
+    }
+   ]
+  }
+ ]
+}

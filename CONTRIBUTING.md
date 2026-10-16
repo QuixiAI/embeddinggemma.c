@@ -1,5 +1,32 @@
 # Contributing
 
+## EmbeddingGemma-2-CPU-Max
+
+CPU-Max changes the CPU execution of EmbeddingGemma 2 (`CPU_MAX.md`); the rest
+of this file is upstream's guide and still applies to the shared code.
+
+- Build and test before sending a change: `make check`, `make`, the CPU-Max
+  kernel tests (`make build/test_gemma2_vnni256 build/test_gemma2_attn` and
+  run them, also with `EI_GEMMA2_CPU_X86=avx2` and `=scalar`), and with the
+  model files `make test-gemma2 GEMMA2_MODEL=… GEMMA2_MMPROJ=…` plus
+  `python3 cpu-max/examples/quickstart.py` against a running server. CI runs
+  the same (`.github/workflows/ci.yml`).
+- A new numeric path gets an environment switch that restores the previous
+  behaviour, and a test against a higher-precision or reference result.
+  Changes meant to be output-preserving must be shown bit-identical.
+- Performance claims need artifacts: raw runs from `cpu-max/bench/run_bench.py`
+  (with `--quiet-cores` on a shared machine), interleaved or repeated A/B on
+  the budget being claimed, and an entry in
+  `cpu-max/reports/optimization_log.md` — kept or rejected. Do not edit
+  generated tables in `README.md` by hand; regenerate them with
+  `cpu-max/scripts/render_results.py`.
+- Do not commit model files, datasets, fixtures, cached embeddings or virtual
+  environments (`.gitignore`, `cpu-max/.gitignore`).
+
+---
+
+# Upstream contributing guide (QuixiAI/embeddinggemma.c)
+
 Contributions should preserve the project's narrow scope: standalone inference
 and serving for two fixed profiles: native CPU/Metal EmbeddingGemma 2 with text,
 vision and audio towers, and EmbeddingGemma 300M on CPU, Metal, CUDA, ROCm,

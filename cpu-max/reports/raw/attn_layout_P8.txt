@@ -1,0 +1,9 @@
+# attention layout, P8 (cpus 0,2,..,14), 2 rounds
+n=2520 headmajor=0: attention n=2520 d=64 heads=12 threads=8: best 35.53 ms, 274.5 GMAC/s
+n=2520 headmajor=1: attention n=2520 d=64 heads=12 threads=8: best 34.40 ms, 283.5 GMAC/s
+n=10080 headmajor=0: attention n=10080 d=64 heads=12 threads=8: best 643.51 ms, 242.5 GMAC/s
+n=10080 headmajor=1: attention n=10080 d=64 heads=12 threads=8: best 563.52 ms, 277.0 GMAC/s
+n=2520 headmajor=0: attention n=2520 d=64 heads=12 threads=8: best 33.86 ms, 288.1 GMAC/s
+n=2520 headmajor=1: attention n=2520 d=64 heads=12 threads=8: best 33.19 ms, 293.9 GMAC/s
+n=10080 headmajor=0: attention n=10080 d=64 heads=12 threads=8: best 620.13 ms, 251.7 GMAC/s
+n=10080 headmajor=1: attention n=10080 d=64 heads=12 threads=8: best 560.24 ms, 278.6 GMAC/s

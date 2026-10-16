@@ -1,0 +1,527 @@
+{
+ "backend": "quixi_upstream",
+ "kind": "native",
+ "threads": 8,
+ "cpus": "P8",
+ "cpu_list": [
+  0,
+  2,
+  4,
+  6,
+  8,
+  10,
+  12,
+  14
+ ],
+ "started": "2026-10-16T03:13:50",
+ "host": "redacted",
+ "load_before": [
+  6.32080078125,
+  5.74658203125,
+  3.150390625
+ ],
+ "load_after": [
+  8.3095703125,
+  7.08740234375,
+  4.25927734375
+ ],
+ "load_ms": 105.50768400006928,
+ "peak_rss_mb": 951.07421875,
+ "versions": {
+  "binary": "third_party/embeddinggemma.c/build/embeddinggemma",
+  "cmd": [
+   "taskset",
+   "-c",
+   "0,2,4,6,8,10,12,14",
+   "third_party/embeddinggemma.c/build/embeddinggemma",
+   "--bind",
+   "127.0.0.1",
+   "--port",
+   "39651",
+   "--threads",
+   "8",
+   "--model",
+   "models/gguf/embeddinggemma-2-Q8_0.gguf",
+   "--mmproj",
+   "models/gguf/mmproj-embeddinggemma-2-Q8_0.gguf",
+   "--cache-entries",
+   "0",
+   "--response-cache-mb",
+   "0",
+   "--media-cache-mb",
+   "0",
+   "--keepalive-timeout-ms",
+   "60000"
+  ],
+  "git": "d8f9e33"
+ },
+ "warmup": 1,
+ "repeat": 2,
+ "argv": [
+  "bench/run_bench.py",
+  "--backend",
+  "native",
+  "--binary",
+  "third_party/embeddinggemma.c/build/embeddinggemma",
+  "--name",
+  "quixi_upstream",
+  "--threads",
+  "8",
+  "--cpus",
+  "P8",
+  "--items",
+  "t16,i70,a5,v4,m_ti",
+  "--warmup",
+  "1",
+  "--repeat",
+  "2",
+  "--out",
+  "reports/raw/smoke_native.json"
+ ],
+ "results": [
+  {
+   "item": "t16",
+   "modality": "text",
+   "tokens": 16,
+   "expected_tokens": 16,
+   "stats": {
+    "total": {
+     "p50": 19.14891849993728,
+     "p95": 20.898830349813217,
+     "mean": 19.14891849993728,
+     "min": 17.20457200007513,
+     "max": 21.09326499979943,
+     "n": 2
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 2
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 2
+    },
+    "client_encode": {
+     "p50": 0.03349300008267164,
+     "p95": 0.03349300008267164,
+     "mean": 0.03349300008267164,
+     "min": 0.03349300008267164,
+     "max": 0.03349300008267164,
+     "n": 2
+    },
+    "rps_single": 52.22227041194391
+   },
+   "cpu_util": 0.8174894152632787,
+   "norm": 0.9999998807907104,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 17.20457200007513,
+     "client_encode": 0.03349300008267164,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 21.09326499979943,
+     "client_encode": 0.03349300008267164,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "i70",
+   "modality": "image",
+   "tokens": 74,
+   "expected_tokens": 74,
+   "stats": {
+    "total": {
+     "p50": 3937.2628459999105,
+     "p95": 3944.536854799872,
+     "mean": 3937.2628459999105,
+     "min": 3929.1806139999535,
+     "max": 3945.3450779998675,
+     "n": 2
+    },
+    "preprocess": {
+     "p50": 3.0250000000000004,
+     "p95": 3.0655,
+     "mean": 3.0250000000000004,
+     "min": 2.98,
+     "max": 3.0700000000000003,
+     "n": 2
+    },
+    "inference": {
+     "p50": 3933.475,
+     "p95": 3940.6165,
+     "mean": 3933.475,
+     "min": 3925.54,
+     "max": 3941.41,
+     "n": 2
+    },
+    "towers": {
+     "p50": 3866.9700000000003,
+     "p95": 3874.098,
+     "mean": 3866.9700000000003,
+     "min": 3859.05,
+     "max": 3874.89,
+     "n": 2
+    },
+    "text": {
+     "p50": 66.505,
+     "p95": 66.51849999999999,
+     "mean": 66.505,
+     "min": 66.49,
+     "max": 66.52,
+     "n": 2
+    },
+    "client_encode": {
+     "p50": 1.0118879999499768,
+     "p95": 1.0118879999499768,
+     "mean": 1.0118879999499768,
+     "min": 1.0118879999499768,
+     "max": 1.0118879999499768,
+     "n": 2
+    },
+    "rps_single": 0.2539835512927355
+   },
+   "cpu_util": 0.8852763536103525,
+   "norm": 1.0000001192092896,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 3945.3450779998675,
+     "client_encode": 1.0118879999499768,
+     "preprocess": 3.0700000000000003,
+     "towers": 3874.89,
+     "text": 66.52,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.16,
+      "decode": 2.87,
+      "resize": 0.04,
+      "vision": 3874.89,
+      "finish": 66.52
+     },
+     "inference": 3941.41
+    },
+    {
+     "total": 3929.1806139999535,
+     "client_encode": 1.0118879999499768,
+     "preprocess": 2.98,
+     "towers": 3859.05,
+     "text": 66.49,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.11,
+      "decode": 2.83,
+      "resize": 0.04,
+      "vision": 3859.05,
+      "finish": 66.49
+     },
+     "inference": 3925.54
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "a5",
+   "modality": "audio",
+   "tokens": 129,
+   "expected_tokens": 129,
+   "stats": {
+    "total": {
+     "p50": 1298.552170000039,
+     "p95": 1298.6099428001094,
+     "mean": 1298.552170000039,
+     "min": 1298.487977999961,
+     "max": 1298.616362000117,
+     "n": 2
+    },
+    "preprocess": {
+     "p50": 3.1550000000000002,
+     "p95": 3.2045,
+     "mean": 3.1550000000000002,
+     "min": 3.1,
+     "max": 3.21,
+     "n": 2
+    },
+    "inference": {
+     "p50": 1294.745,
+     "p95": 1294.7765,
+     "mean": 1294.745,
+     "min": 1294.71,
+     "max": 1294.78,
+     "n": 2
+    },
+    "towers": {
+     "p50": 1176.9499999999998,
+     "p95": 1177.1029999999998,
+     "mean": 1176.9499999999998,
+     "min": 1176.78,
+     "max": 1177.12,
+     "n": 2
+    },
+    "text": {
+     "p50": 117.795,
+     "p95": 117.91650000000001,
+     "mean": 117.795,
+     "min": 117.66,
+     "max": 117.93,
+     "n": 2
+    },
+    "client_encode": {
+     "p50": 0.8428179998882115,
+     "p95": 0.8428179998882115,
+     "mean": 0.8428179998882115,
+     "min": 0.8428179998882115,
+     "max": 0.8428179998882115,
+     "n": 2
+    },
+    "rps_single": 0.7700884285611489
+   },
+   "cpu_util": 0.7322578123803912,
+   "norm": 1.0000001192092896,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 1298.616362000117,
+     "client_encode": 0.8428179998882115,
+     "preprocess": 3.21,
+     "towers": 1177.12,
+     "text": 117.66,
+     "tokens": 129,
+     "stages": {
+      "base64": 0.06,
+      "wav": 0.2,
+      "logmel": 2.95,
+      "audio": 1177.12,
+      "finish": 117.66
+     },
+     "inference": 1294.78
+    },
+    {
+     "total": 1298.487977999961,
+     "client_encode": 0.8428179998882115,
+     "preprocess": 3.1,
+     "towers": 1176.78,
+     "text": 117.93,
+     "tokens": 129,
+     "stages": {
+      "base64": 0.06,
+      "wav": 0.14,
+      "logmel": 2.9,
+      "audio": 1176.78,
+      "finish": 117.93
+     },
+     "inference": 1294.71
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "v4",
+   "modality": "video",
+   "tokens": 597,
+   "expected_tokens": 570,
+   "stats": {
+    "total": {
+     "p50": 41126.680183499935,
+     "p95": 41180.99974424996,
+     "mean": 41126.680183499935,
+     "min": 41066.325115999905,
+     "max": 41187.035250999965,
+     "n": 2
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 2
+    },
+    "inference": {
+     "p50": 720.52,
+     "p95": 737.377,
+     "mean": 720.52,
+     "min": 701.79,
+     "max": 739.25,
+     "n": 2
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 2
+    },
+    "text": {
+     "p50": 720.52,
+     "p95": 737.377,
+     "mean": 720.52,
+     "min": 701.79,
+     "max": 739.25,
+     "n": 2
+    },
+    "client_encode": {
+     "p50": 7.378620999865234,
+     "p95": 7.378620999865234,
+     "mean": 7.378620999865234,
+     "min": 7.378620999865234,
+     "max": 7.378620999865234,
+     "n": 2
+    },
+    "rps_single": 0.02431511601564186
+   },
+   "cpu_util": 0.9067536913672536,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 41187.035250999965,
+     "client_encode": 7.378620999865234,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 739.25,
+     "tokens": 597,
+     "stages": {
+      "finish": 739.25
+     },
+     "inference": 739.25
+    },
+    {
+     "total": 41066.325115999905,
+     "client_encode": 7.378620999865234,
+     "preprocess": 0,
+     "towers": 0,
+     "text": 701.79,
+     "tokens": 597,
+     "stages": {
+      "finish": 701.79
+     },
+     "inference": 701.79
+    }
+   ],
+   "throughput": []
+  },
+  {
+   "item": "m_ti",
+   "modality": "mixed",
+   "tokens": 314,
+   "expected_tokens": 314,
+   "stats": {
+    "total": {
+     "p50": 32386.755519,
+     "p95": 32778.277417800055,
+     "mean": 32386.755519,
+     "min": 31951.73118699994,
+     "max": 32821.77985100006,
+     "n": 2
+    },
+    "preprocess": {
+     "p50": 9.68,
+     "p95": 9.68,
+     "mean": 9.68,
+     "min": 9.68,
+     "max": 9.68,
+     "n": 2
+    },
+    "inference": {
+     "p50": 32375.82,
+     "p95": 32767.337999999996,
+     "mean": 32375.82,
+     "min": 31940.8,
+     "max": 32810.84,
+     "n": 2
+    },
+    "towers": {
+     "p50": 32049.309999999998,
+     "p95": 32442.07,
+     "mean": 32049.309999999998,
+     "min": 31612.91,
+     "max": 32485.71,
+     "n": 2
+    },
+    "text": {
+     "p50": 326.51,
+     "p95": 327.752,
+     "mean": 326.51,
+     "min": 325.13,
+     "max": 327.89,
+     "n": 2
+    },
+    "client_encode": {
+     "p50": 3.1669229997787625,
+     "p95": 3.1669229997787625,
+     "mean": 3.1669229997787625,
+     "min": 3.1669229997787625,
+     "max": 3.1669229997787625,
+     "n": 2
+    },
+    "rps_single": 0.03087681936566139
+   },
+   "cpu_util": 0.9293862936299542,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 32821.77985100006,
+     "client_encode": 3.1669229997787625,
+     "preprocess": 9.68,
+     "towers": 32485.71,
+     "text": 325.13,
+     "tokens": 314,
+     "stages": {
+      "base64": 0.36,
+      "decode": 9.04,
+      "resize": 0.28,
+      "vision": 32485.71,
+      "finish": 325.13
+     },
+     "inference": 32810.84
+    },
+    {
+     "total": 31951.73118699994,
+     "client_encode": 3.1669229997787625,
+     "preprocess": 9.68,
+     "towers": 31612.91,
+     "text": 327.89,
+     "tokens": 314,
+     "stages": {
+      "base64": 0.34,
+      "decode": 9.06,
+      "resize": 0.28,
+      "vision": 31612.91,
+      "finish": 327.89
+     },
+     "inference": 31940.8
+    }
+   ],
+   "throughput": []
+  }
+ ]
+}

@@ -1,0 +1,850 @@
+{
+  "generated_utc": "2026-10-15T23:44:12+00:00",
+  "hostname": "redacted",
+  "os": {
+    "kernel": "7.0.0-38-generic",
+    "system": "Linux",
+    "machine": "x86_64",
+    "distro": "Ubuntu 24.04.5 LTS",
+    "glibc": "2.39"
+  },
+  "cpu": {
+    "model": "Intel(R) Core(TM) i7-14700HX",
+    "vendor": "GenuineIntel",
+    "family": 6,
+    "model_id": 183,
+    "stepping": "1",
+    "microcode": "0x133",
+    "isa": {
+      "sse4_2": true,
+      "avx": true,
+      "avx2": true,
+      "fma": true,
+      "f16c": true,
+      "bmi2": true,
+      "avx_vnni": true,
+      "avx512f": false,
+      "avx512bw": false,
+      "avx512vl": false,
+      "avx512dq": false,
+      "avx512_vnni": false,
+      "avx512_bf16": false,
+      "avx512_fp16": false,
+      "avx_vnni_int8": false,
+      "avx_ne_convert": false,
+      "amx_tile": false,
+      "amx_int8": false,
+      "amx_bf16": false,
+      "amx_fp16": false,
+      "gfni": true,
+      "vaes": true,
+      "sha_ni": true
+    },
+    "all_flags": [
+      "3dnowprefetch",
+      "abm",
+      "acpi",
+      "adx",
+      "aes",
+      "aperfmperf",
+      "apic",
+      "arat",
+      "arch_capabilities",
+      "arch_lbr",
+      "arch_perfmon",
+      "art",
+      "avx",
+      "avx2",
+      "avx_vnni",
+      "bmi1",
+      "bmi2",
+      "bts",
+      "clflush",
+      "clflushopt",
+      "clwb",
+      "cmov",
+      "constant_tsc",
+      "cpuid",
+      "cpuid_fault",
+      "cx16",
+      "cx8",
+      "de",
+      "ds_cpl",
+      "dtes64",
+      "dtherm",
+      "dts",
+      "epb",
+      "ept",
+      "ept_ad",
+      "erms",
+      "est",
+      "f16c",
+      "flexpriority",
+      "flush_l1d",
+      "fma",
+      "fpu",
+      "fsgsbase",
+      "fsrm",
+      "fxsr",
+      "gfni",
+      "hfi",
+      "ht",
+      "hwp",
+      "hwp_act_window",
+      "hwp_epp",
+      "hwp_notify",
+      "hwp_pkg_req",
+      "ibpb",
+      "ibrs",
+      "ibrs_enhanced",
+      "ibt",
+      "ida",
+      "intel_pt",
+      "invpcid",
+      "lahf_lm",
+      "lm",
+      "mca",
+      "mce",
+      "md_clear",
+      "mmx",
+      "monitor",
+      "movbe",
+      "movdir64b",
+      "movdiri",
+      "msr",
+      "mtrr",
+      "nonstop_tsc",
+      "nopl",
+      "nx",
+      "ospke",
+      "pae",
+      "pat",
+      "pbe",
+      "pcid",
+      "pclmulqdq",
+      "pdcm",
+      "pdpe1gb",
+      "pebs",
+      "pge",
+      "pku",
+      "pln",
+      "pni",
+      "popcnt",
+      "pse",
+      "pse36",
+      "pts",
+      "rdpid",
+      "rdrand",
+      "rdseed",
+      "rdtscp",
+      "rep_good",
+      "sdbg",
+      "sep",
+      "serialize",
+      "sha_ni",
+      "smap",
+      "smep",
+      "split_lock_detect",
+      "ss",
+      "ssbd",
+      "sse",
+      "sse2",
+      "sse4_1",
+      "sse4_2",
+      "ssse3",
+      "stibp",
+      "syscall",
+      "tm",
+      "tm2",
+      "tpr_shadow",
+      "tsc",
+      "tsc_adjust",
+      "tsc_deadline_timer",
+      "tsc_known_freq",
+      "umip",
+      "user_shstk",
+      "vaes",
+      "vme",
+      "vmx",
+      "vnmi",
+      "vpclmulqdq",
+      "vpid",
+      "waitpkg",
+      "x2apic",
+      "xgetbv1",
+      "xsave",
+      "xsavec",
+      "xsaveopt",
+      "xsaves",
+      "xtopology",
+      "xtpr"
+    ]
+  },
+  "topology": {
+    "logical_cpus": 28,
+    "physical_cores": 20,
+    "packages": 1,
+    "smt_threads_per_core_max": 2,
+    "core_groups": [
+      {
+        "package": 0,
+        "core_id": 0,
+        "cpus": [
+          0,
+          1
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 4,
+        "cpus": [
+          2,
+          3
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 8,
+        "cpus": [
+          4,
+          5
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 12,
+        "cpus": [
+          6,
+          7
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 16,
+        "cpus": [
+          8,
+          9
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 20,
+        "cpus": [
+          10,
+          11
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 24,
+        "cpus": [
+          12,
+          13
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 28,
+        "cpus": [
+          14,
+          15
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 32,
+        "cpus": [
+          16
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 33,
+        "cpus": [
+          17
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 34,
+        "cpus": [
+          18
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 35,
+        "cpus": [
+          19
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 36,
+        "cpus": [
+          20
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 37,
+        "cpus": [
+          21
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 38,
+        "cpus": [
+          22
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 39,
+        "cpus": [
+          23
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 40,
+        "cpus": [
+          24
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 41,
+        "cpus": [
+          25
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 42,
+        "cpus": [
+          26
+        ]
+      },
+      {
+        "package": 0,
+        "core_id": 43,
+        "cpus": [
+          27
+        ]
+      }
+    ],
+    "hybrid": {
+      "cpu_core": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "cpu_atom": [
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ]
+    },
+    "per_cpu": [
+      {
+        "cpu": 0,
+        "package": 0,
+        "core_id": 0,
+        "max_khz": 5300000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 1,
+        "package": 0,
+        "core_id": 0,
+        "max_khz": 5300000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 2,
+        "package": 0,
+        "core_id": 4,
+        "max_khz": 5300000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 3,
+        "package": 0,
+        "core_id": 4,
+        "max_khz": 5300000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 4,
+        "package": 0,
+        "core_id": 8,
+        "max_khz": 5300000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 5,
+        "package": 0,
+        "core_id": 8,
+        "max_khz": 5300000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 6,
+        "package": 0,
+        "core_id": 12,
+        "max_khz": 5300000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 7,
+        "package": 0,
+        "core_id": 12,
+        "max_khz": 5300000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 8,
+        "package": 0,
+        "core_id": 16,
+        "max_khz": 5500000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 9,
+        "package": 0,
+        "core_id": 16,
+        "max_khz": 5500000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 10,
+        "package": 0,
+        "core_id": 20,
+        "max_khz": 5500000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 11,
+        "package": 0,
+        "core_id": 20,
+        "max_khz": 5500000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 12,
+        "package": 0,
+        "core_id": 24,
+        "max_khz": 5300000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 13,
+        "package": 0,
+        "core_id": 24,
+        "max_khz": 5300000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 14,
+        "package": 0,
+        "core_id": 28,
+        "max_khz": 5300000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 15,
+        "package": 0,
+        "core_id": 28,
+        "max_khz": 5300000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 16,
+        "package": 0,
+        "core_id": 32,
+        "max_khz": 3900000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 17,
+        "package": 0,
+        "core_id": 33,
+        "max_khz": 3900000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 18,
+        "package": 0,
+        "core_id": 34,
+        "max_khz": 3900000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 19,
+        "package": 0,
+        "core_id": 35,
+        "max_khz": 3900000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 20,
+        "package": 0,
+        "core_id": 36,
+        "max_khz": 3900000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 21,
+        "package": 0,
+        "core_id": 37,
+        "max_khz": 3900000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 22,
+        "package": 0,
+        "core_id": 38,
+        "max_khz": 3900000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 23,
+        "package": 0,
+        "core_id": 39,
+        "max_khz": 3900000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 24,
+        "package": 0,
+        "core_id": 40,
+        "max_khz": 3900000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 25,
+        "package": 0,
+        "core_id": 41,
+        "max_khz": 3900000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 26,
+        "package": 0,
+        "core_id": 42,
+        "max_khz": 3900000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      },
+      {
+        "cpu": 27,
+        "package": 0,
+        "core_id": 43,
+        "max_khz": 3900000,
+        "min_khz": 800000,
+        "governor": "powersave",
+        "epp": "performance"
+      }
+    ]
+  },
+  "caches": [
+    {
+      "level": 1,
+      "type": "Data",
+      "size": "32K",
+      "line_size": 64,
+      "instances": 12,
+      "shared_cpu_lists": [
+        "16",
+        "17",
+        "18",
+        "19",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24",
+        "25",
+        "26",
+        "27"
+      ]
+    },
+    {
+      "level": 1,
+      "type": "Data",
+      "size": "48K",
+      "line_size": 64,
+      "instances": 8,
+      "shared_cpu_lists": [
+        "0-1",
+        "2-3",
+        "4-5",
+        "6-7",
+        "8-9",
+        "10-11",
+        "12-13",
+        "14-15"
+      ]
+    },
+    {
+      "level": 1,
+      "type": "Instruction",
+      "size": "32K",
+      "line_size": 64,
+      "instances": 8,
+      "shared_cpu_lists": [
+        "0-1",
+        "2-3",
+        "4-5",
+        "6-7",
+        "8-9",
+        "10-11",
+        "12-13",
+        "14-15"
+      ]
+    },
+    {
+      "level": 1,
+      "type": "Instruction",
+      "size": "64K",
+      "line_size": 64,
+      "instances": 12,
+      "shared_cpu_lists": [
+        "16",
+        "17",
+        "18",
+        "19",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24",
+        "25",
+        "26",
+        "27"
+      ]
+    },
+    {
+      "level": 2,
+      "type": "Unified",
+      "size": "2048K",
+      "line_size": 64,
+      "instances": 8,
+      "shared_cpu_lists": [
+        "0-1",
+        "2-3",
+        "4-5",
+        "6-7",
+        "8-9",
+        "10-11",
+        "12-13",
+        "14-15"
+      ]
+    },
+    {
+      "level": 2,
+      "type": "Unified",
+      "size": "4096K",
+      "line_size": 64,
+      "instances": 3,
+      "shared_cpu_lists": [
+        "16-19",
+        "20-23",
+        "24-27"
+      ]
+    },
+    {
+      "level": 3,
+      "type": "Unified",
+      "size": "33792K",
+      "line_size": 64,
+      "instances": 1,
+      "shared_cpu_lists": [
+        "0-27"
+      ]
+    }
+  ],
+  "numa": [
+    {
+      "node": 0,
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "mem_total_kib": 16061520
+    }
+  ],
+  "memory": {
+    "MemTotal": "16061520 kB",
+    "MemFree": "4035992 kB",
+    "MemAvailable": "9253320 kB",
+    "SwapTotal": "4194300 kB",
+    "SwapFree": "2855700 kB",
+    "HugePages_Total": "0",
+    "Hugepagesize": "2048 kB",
+    "transparent_hugepage": "always [madvise] never"
+  },
+  "power": {
+    "ac_online": "1",
+    "intel_pstate_status": "active",
+    "no_turbo": "0",
+    "governor_cpu0": "powersave",
+    "epp_cpu0": "performance"
+  },
+  "profiling": {
+    "perf_path": "/usr/bin/perf",
+    "perf_version": "perf version 7.0.14",
+    "perf_event_paranoid": "4",
+    "hardware_counters_accessible": false,
+    "valgrind": null
+  },
+  "toolchain": {
+    "gcc": {
+      "available": true,
+      "path": "/usr/bin/gcc",
+      "version": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+      "native_isa_macros": [
+        "__AVX2__",
+        "__AVXVNNI__",
+        "__AVX__",
+        "__BMI2__",
+        "__BMI__",
+        "__F16C__",
+        "__FMA__",
+        "__GFNI__",
+        "__SHA__",
+        "__SSE2_MATH__",
+        "__SSE2__",
+        "__SSE3__",
+        "__SSE4_1__",
+        "__SSE4_2__",
+        "__SSE_MATH__",
+        "__SSE__",
+        "__VAES__"
+      ],
+      "native_march": "-march=                     \t\talderlake",
+      "compiler_can_target_isa (compile-only, NOT runtime support)": {
+        "avx2_fma": true,
+        "avx_vnni": true,
+        "avx512_vnni": true,
+        "amx_int8": true
+      }
+    },
+    "clang": {
+      "available": false
+    },
+    "make": "GNU Make 4.3",
+    "cmake": "cmake version 3.28.3",
+    "python": "3.12.3"
+  },
+  "accelerators": {
+    "present": "NVIDIA GeForce RTX 5050 Laptop GPU, 8151 MiB",
+    "policy": "Present accelerators are NOT used: all measured runs are CPU-only (CPU torch wheel, onnxruntime CPUExecutionProvider, native C without GPU code, CUDA_VISIBLE_DEVICES='')."
+  },
+  "load_at_detection": {
+    "loadavg": "4.40 10.65 6.69 1/1971 364387"
+  }
+}

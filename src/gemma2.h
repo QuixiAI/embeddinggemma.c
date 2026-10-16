@@ -23,8 +23,39 @@ bool ei_gemma2_embed_batch_fast_ctx(ei_gemma2_fast *ctx, const ei_gguf *g, ei_th
                                     const int32_t *ids, const float *inputs,
                                     const size_t *offsets, size_t batch, float *out, char *err,
                                     size_t err_len);
+/* Fast-graph kernels reused by the CPU media towers (cpu-max fork). The GEMM
+ * uses ctx's activation-repack workspace; callers serialize per context. */
+void ei_gemma2_fast_gemm_q8(ei_gemma2_fast *ctx, ei_thread_pool *pool, const ei_tensor *w,
+                            const ei_block_q8_0 *xq, int n, float *y);
+void ei_gemma2_fast_gemm_f(ei_thread_pool *pool, const ei_tensor *w, const float *x, int n, float *y);
+void ei_gemma2_fast_quant_row(const float *x, ei_block_q8_0 *q, int width);
+float ei_gemma2_fast_sum_squares(const float *x, int d);
+void ei_gemma2_fast_gelu_mul(float *g, const float *u, int n);
 bool ei_gemma2_vision(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb, int width,
                       int height, float **output, size_t *tokens, char *err, size_t err_len);
+/* cpu-max fork: SIMD/threaded CPU vision tower (default; EI_GEMMA2_CPU_MEDIA_FAST=0
+ * restores the reference graph above). Same math as the reference: Q8 activations
+ * for Q8 weights, fp32 attention/norms, the selected GELU variant. */
+bool ei_gemma2_cpu_media_fast(void);
+/* cpu-max fork: official (default) vs upstream semantics (EI_GEMMA2_SEMANTICS=upstream):
+ * vision MLP activation, log-mel floor, video frame timestamps. */
+bool ei_gemma2_official_semantics(void);
+/* cpu-max fork: the CPU media towers call ei_gemma2_cpu_yield() between
+ * layers; a server that shares the engine pool with text waves installs a
+ * hook there that lets waiting waves run (EI_GEMMA2_CPU_YIELD=0: never). */
+void ei_gemma2_set_cpu_yield(void (*hook)(void));
+void ei_gemma2_cpu_yield(void);
+bool ei_gemma2_vision_tanh_gelu(const ei_gguf *g);
+bool ei_gemma2_vision_ref(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb, int width,
+                          int height, float **output, size_t *tokens, char *err, size_t err_len);
+bool ei_gemma2_vision_fast(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb, int width,
+                           int height, float **output, size_t *tokens, char *err, size_t err_len);
 bool ei_gemma2_audio(const ei_gguf *g, ei_thread_pool *pool, const float *mel, int frames,
                      float **output, size_t *tokens, char *err, size_t err_len);
+/* cpu-max fork: SIMD/threaded CPU audio tower (default; EI_GEMMA2_CPU_MEDIA_FAST=0
+ * restores the reference graph). Same math as the reference. */
+bool ei_gemma2_audio_ref(const ei_gguf *g, ei_thread_pool *pool, const float *mel, int frames,
+                         float **output, size_t *tokens, char *err, size_t err_len);
+bool ei_gemma2_audio_fast(const ei_gguf *g, ei_thread_pool *pool, const float *mel, int frames,
+                          float **output, size_t *tokens, char *err, size_t err_len);
 #endif

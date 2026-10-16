@@ -1,0 +1,313 @@
+{
+ "backend": "cold_pp0",
+ "kind": "native",
+ "threads": 12,
+ "cpus": "E12",
+ "cpu_list": [
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27
+ ],
+ "started": "2026-10-16T10:03:07",
+ "host": "redacted",
+ "load_before": [
+  13.88330078125,
+  19.2900390625,
+  20.59912109375
+ ],
+ "load_after": [
+  15.01416015625,
+  19.43505859375,
+  20.63916015625
+ ],
+ "load_ms": 153.913587000221,
+ "peak_rss_mb": 753.47265625,
+ "versions": {
+  "binary": "engine/build-next/embeddinggemma",
+  "cmd": [
+   "taskset",
+   "-c",
+   "16,17,18,19,20,21,22,23,24,25,26,27",
+   "engine/build-next/embeddinggemma",
+   "--bind",
+   "127.0.0.1",
+   "--port",
+   "59275",
+   "--threads",
+   "12",
+   "--model",
+   "models/gguf/embeddinggemma-2-Q8_0.gguf",
+   "--mmproj",
+   "models/gguf/mmproj-embeddinggemma-2-Q8_0.gguf",
+   "--cache-entries",
+   "0",
+   "--response-cache-mb",
+   "0",
+   "--media-cache-mb",
+   "0",
+   "--keepalive-timeout-ms",
+   "60000"
+  ],
+  "git": "d9da7bf+dirty"
+ },
+ "warmup": 0,
+ "repeat": 1,
+ "argv": [
+  "bench/run_bench.py",
+  "--backend",
+  "native",
+  "--binary",
+  "engine/build-next/embeddinggemma",
+  "--name",
+  "cold_pp0",
+  "--threads",
+  "12",
+  "--cpus",
+  "E12",
+  "--items",
+  "t512,i280,a30",
+  "--fresh-server",
+  "--warmup",
+  "0",
+  "--min-repeat",
+  "1",
+  "--repeat",
+  "1",
+  "--env",
+  "EI_GEMMA2_CPU_PREPACK=0",
+  "--out",
+  "reports/raw/cold_prepack0_E12_r1.json"
+ ],
+ "results": [
+  {
+   "item": "t512",
+   "modality": "text",
+   "tokens": 512,
+   "expected_tokens": 512,
+   "stats": {
+    "total": {
+     "p50": 647.3985129967332,
+     "p95": 647.3985129967332,
+     "mean": 647.3985129967332,
+     "min": 647.3985129967332,
+     "max": 647.3985129967332,
+     "n": 1
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 1
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 1
+    },
+    "client_encode": {
+     "p50": 0.03352900221943855,
+     "p95": 0.03352900221943855,
+     "mean": 0.03352900221943855,
+     "min": 0.03352900221943855,
+     "max": 0.03352900221943855,
+     "n": 1
+    },
+    "rps_single": 1.5446436467255928
+   },
+   "cpu_util": 0.591407502839549,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 647.3985129967332,
+     "client_encode": 0.03352900221943855,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 512,
+     "stages": {},
+     "inference": NaN
+    }
+   ],
+   "throughput": [],
+   "peak_rss_mb": 351.734375
+  },
+  {
+   "item": "i280",
+   "modality": "image",
+   "tokens": 284,
+   "expected_tokens": 284,
+   "stats": {
+    "total": {
+     "p50": 2857.2996030002832,
+     "p95": 2857.2996030002832,
+     "mean": 2857.2996030002832,
+     "min": 2857.2996030002832,
+     "max": 2857.2996030002832,
+     "n": 1
+    },
+    "preprocess": {
+     "p50": 15.17,
+     "p95": 15.17,
+     "mean": 15.17,
+     "min": 15.17,
+     "max": 15.17,
+     "n": 1
+    },
+    "inference": {
+     "p50": 2838.21,
+     "p95": 2838.21,
+     "mean": 2838.21,
+     "min": 2838.21,
+     "max": 2838.21,
+     "n": 1
+    },
+    "towers": {
+     "p50": 2381.65,
+     "p95": 2381.65,
+     "mean": 2381.65,
+     "min": 2381.65,
+     "max": 2381.65,
+     "n": 1
+    },
+    "text": {
+     "p50": 456.56,
+     "p95": 456.56,
+     "mean": 456.56,
+     "min": 456.56,
+     "max": 456.56,
+     "n": 1
+    },
+    "client_encode": {
+     "p50": 5.278248995542526,
+     "p95": 5.278248995542526,
+     "mean": 5.278248995542526,
+     "min": 5.278248995542526,
+     "max": 5.278248995542526,
+     "n": 1
+    },
+    "rps_single": 0.3499807996858147
+   },
+   "cpu_util": 0.8232818203095467,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 2857.2996030002832,
+     "client_encode": 5.278248995542526,
+     "preprocess": 15.17,
+     "towers": 2381.65,
+     "text": 456.56,
+     "tokens": 284,
+     "stages": {
+      "base64": 0.67,
+      "decode": 14.02,
+      "resize": 0.48,
+      "vision": 2381.65,
+      "finish": 456.56
+     },
+     "inference": 2838.21
+    }
+   ],
+   "throughput": [],
+   "peak_rss_mb": 548.171875
+  },
+  {
+   "item": "a30",
+   "modality": "audio",
+   "tokens": 754,
+   "expected_tokens": 754,
+   "stats": {
+    "total": {
+     "p50": 2091.4322189986706,
+     "p95": 2091.4322189986706,
+     "mean": 2091.4322189986706,
+     "min": 2091.4322189986706,
+     "max": 2091.4322189986706,
+     "n": 1
+    },
+    "preprocess": {
+     "p50": 37.410000000000004,
+     "p95": 37.410000000000004,
+     "mean": 37.410000000000004,
+     "min": 37.410000000000004,
+     "max": 37.410000000000004,
+     "n": 1
+    },
+    "inference": {
+     "p50": 2047.56,
+     "p95": 2047.56,
+     "mean": 2047.56,
+     "min": 2047.56,
+     "max": 2047.56,
+     "n": 1
+    },
+    "towers": {
+     "p50": 1160.85,
+     "p95": 1160.85,
+     "mean": 1160.85,
+     "min": 1160.85,
+     "max": 1160.85,
+     "n": 1
+    },
+    "text": {
+     "p50": 886.71,
+     "p95": 886.71,
+     "mean": 886.71,
+     "min": 886.71,
+     "max": 886.71,
+     "n": 1
+    },
+    "client_encode": {
+     "p50": 7.643837999552488,
+     "p95": 7.643837999552488,
+     "mean": 7.643837999552488,
+     "min": 7.643837999552488,
+     "max": 7.643837999552488,
+     "n": 1
+    },
+    "rps_single": 0.47814124259727475
+   },
+   "cpu_util": 0.7024980962216879,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 2091.4322189986706,
+     "client_encode": 7.643837999552488,
+     "preprocess": 37.410000000000004,
+     "towers": 1160.85,
+     "text": 886.71,
+     "tokens": 754,
+     "stages": {
+      "base64": 1.02,
+      "wav": 1.82,
+      "logmel": 34.57,
+      "audio": 1160.85,
+      "finish": 886.71
+     },
+     "inference": 2047.56
+    }
+   ],
+   "throughput": [],
+   "peak_rss_mb": 753.47265625
+  }
+ ]
+}

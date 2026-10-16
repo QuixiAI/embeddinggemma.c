@@ -1,0 +1,363 @@
+{
+ "backend": "fork_5dd7dbf",
+ "kind": "native",
+ "threads": 28,
+ "cpus": "ALL",
+ "cpu_list": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27
+ ],
+ "started": "2026-10-16T13:37:15",
+ "host": "redacted",
+ "load_before": [
+  8.42236328125,
+  11.66552734375,
+  12.9453125
+ ],
+ "load_after": [
+  9.44970703125,
+  11.7626953125,
+  12.96240234375
+ ],
+ "load_ms": 153.77322599291801,
+ "peak_rss_mb": 917.7890625,
+ "versions": {
+  "binary": "engine/build/embeddinggemma",
+  "cmd": [
+   "taskset",
+   "-c",
+   "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27",
+   "engine/build/embeddinggemma",
+   "--bind",
+   "127.0.0.1",
+   "--port",
+   "53695",
+   "--threads",
+   "28",
+   "--model",
+   "models/gguf/embeddinggemma-2-Q8_0.gguf",
+   "--mmproj",
+   "models/gguf/mmproj-embeddinggemma-2-Q8_0.gguf",
+   "--cache-entries",
+   "0",
+   "--response-cache-mb",
+   "0",
+   "--media-cache-mb",
+   "0",
+   "--keepalive-timeout-ms",
+   "60000"
+  ],
+  "git": "5dd7dbf"
+ },
+ "warmup": 1,
+ "repeat": 3,
+ "argv": [
+  "bench/run_bench.py",
+  "--backend",
+  "native",
+  "--binary",
+  "engine/build/embeddinggemma",
+  "--name",
+  "fork_5dd7dbf",
+  "--threads",
+  "28",
+  "--cpus",
+  "ALL",
+  "--items",
+  "i70,a15",
+  "--warmup",
+  "1",
+  "--min-repeat",
+  "3",
+  "--repeat",
+  "3",
+  "--concurrency",
+  "2",
+  "--requests",
+  "6",
+  "--quiet-cores",
+  "1.5",
+  "--quiet-wait-s",
+  "180",
+  "--out",
+  "reports/raw/final_tput_media_fork_5dd7dbf_ALL_t28.json"
+ ],
+ "results": [
+  {
+   "item": "i70",
+   "modality": "image",
+   "tokens": 74,
+   "expected_tokens": 74,
+   "stats": {
+    "total": {
+     "p50": 148.95501400530338,
+     "p95": 190.32768010273577,
+     "mean": 164.0785813331604,
+     "min": 148.35608699172735,
+     "max": 194.92464300245047,
+     "n": 3
+    },
+    "preprocess": {
+     "p50": 2.28,
+     "p95": 2.4869999999999997,
+     "mean": 2.3166666666666664,
+     "min": 2.16,
+     "max": 2.51,
+     "n": 3
+    },
+    "inference": {
+     "p50": 146.09,
+     "p95": 187.085,
+     "mean": 161.01333333333335,
+     "min": 145.31,
+     "max": 191.64000000000001,
+     "n": 3
+    },
+    "towers": {
+     "p50": 125.93,
+     "p95": 167.21300000000002,
+     "mean": 141.17333333333335,
+     "min": 125.79,
+     "max": 171.8,
+     "n": 3
+    },
+    "text": {
+     "p50": 19.84,
+     "p95": 20.254,
+     "mean": 19.84,
+     "min": 19.38,
+     "max": 20.3,
+     "n": 3
+    },
+    "client_encode": {
+     "p50": 1.6121039986610413,
+     "p95": 1.6121039986610413,
+     "mean": 1.6121039986610413,
+     "min": 1.6121039986610413,
+     "max": 1.6121039986610413,
+     "n": 3
+    },
+    "rps_single": 6.09464070127171
+   },
+   "cpu_util": 0.6939894603853721,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "background_cores_before": 0.099955465818716,
+   "foreign_cores": 0.9625612329476444,
+   "trials": [
+    {
+     "total": 194.92464300245047,
+     "client_encode": 1.6121039986610413,
+     "preprocess": 2.51,
+     "towers": 171.8,
+     "text": 19.84,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.17,
+      "decode": 2.3,
+      "resize": 0.04,
+      "vision": 171.8,
+      "finish": 19.84
+     },
+     "inference": 191.64000000000001
+    },
+    {
+     "total": 148.95501400530338,
+     "client_encode": 1.6121039986610413,
+     "preprocess": 2.16,
+     "towers": 125.79,
+     "text": 20.3,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.2,
+      "decode": 1.92,
+      "resize": 0.04,
+      "vision": 125.79,
+      "finish": 20.3
+     },
+     "inference": 146.09
+    },
+    {
+     "total": 148.35608699172735,
+     "client_encode": 1.6121039986610413,
+     "preprocess": 2.28,
+     "towers": 125.93,
+     "text": 19.38,
+     "tokens": 74,
+     "stages": {
+      "base64": 0.08,
+      "decode": 2.17,
+      "resize": 0.03,
+      "vision": 125.93,
+      "finish": 19.38
+     },
+     "inference": 145.31
+    }
+   ],
+   "throughput": [
+    {
+     "concurrency": 2,
+     "mode": "concurrent_http",
+     "requests": 6,
+     "wall_s": 1.0172291259950725,
+     "rps": 5.898376134413855,
+     "p50": 345.20191199771944,
+     "p95": 366.4074684966181,
+     "cpu_util": 0.6913037267060048
+    }
+   ]
+  },
+  {
+   "item": "a15",
+   "modality": "audio",
+   "tokens": 379,
+   "expected_tokens": 379,
+   "stats": {
+    "total": {
+     "p50": 258.6291499957442,
+     "p95": 265.5298361025751,
+     "mean": 256.6111830001076,
+     "min": 244.90782000124454,
+     "max": 266.29657900333405,
+     "n": 3
+    },
+    "preprocess": {
+     "p50": 1.25,
+     "p95": 1.682,
+     "mean": 1.4066666666666665,
+     "min": 1.24,
+     "max": 1.73,
+     "n": 3
+    },
+    "inference": {
+     "p50": 256.49,
+     "p95": 263.38399999999996,
+     "mean": 254.3033333333333,
+     "min": 242.27,
+     "max": 264.15,
+     "n": 3
+    },
+    "towers": {
+     "p50": 159.3,
+     "p95": 169.641,
+     "mean": 158.59,
+     "min": 145.68,
+     "max": 170.79,
+     "n": 3
+    },
+    "text": {
+     "p50": 96.59,
+     "p95": 97.13,
+     "mean": 95.71333333333332,
+     "min": 93.36,
+     "max": 97.19,
+     "n": 3
+    },
+    "client_encode": {
+     "p50": 1.912611000239849,
+     "p95": 1.912611000239849,
+     "mean": 1.912611000239849,
+     "min": 1.912611000239849,
+     "max": 1.912611000239849,
+     "n": 3
+    },
+    "rps_single": 3.89694629948992
+   },
+   "cpu_util": 0.580626405532971,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "background_cores_before": 0.11997201244423676,
+   "foreign_cores": 0.747176927578814,
+   "trials": [
+    {
+     "total": 244.90782000124454,
+     "client_encode": 1.912611000239849,
+     "preprocess": 1.73,
+     "towers": 145.68,
+     "text": 96.59,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.25,
+      "wav": 0.44,
+      "logmel": 1.04,
+      "audio": 145.68,
+      "finish": 96.59
+     },
+     "inference": 242.27
+    },
+    {
+     "total": 258.6291499957442,
+     "client_encode": 1.912611000239849,
+     "preprocess": 1.24,
+     "towers": 159.3,
+     "text": 97.19,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.19,
+      "wav": 0.21,
+      "logmel": 0.84,
+      "audio": 159.3,
+      "finish": 97.19
+     },
+     "inference": 256.49
+    },
+    {
+     "total": 266.29657900333405,
+     "client_encode": 1.912611000239849,
+     "preprocess": 1.25,
+     "towers": 170.79,
+     "text": 93.36,
+     "tokens": 379,
+     "stages": {
+      "base64": 0.15,
+      "wav": 0.25,
+      "logmel": 0.85,
+      "audio": 170.79,
+      "finish": 93.36
+     },
+     "inference": 264.15
+    }
+   ],
+   "throughput": [
+    {
+     "concurrency": 2,
+     "mode": "concurrent_http",
+     "requests": 6,
+     "wall_s": 1.4178490300037083,
+     "rps": 4.2317622490345865,
+     "p50": 467.21341900047264,
+     "p95": 481.8454224950983,
+     "cpu_util": 0.6196509007514932
+    }
+   ]
+  }
+ ]
+}

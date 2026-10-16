@@ -25,6 +25,11 @@ struct ei_thread_pool {
     worker_context *contexts;
     int32_t worker_count;
     int32_t total_threads;
+    /* cpu-max fork: at most `cap` threads (caller included) join a call;
+     * `performance` leading threads of a hybrid-ordered pinned pool sit on
+     * P-cores (0 when unknown). */
+    _Atomic int32_t cap;
+    int32_t performance;
     int32_t *cpus; /* pinned pools: [0] the caller, [1 + i] worker i */
 
     pthread_mutex_t mutex;
@@ -256,6 +261,7 @@ ei_thread_pool *ei_thread_pool_create(int32_t requested_threads) {
     ei_thread_pool *pool = calloc(1, sizeof *pool);
     if (!pool) ei_die("out of memory creating CPU thread pool");
     pool->total_threads = total;
+    atomic_store(&pool->cap, total);
     pool->worker_count = total - 1;
     if (create_cpus) {
         pool->cpus = malloc((size_t)total * sizeof *pool->cpus);
@@ -308,6 +314,84 @@ void ei_thread_pool_destroy(ei_thread_pool *pool) {
     free(pool);
 }
 
+void ei_thread_pool_set_cap(ei_thread_pool *pool, int32_t threads) {
+    if (!pool) return;
+    if (threads < 1 || threads > pool->total_threads) threads = pool->total_threads;
+    atomic_store_explicit(&pool->cap, threads, memory_order_relaxed);
+}
+
+int32_t ei_thread_pool_performance_threads(const ei_thread_pool *pool) {
+    return pool ? pool->performance : 0;
+}
+
+void ei_thread_pool_set_performance_threads(ei_thread_pool *pool, int32_t threads) {
+    if (pool) pool->performance = threads < 0 ? 0 : threads > pool->total_threads ? pool->total_threads : threads;
+}
+
+#if defined(__linux__)
+static int read_cpulist(const char *path, unsigned char *mask, int max) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[1024];
+    int n = 0;
+    if (fgets(buf, sizeof buf, f)) {
+        for (char *p = buf; *p && *p != '\n';) {
+            long a = strtol(p, &p, 10), b = a;
+            if (*p == '-') b = strtol(p + 1, &p, 10);
+            for (long c = a; c <= b && c < max; c++) mask[c] = 1, n++;
+            if (*p == ',') p++;
+            else if (*p && *p != '\n') break;
+        }
+    }
+    fclose(f);
+    return n;
+}
+#endif
+
+int32_t ei_cpu_hybrid_order(int32_t *cpus, int32_t max, int32_t *performance) {
+    *performance = 0;
+#if defined(__linux__)
+    enum { M = 4096 };
+    static unsigned char pcore[M], ecore[M];
+    memset(pcore, 0, sizeof pcore), memset(ecore, 0, sizeof ecore);
+    if (!read_cpulist("/sys/devices/cpu_core/cpus", pcore, M) ||
+        !read_cpulist("/sys/devices/cpu_atom/cpus", ecore, M))
+        return 0; /* not a hybrid CPU (or not reported): keep upstream's placement */
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) return 0;
+    int32_t n = ei_cpu_count(), out = 0;
+    int32_t *primary_core = calloc((size_t)n, sizeof *primary_core);
+    if (!primary_core) return 0;
+    /* Pass 0: P-core primary threads, 1: E-cores, 2: P-core SMT siblings. */
+    for (int pass = 0; pass < 3; pass++) {
+        int32_t seen = 0;
+        for (int32_t c = 0; c < n && c < M; c++) {
+            if (!CPU_ISSET(c, &allowed)) continue;
+            int core = read_sys_int("/sys/devices/system/cpu/cpu%d/topology/core_id", c);
+            bool sibling = false;
+            for (int32_t j = 0; j < seen; j++)
+                if (primary_core[j] == core) sibling = true;
+            if (pcore[c] && !sibling && pass == 0 && out < max) {
+                cpus[out++] = c;
+                primary_core[seen++] = core;
+                (*performance)++;
+            } else if (pcore[c] && !sibling) {
+                primary_core[seen++] = core;
+            } else if (pcore[c] && sibling && pass == 2 && out < max) {
+                cpus[out++] = c;
+            } else if (ecore[c] && pass == 1 && out < max) {
+                cpus[out++] = c;
+            }
+        }
+    }
+    free(primary_core);
+    return out;
+#else
+    (void)cpus, (void)max;
+    return 0;
+#endif
+}
+
 int32_t ei_thread_pool_threads(const ei_thread_pool *pool) {
     return pool ? pool->total_threads : 1;
 }
@@ -321,9 +405,11 @@ void ei_parallel_for(ei_thread_pool *pool, int32_t count, int32_t grain,
     }
     if (grain < 1) grain = 1;
 
+    const int32_t cap = atomic_load_explicit(&pool->cap, memory_order_relaxed);
     if (pool->spin_ns) {
         int32_t jobs = (count + grain - 1) / grain, helpers = jobs - 1;
         if (helpers > pool->worker_count) helpers = pool->worker_count;
+        if (helpers > cap - 1) helpers = cap - 1 > 0 ? cap - 1 : 0;
         pool->count = count;
         pool->grain = grain;
         pool->function = function;
@@ -353,6 +439,7 @@ void ei_parallel_for(ei_thread_pool *pool, int32_t count, int32_t grain,
     pool->context = context;
     int32_t jobs = (count + grain - 1) / grain;
     pool->active_workers = jobs - 1;
+    if (pool->active_workers > cap - 1) pool->active_workers = cap - 1 > 0 ? cap - 1 : 0;
     if (pool->active_workers > pool->worker_count) {
         pool->active_workers = pool->worker_count;
     }

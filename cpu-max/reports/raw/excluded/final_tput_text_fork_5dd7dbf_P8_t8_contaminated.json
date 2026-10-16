@@ -1,0 +1,287 @@
+{
+ "backend": "fork_5dd7dbf",
+ "kind": "native",
+ "threads": 8,
+ "cpus": "P8",
+ "cpu_list": [
+  0,
+  2,
+  4,
+  6,
+  8,
+  10,
+  12,
+  14
+ ],
+ "started": "2026-10-16T12:49:50",
+ "host": "redacted",
+ "load_before": [
+  12.88525390625,
+  15.5478515625,
+  15.5576171875
+ ],
+ "load_after": [
+  12.57373046875,
+  15.43896484375,
+  15.52197265625
+ ],
+ "load_ms": 104.28092100471258,
+ "peak_rss_mb": 408.0,
+ "versions": {
+  "binary": "engine/build/embeddinggemma",
+  "cmd": [
+   "taskset",
+   "-c",
+   "0,2,4,6,8,10,12,14",
+   "engine/build/embeddinggemma",
+   "--bind",
+   "127.0.0.1",
+   "--port",
+   "41207",
+   "--threads",
+   "8",
+   "--model",
+   "models/gguf/embeddinggemma-2-Q8_0.gguf",
+   "--mmproj",
+   "models/gguf/mmproj-embeddinggemma-2-Q8_0.gguf",
+   "--cache-entries",
+   "0",
+   "--response-cache-mb",
+   "0",
+   "--media-cache-mb",
+   "0",
+   "--keepalive-timeout-ms",
+   "60000"
+  ],
+  "git": "5dd7dbf"
+ },
+ "warmup": 1,
+ "repeat": 3,
+ "argv": [
+  "bench/run_bench.py",
+  "--backend",
+  "native",
+  "--binary",
+  "engine/build/embeddinggemma",
+  "--name",
+  "fork_5dd7dbf",
+  "--threads",
+  "8",
+  "--cpus",
+  "P8",
+  "--items",
+  "t16,t128",
+  "--warmup",
+  "1",
+  "--min-repeat",
+  "3",
+  "--repeat",
+  "3",
+  "--concurrency",
+  "4,16",
+  "--requests",
+  "64",
+  "--out",
+  "reports/raw/final_tput_text_fork_5dd7dbf_P8_t8.json"
+ ],
+ "results": [
+  {
+   "item": "t16",
+   "modality": "text",
+   "tokens": 16,
+   "expected_tokens": 16,
+   "stats": {
+    "total": {
+     "p50": 8.643446996808052,
+     "p95": 8.887682700157166,
+     "mean": 8.625740334391594,
+     "min": 8.31895400583744,
+     "max": 8.91482000052929,
+     "n": 3
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "client_encode": {
+     "p50": 0.01770300418138504,
+     "p95": 0.01770300418138504,
+     "mean": 0.01770300418138504,
+     "min": 0.01770300418138504,
+     "max": 0.01770300418138504,
+     "n": 3
+    },
+    "rps_single": 115.93207785457105
+   },
+   "cpu_util": 0.6166243148007637,
+   "norm": 0.9999999403953552,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 8.91482000052929,
+     "client_encode": 0.01770300418138504,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 8.31895400583744,
+     "client_encode": 0.01770300418138504,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 8.643446996808052,
+     "client_encode": 0.01770300418138504,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 16,
+     "stages": {},
+     "inference": NaN
+    }
+   ],
+   "throughput": [
+    {
+     "concurrency": 4,
+     "mode": "concurrent_http",
+     "requests": 64,
+     "wall_s": 0.44777696899836883,
+     "rps": 142.92829786034204,
+     "p50": 24.666441000590567,
+     "p95": 60.01262219615444,
+     "cpu_util": 0.773264423970991
+    },
+    {
+     "concurrency": 16,
+     "mode": "concurrent_http",
+     "requests": 64,
+     "wall_s": 0.14292203899822198,
+     "rps": 447.79657811064527,
+     "p50": 34.83653150033206,
+     "p95": 39.405268546397565,
+     "cpu_util": 0.9008407723710246
+    }
+   ]
+  },
+  {
+   "item": "t128",
+   "modality": "text",
+   "tokens": 128,
+   "expected_tokens": 128,
+   "stats": {
+    "total": {
+     "p50": 50.93375100195408,
+     "p95": 73.78814940154552,
+     "mean": 54.074523001909256,
+     "min": 34.96229100227356,
+     "max": 76.32752700150013,
+     "n": 3
+    },
+    "preprocess": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "towers": {
+     "p50": 0.0,
+     "p95": 0.0,
+     "mean": 0.0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "client_encode": {
+     "p50": 0.018175996840000153,
+     "p95": 0.018175996840000153,
+     "mean": 0.018175996840000153,
+     "min": 0.018175996840000153,
+     "max": 0.018175996840000153,
+     "n": 3
+    },
+    "rps_single": 18.49299715440286
+   },
+   "cpu_util": 0.5484954180719945,
+   "norm": 1.0,
+   "finite": true,
+   "repeat_cos_spread": 0.0,
+   "trials": [
+    {
+     "total": 34.96229100227356,
+     "client_encode": 0.018175996840000153,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 50.93375100195408,
+     "client_encode": 0.018175996840000153,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    },
+    {
+     "total": 76.32752700150013,
+     "client_encode": 0.018175996840000153,
+     "preprocess": 0,
+     "towers": 0,
+     "text": NaN,
+     "tokens": 128,
+     "stages": {},
+     "inference": NaN
+    }
+   ],
+   "throughput": [
+    {
+     "concurrency": 4,
+     "mode": "concurrent_http",
+     "requests": 64,
+     "wall_s": 2.226684800996736,
+     "rps": 28.7422808883195,
+     "p50": 127.57795950165018,
+     "p95": 206.46801920120197,
+     "cpu_util": 0.8386907743583855
+    },
+    {
+     "concurrency": 16,
+     "mode": "concurrent_http",
+     "requests": 64,
+     "wall_s": 0.8845010310033103,
+     "rps": 72.35717964896354,
+     "p50": 235.31399099738337,
+     "p95": 251.86162009704276,
+     "cpu_util": 0.9185970072622325
+    }
+   ]
+  }
+ ]
+}

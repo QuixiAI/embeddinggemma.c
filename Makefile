@@ -43,6 +43,14 @@ BUILD   := build
 DIST    ?= dist
 MODEL   ?= model/embeddinggemma-300M-qat-Q4_0.gguf
 VERSION := $(strip $(shell cat VERSION 2>/dev/null))
+# cpu-max fork: build identity reported by `embeddinggemma --version` and at startup.
+CPU_MAX_VERSION := $(strip $(shell cat CPU_MAX_VERSION 2>/dev/null))
+GIT_COMMIT ?= $(strip $(shell git rev-parse --short=7 HEAD 2>/dev/null)$(shell git diff --quiet HEAD -- 2>/dev/null || echo -dirty))
+# The upstream commit this fork is based on (`git describe --tags d8f9e33`; upstream's
+# VERSION file still reads v0.3.1). A literal, so shallow clones report it too.
+UPSTREAM_BASE := v0.3.1-8-gd8f9e33
+IDENTITY_DEFS = -DEI_CPU_MAX_VERSION='"$(or $(CPU_MAX_VERSION),unknown)"' -DEI_UPSTREAM_VERSION='"$(UPSTREAM_BASE)"' \
+	-DEI_GIT_COMMIT='"$(or $(GIT_COMMIT),unknown)"'
 PERF_SERVER_URL ?= http://127.0.0.1:42666
 PERF_SERVER_API ?= embeddinggemma
 PERF_SERVER_MODEL ?= embeddinggemma-300m
@@ -99,7 +107,7 @@ HDRS_NATIVE := $(wildcard src/*.h src/vendor/*.h)
 SRCS_CORE := src/gguf.c
 SRCS_MODEL := $(SRCS_CORE) src/model.c
 SRCS_TOKENIZER := $(SRCS_MODEL) src/tokenizer.c
-SRCS_ENGINE := $(SRCS_TOKENIZER) src/quants.c src/kernels.c src/parallel.c src/engine.c src/gemma2.c src/gemma2_fast.c src/gemma2_fast_x86.c src/media.c src/response_cache.c
+SRCS_ENGINE := $(SRCS_TOKENIZER) src/quants.c src/kernels.c src/parallel.c src/engine.c src/gemma2.c src/gemma2_fast.c src/gemma2_fast_x86.c src/gemma2_vision_fast.c src/gemma2_audio_fast.c src/gemma2_media_x86.c src/gemma2_vnni256.c src/gemma2_sgemm_x86.c src/media.c src/response_cache.c
 SRCS_SERVICE := src/inference_service.c
 SRCS_SERVER := src/server.c src/float_format.c
 
@@ -187,8 +195,8 @@ $(BUILD)/test_batch: src/test_batch.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
 $(BUILD)/test_kernels: src/test_kernels.c src/quants.c src/kernels.c src/gguf.c $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_kernels.c src/quants.c src/kernels.c src/gguf.c $(LDLIBS)
 
-$(BUILD)/embeddinggemma: $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(HDRS_NATIVE) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(LDLIBS)
+$(BUILD)/embeddinggemma: $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(HDRS_NATIVE) CPU_MAX_VERSION | $(BUILD)
+	$(CC) $(CFLAGS) $(IDENTITY_DEFS) -o $@ $(SRCS_SERVER) $(SRCS_ENGINE) $(SRCS_SERVICE) $(LDLIBS)
 
 $(BUILD)/test_inference_service: src/test_inference_service.c $(SRCS_SERVICE) src/tokenizer.c src/gguf.c $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_inference_service.c $(SRCS_SERVICE) src/tokenizer.c src/gguf.c $(LDLIBS)
@@ -681,8 +689,11 @@ $(BUILD)/test_gemma2: src/test_gemma2.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_gemma2.c $(SRCS_ENGINE) $(LDLIBS)
 
 .PHONY: test-gemma2
+# cpu-max fork: the goldens are llama.cpp outputs, i.e. upstream semantics (QuickGELU
+# vision MLP, log(max) mel floor, timestamped video); official-semantics accuracy
+# is validated against the HF FP32 model instead (scripts/validate_embeddings.py).
 test-gemma2: $(BUILD)/test_gemma2 $(BUILD)/embeddinggemma
-	python3 testdata/test_gemma2.py --binary $(BUILD)/test_gemma2 \
+	EI_GEMMA2_SEMANTICS=upstream python3 testdata/test_gemma2.py --binary $(BUILD)/test_gemma2 \
 		--server $(BUILD)/embeddinggemma --model $(GEMMA2_MODEL) --mmproj $(GEMMA2_MMPROJ)
 
 $(BUILD)/gemma2_metal.o: src/gemma2_metal.m $(HDRS_NATIVE) | $(BUILD)
@@ -736,3 +747,23 @@ ROUTE ?= TENSOR=1,FLASH=1
 .PHONY: bench-gemma2-metal
 bench-gemma2-metal: $(BUILD)/bench_gemma2_metal
 	./$(BUILD)/bench_gemma2_metal $(GEMMA2_MODEL) "$(ROUTE)" $(CASES)
+
+# cpu-max fork: fast-vs-reference CPU media tower parity and timing.
+$(BUILD)/test_gemma2_media: src/test_gemma2_media.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/test_gemma2_media.c $(SRCS_ENGINE) $(LDLIBS)
+
+.PHONY: test-gemma2-media
+test-gemma2-media: $(BUILD)/test_gemma2_media
+	./$(BUILD)/test_gemma2_media $(GEMMA2_MODEL) $(GEMMA2_MMPROJ) vision-synthetic
+
+# cpu-max fork: Q8_0 GEMM route exactness and throughput (EI_GEMMA2_CPU_VNNI256=0 for upstream's tile).
+$(BUILD)/test_gemma2_vnni256: src/test_gemma2_vnni256.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/test_gemma2_vnni256.c $(SRCS_ENGINE) $(LDLIBS)
+
+.PHONY: test-gemma2-vnni256
+test-gemma2-vnni256: $(BUILD)/test_gemma2_vnni256
+	./$(BUILD)/test_gemma2_vnni256
+
+# cpu-max fork: tiled attention kernel vs its scalar reference.
+$(BUILD)/test_gemma2_attn: src/test_gemma2_attn.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/test_gemma2_attn.c $(SRCS_ENGINE) $(LDLIBS)

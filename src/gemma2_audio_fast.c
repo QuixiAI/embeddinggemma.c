@@ -99,8 +99,8 @@ typedef struct {
     float *x, *h, *hn, *q, *k, *v, *a;  /* [cap][1024] */
     float *up;                          /* [cap][4096] */
     ei_block_q8_0 *xq;                  /* [cap][4096/32] */
-    size_t conv_cap;
-    float *c0, *c1;                     /* subsampling activations */
+    size_t conv1_cap;
+    float *c1;                          /* subsampled activations [t1][32][32] */
     float rel[12][NREL * AD];           /* per-layer relative keys */
     const void *rel_key;                /* projector the cache belongs to */
     float qscale[12][AHD], kscale;
@@ -112,7 +112,7 @@ static pthread_mutex_t audio_lock = PTHREAD_MUTEX_INITIALIZER;
 static audio_ws aws;
 static ei_gemma2_fast *gemm_ctx;
 
-static void reserve(audio_ws *w, size_t n, size_t conv_floats) {
+static void reserve(audio_ws *w, size_t n, size_t conv1_floats) {
     if (w->cap < n) {
         free(w->x), free(w->h), free(w->hn), free(w->q), free(w->k), free(w->v), free(w->a);
         free(w->up), free(w->xq);
@@ -128,11 +128,10 @@ static void reserve(audio_ws *w, size_t n, size_t conv_floats) {
         w->xq = ei_xmalloc(n * (AF / 32) * sizeof(ei_block_q8_0));
         w->cap = n;
     }
-    if (w->conv_cap < conv_floats) {
-        free(w->c0), free(w->c1);
-        w->c0 = ei_xmalloc(conv_floats * sizeof(float));
-        w->c1 = ei_xmalloc(conv_floats * sizeof(float));
-        w->conv_cap = conv_floats;
+    if (w->conv1_cap < conv1_floats) {
+        free(w->c1);
+        w->c1 = ei_xmalloc(conv1_floats * sizeof(float));
+        w->conv1_cap = conv1_floats;
     }
 }
 
@@ -176,13 +175,6 @@ static void prepare(audio_ws *w, const ei_gguf *g, ei_thread_pool *pool) {
 
 /* ---- subsampling convolutions ------------------------------------------------ */
 
-typedef struct {
-    audio_ws *w;
-    const float *in;
-    float *out;
-    const float *norm;
-    int nt, nf, ot, of;
-} conv_job;
 
 static void layer_norm_relu(float *r, int c, const float *w) {
     double mean = 0, var = 0;
@@ -196,31 +188,32 @@ static void layer_norm_relu(float *r, int c, const float *w) {
         r[i] = fmaxf(0, ((float)(r[i] - mean)) * scale * w[i]);
 }
 
-/* conv0: 1 -> 128 channels, 3x3, stride 2, pad 1, over (time, mel). Row t. */
-static void conv0_rows(void *opaque, int32_t begin, int32_t end) {
-    conv_job *j = opaque;
-    for (int t = begin; t < end; t++)
-        for (int f = 0; f < j->of; f++) {
-            float acc[128] = {0};
-            for (int ky = 0; ky < 3; ky++)
-                for (int kx = 0; kx < 3; kx++) {
-                    int ti = t * 2 + ky - 1, fi = f * 2 + kx - 1;
-                    if (ti < 0 || ti >= j->nt || fi < 0 || fi >= j->nf)
-                        continue;
-                    float x = j->in[(size_t)ti * j->nf + fi];
-                    const float *wr = j->w->w0t[ky * 3 + kx];
-                    for (int o = 0; o < 128; o++)
-                        acc[o] += x * wr[o];
-                }
-            float *dst = j->out + ((size_t)t * j->of + f) * 128;
-            memcpy(dst, acc, sizeof acc);
-            layer_norm_relu(dst, 128, j->norm);
-        }
+/* conv0: 1 -> 128 channels, 3x3, stride 2, pad 1, over (time, mel): one
+ * output time row (64 mel positions x 128 channels), LayerNorm + ReLU. */
+static void conv0_row(const audio_ws *w, const float *mel, int frames, int t, const float *norm, float *dst) {
+    for (int f = 0; f < 64; f++) {
+        float acc[128] = {0};
+        for (int ky = 0; ky < 3; ky++)
+            for (int kx = 0; kx < 3; kx++) {
+                int ti = t * 2 + ky - 1, fi = f * 2 + kx - 1;
+                if (ti < 0 || ti >= frames || fi < 0 || fi >= 128)
+                    continue;
+                float x = mel[(size_t)ti * 128 + fi];
+                const float *wr = w->w0t[ky * 3 + kx];
+                for (int o = 0; o < 128; o++)
+                    acc[o] += x * wr[o];
+            }
+        float *d = dst + (size_t)f * 128;
+        memcpy(d, acc, sizeof acc);
+        layer_norm_relu(d, 128, norm);
+    }
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
-/* conv1 output (t, f) = 32 channels in 4 ymm; 1152 taps x inputs. */
-AVX2 static void conv1_point_avx2(const float *in, int nt, int nf, int t, int f, const float *w1t, float *out) {
+/* conv1 output (t, f) = 32 channels in 4 ymm; 1152 taps x inputs. `in` holds
+ * conv0 rows [row0, ...); bounds use the global time index. */
+AVX2 static void conv1_point_avx2(const float *in, int row0, int nt, int nf, int t, int f, const float *w1t,
+                                  float *out) {
     __m256 acc[4];
     UNROLL for (int o = 0; o < 4; o++) acc[o] = _mm256_setzero_ps();
     for (int ky = 0; ky < 3; ky++)
@@ -228,7 +221,7 @@ AVX2 static void conv1_point_avx2(const float *in, int nt, int nf, int t, int f,
             int ti = t * 2 + ky - 1, fi = f * 2 + kx - 1;
             if (ti < 0 || ti >= nt || fi < 0 || fi >= nf)
                 continue;
-            const float *x = in + ((size_t)ti * nf + fi) * 128;
+            const float *x = in + ((size_t)(ti - row0) * nf + fi) * 128;
             const float *wr = w1t + (size_t)(ky * 3 + kx) * 128 * 32;
             for (int c = 0; c < 128; c++) {
                 __m256 xb = _mm256_broadcast_ss(x + c);
@@ -239,30 +232,52 @@ AVX2 static void conv1_point_avx2(const float *in, int nt, int nf, int t, int f,
     UNROLL for (int o = 0; o < 4; o++) _mm256_storeu_ps(out + o * 8, acc[o]);
 }
 #endif
-static void conv1_rows(void *opaque, int32_t begin, int32_t end) {
+
+/* Both subsampling convolutions, streamed: a task producing conv1 rows
+ * [begin, end) computes the conv0 rows they read (2*begin-1 .. 2*end-1) into a
+ * task-local buffer instead of materializing conv0 for the whole clip (49 MB
+ * at 30 s); boundary rows are recomputed by neighbouring tasks. */
+typedef struct {
+    const audio_ws *w;
+    const float *mel, *norm0, *norm1;
+    float *out;
+    int frames, t0, t1;
+} conv_job;
+static void conv01_rows(void *opaque, int32_t begin, int32_t end) {
     conv_job *j = opaque;
+    int r0 = 2 * begin - 1 < 0 ? 0 : 2 * begin - 1, r1 = 2 * (end - 1) + 2 < j->t0 ? 2 * (end - 1) + 2 : j->t0;
+    static _Thread_local float *buf; /* per pool thread, kept: <= (2 * grain + 1) conv0 rows */
+    static _Thread_local size_t cap;
+    size_t need = (size_t)(r1 - r0) * 64 * 128;
+    if (cap < need) {
+        free(buf);
+        buf = ei_xmalloc(need * sizeof(float));
+        cap = need;
+    }
+    for (int r = r0; r < r1; r++)
+        conv0_row(j->w, j->mel, j->frames, r, j->norm0, buf + (size_t)(r - r0) * 64 * 128);
     for (int t = begin; t < end; t++)
-        for (int f = 0; f < j->of; f++) {
-            float *dst = j->out + ((size_t)t * j->of + f) * 32;
+        for (int f = 0; f < 32; f++) {
+            float *dst = j->out + ((size_t)t * 32 + f) * 32;
 #if defined(__x86_64__) || defined(_M_X64)
             if (g2x_level() >= G2X_AVX2)
-                conv1_point_avx2(j->in, j->nt, j->nf, t, f, j->w->w1t, dst);
+                conv1_point_avx2(buf, r0, j->t0, 64, t, f, j->w->w1t, dst);
             else
 #endif
             {
                 float acc[32] = {0};
                 for (int tap = 0; tap < 9; tap++) {
                     int ti = t * 2 + tap / 3 - 1, fi = f * 2 + tap % 3 - 1;
-                    if (ti < 0 || ti >= j->nt || fi < 0 || fi >= j->nf)
+                    if (ti < 0 || ti >= j->t0 || fi < 0 || fi >= 64)
                         continue;
-                    const float *x = j->in + ((size_t)ti * j->nf + fi) * 128;
+                    const float *x = buf + ((size_t)(ti - r0) * 64 + fi) * 128;
                     for (int c = 0; c < 128; c++)
                         for (int o = 0; o < 32; o++)
                             acc[o] += x[c] * j->w->w1t[((size_t)tap * 128 + c) * 32 + o];
                 }
                 memcpy(dst, acc, sizeof acc);
             }
-            layer_norm_relu(dst, 32, j->norm);
+            layer_norm_relu(dst, 32, j->norm1);
         }
 }
 
@@ -460,14 +475,14 @@ bool ei_gemma2_audio_fast(const ei_gguf *g, ei_thread_pool *pool, const float *m
     ei_cpu_binding binding; /* hybrid pools: the caller joins on a P-core */
     ei_thread_pool_bind_caller(pool, &binding);
     audio_ws *w = &aws;
-    const int t0 = (frames + 1) / 2, f0 = 64, t1 = (t0 + 1) / 2, f1 = 32, n = t1;
-    reserve(w, (size_t)n, (size_t)t0 * f0 * 128);
+    const int t0 = (frames + 1) / 2, t1 = (t0 + 1) / 2, n = t1; /* conv0: t0 x 64 mel x 128 ch; conv1: t1 x 32 x 32 */
+    reserve(w, (size_t)n, (size_t)t1 * 32 * 32);
     prepare(w, g, pool);
 
     /* Subsampling: (frames x 128) -> (t0 x 64 x 128) -> (t1 x 32 x 32), LayerNorm + ReLU. */
-    conv_job cj0 = {w, mel, w->c0, f32_of(g, "a.conv1d.0.norm.weight"), frames, 128, t0, f0};
-    conv_job cj1 = {w, w->c0, w->c1, f32_of(g, "a.conv1d.1.norm.weight"), t0, f0, t1, f1};
-    AP(AP_CONV, ei_parallel_for(pool, t0, 4, conv0_rows, &cj0); ei_parallel_for(pool, t1, 2, conv1_rows, &cj1));
+    conv_job cj = {w, mel, f32_of(g, "a.conv1d.0.norm.weight"), f32_of(g, "a.conv1d.1.norm.weight"), w->c1,
+                   frames, t0, t1};
+    AP(AP_CONV, ei_parallel_for(pool, t1, 8, conv01_rows, &cj));
     AP(AP_GEMM, ei_gemma2_fast_gemm_f(pool, tensor_of(g, "a.input_projection.weight"), w->c1, n, w->x));
 
     for (int l = 0; l < 12; ++l) {

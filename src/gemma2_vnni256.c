@@ -12,6 +12,8 @@
  * This kernel repacks each weight once into 8-row groups so that one 32-byte
  * load holds 4 consecutive k-bytes of 8 different output rows:
  *     w8[g][block][j][r][4] = w[8g + r][32 block + 4j .. 4j + 3]   (j = 0..7)
+ * Per (group, block) the 8 rows' fp16 Q8_0 scales and int16 weight sums are
+ * kept (36 bytes per 32 weights, vs 34 for Q8_0 itself).
  * Activations are the u8 = q + 128 rows of g2x_acts. For each token the 4
  * k-bytes of step j are broadcast to all lanes and one vpdpbusd advances 8
  * output rows at once; seeding the int32 accumulator with -128 * sum(w) per
@@ -32,8 +34,8 @@ typedef struct {
     const void *key;
     int m, k;
     int8_t *q;    /* [m/8][k/32][8 steps][8 rows][4] */
-    float *s;     /* [m/8][k/32][8 rows] */
-    int32_t *c;   /* [m/8][k/32][8 rows] = -128 * sum(w) */
+    ei_fp16 *s;   /* [m/8][k/32][8 rows], the Q8_0 block scales (fp16, exact) */
+    int16_t *c;   /* [m/8][k/32][8 rows] = sum(w) in [-4064, 4064]; x -128 at use */
 } g2v_weight;
 
 enum { G2V_CACHE = 1024 };
@@ -66,8 +68,8 @@ const void *g2v_weight_of(const void *key, const ei_block_q8_0 *blocks, int m, i
     const int kb = k / 32;
     g2v_weight *w = &g2v_weights[g2v_count];
     w->q = aligned_alloc(64, (size_t)m * k);
-    w->s = aligned_alloc(64, (size_t)m * kb * sizeof(float));
-    w->c = aligned_alloc(64, (size_t)m * kb * sizeof(int32_t));
+    w->s = aligned_alloc(64, ((size_t)m * kb * sizeof(ei_fp16) + 63) & ~(size_t)63);
+    w->c = aligned_alloc(64, ((size_t)m * kb * sizeof(int16_t) + 63) & ~(size_t)63);
     if (!w->q || !w->s || !w->c)
         return NULL;
     for (int g = 0; g < m / 8; g++)
@@ -80,8 +82,8 @@ const void *g2v_weight_of(const void *key, const ei_block_q8_0 *blocks, int m, i
                     memcpy(dst + j * 32 + r * 4, b->qs + 4 * j, 4);
                 for (int z = 0; z < 32; z++)
                     sum += b->qs[z];
-                w->s[((size_t)g * kb + p) * 8 + r] = ei_fp16_to_fp32(b->d);
-                w->c[((size_t)g * kb + p) * 8 + r] = -128 * sum;
+                w->s[((size_t)g * kb + p) * 8 + r] = b->d;
+                w->c[((size_t)g * kb + p) * 8 + r] = (int16_t)sum;
             }
         }
     g2_release_source(blocks, (size_t)m * kb * sizeof(ei_block_q8_0));
@@ -104,8 +106,8 @@ const void *g2v_weight_of(const void *key, const ei_block_q8_0 *blocks, int m, i
                                  int t0, int k, float *y, int m) {                                 \
         const int kb = k / 32;                                                                     \
         const int8_t *wq = w->q + (size_t)g * kb * 256;                                            \
-        const float *ws = w->s + (size_t)g * kb * 8;                                               \
-        const int32_t *wc = w->c + (size_t)g * kb * 8;                                             \
+        const ei_fp16 *ws = w->s + (size_t)g * kb * 8;                                             \
+        const int16_t *wc = w->c + (size_t)g * kb * 8;                                             \
         const uint8_t *xr[NT];                                                                     \
         const float *sr[NT];                                                                       \
         __m256 acc[NT];                                                                            \
@@ -116,7 +118,10 @@ const void *g2v_weight_of(const void *key, const ei_block_q8_0 *blocks, int m, i
         }                                                                                          \
         for (int p = 0; p < kb; p++) {                                                             \
             __m256i even[NT], odd[NT];                                                             \
-            const __m256i corr = _mm256_load_si256((const __m256i *)(wc + (size_t)p * 8));         \
+            const __m256i corr = _mm256_slli_epi32(                                                \
+                _mm256_sub_epi32(_mm256_setzero_si256(),                                           \
+                                 _mm256_cvtepi16_epi32(_mm_load_si128((const __m128i *)(wc + (size_t)p * 8)))), \
+                7); /* -128 * sum(w) */                                                            \
             G2V_UNROLL for (int t = 0; t < NT; t++) {                                              \
                 even[t] = corr;                                                                    \
                 odd[t] = _mm256_setzero_si256();                                                   \
@@ -136,7 +141,7 @@ const void *g2v_weight_of(const void *key, const ei_block_q8_0 *blocks, int m, i
                     odd[t] = _mm256_dpbusd_avx_epi32(odd[t], _mm256_set1_epi32(four), w1);         \
                 }                                                                                  \
             }                                                                                      \
-            const __m256 sw = _mm256_load_ps(ws + (size_t)p * 8);                                  \
+            const __m256 sw = _mm256_cvtph_ps(_mm_load_si128((const __m128i *)(ws + (size_t)p * 8))); \
             G2V_UNROLL for (int t = 0; t < NT; t++)                                                \
                 acc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_add_epi32(even[t], odd[t])),    \
                                          _mm256_mul_ps(sw, _mm256_broadcast_ss(sr[t] + p)), acc[t]);\

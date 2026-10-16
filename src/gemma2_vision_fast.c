@@ -299,6 +299,8 @@ bool ei_gemma2_vision_fast(const ei_gguf *g, ei_thread_pool *pool, const uint8_t
     const bool tanh_gelu = ei_gemma2_vision_tanh_gelu(g);
 
     pthread_mutex_lock(&vision_lock);
+    ei_cpu_binding binding; /* hybrid pools: the caller joins on a P-core */
+    ei_thread_pool_bind_caller(pool, &binding);
     vision_ws *w = &vws;
     reserve(w, (size_t)n);
     rope_table(w, cols > prow ? cols : prow);
@@ -361,6 +363,7 @@ bool ei_gemma2_vision_fast(const ei_gguf *g, ei_thread_pool *pool, const uint8_t
         fprintf(stderr, "\n");
         memset(vp_ms, 0, sizeof vp_ms);
     }
+    ei_thread_pool_unbind_caller(&binding);
     pthread_mutex_unlock(&vision_lock);
     return true;
 }

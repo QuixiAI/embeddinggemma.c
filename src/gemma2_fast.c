@@ -1119,6 +1119,21 @@ bool ei_gemma2_embed_batch_fast_ctx(ei_gemma2_fast *ctx, const ei_gguf *g, ei_th
     workspace *ws = &ctx->ws;
     reserve(ws, count);
     int n = (int)count;
+    /* cpu-max fork, hybrid CPUs: waves below EI_GEMMA2_CPU_HYBRID_TOKENS run on
+     * the pool's P-core threads only (every parallel step otherwise waits on
+     * the slower E-cores); larger waves use every core. The caller is pinned
+     * to the pool's first (P-core) CPU for the wave. */
+    ei_cpu_binding binding;
+    ei_thread_pool_bind_caller(pool, &binding);
+    const int perf = ei_thread_pool_performance_threads(pool);
+    static int hybrid_tokens = -1;
+    if (hybrid_tokens < 0) {
+        const char *e = getenv("EI_GEMMA2_CPU_HYBRID_TOKENS");
+        hybrid_tokens = e ? atoi(e) : 512;
+    }
+    const bool capped = perf > 0 && n < hybrid_tokens;
+    if (capped)
+        ei_thread_pool_set_cap(pool, perf);
     for (size_t s = 0; s < batch; s++)
         for (size_t t = offsets[s]; t < offsets[s + 1]; t++) {
             ws->lo[t] = (uint32_t)offsets[s];
@@ -1202,6 +1217,9 @@ bool ei_gemma2_embed_batch_fast_ctx(ei_gemma2_fast *ctx, const ei_gguf *g, ei_th
         fprintf(stderr, "\n");
     }
     memset(prof, 0, sizeof prof);
+    if (capped)
+        ei_thread_pool_set_cap(pool, 0);
+    ei_thread_pool_unbind_caller(&binding);
     pthread_mutex_unlock(&ctx->lock);
     return true;
 }

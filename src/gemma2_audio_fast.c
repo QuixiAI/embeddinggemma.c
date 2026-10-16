@@ -457,6 +457,8 @@ bool ei_gemma2_audio_fast(const ei_gguf *g, ei_thread_pool *pool, const float *m
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, create_ctx);
     pthread_mutex_lock(&audio_lock);
+    ei_cpu_binding binding; /* hybrid pools: the caller joins on a P-core */
+    ei_thread_pool_bind_caller(pool, &binding);
     audio_ws *w = &aws;
     const int t0 = (frames + 1) / 2, f0 = 64, t1 = (t0 + 1) / 2, f1 = 32, n = t1;
     reserve(w, (size_t)n, (size_t)t0 * f0 * 128);
@@ -550,6 +552,7 @@ bool ei_gemma2_audio_fast(const ei_gguf *g, ei_thread_pool *pool, const float *m
         fprintf(stderr, "\n");
         memset(ap_ms, 0, sizeof ap_ms);
     }
+    ei_thread_pool_unbind_caller(&binding);
     pthread_mutex_unlock(&audio_lock);
     return true;
 }

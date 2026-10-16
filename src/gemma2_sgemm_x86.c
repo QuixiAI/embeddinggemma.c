@@ -23,14 +23,14 @@ typedef struct {
     int m, k;
     float *p; /* [m/16][k][16] */
 } g2s_weight;
-enum { G2S_CACHE = 64 };
-static g2s_weight g2s_weights[G2S_CACHE];
-static int g2s_count;
 
 int g2s_m(const void *w) { return ((const g2s_weight *)w)->m; }
 int g2s_k(const void *w) { return ((const g2s_weight *)w)->k; }
 
 #if defined(__x86_64__) || defined(_M_X64)
+enum { G2S_CACHE = 64 };
+static g2s_weight g2s_weights[G2S_CACHE];
+static int g2s_count;
 #include <immintrin.h>
 #define AVX2 __attribute__((target("avx2,fma,f16c")))
 #define UNROLL _Pragma("GCC unroll 8")

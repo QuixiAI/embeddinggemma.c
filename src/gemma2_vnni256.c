@@ -38,20 +38,19 @@ typedef struct {
     int16_t *c;   /* [m/8][k/32][8 rows] = sum(w) in [-4064, 4064]; x -128 at use */
 } g2v_weight;
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+
 enum { G2V_CACHE = 1024 };
 static g2v_weight g2v_weights[G2V_CACHE];
 static int g2v_count;
-
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
 
 int g2v_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *flag = getenv("EI_GEMMA2_CPU_VNNI256"); /* default on where supported */
         __builtin_cpu_init();
-        cached = (!flag || strcmp(flag, "0")) && g2x_level() == G2X_AVXVNNI &&
-                 __builtin_cpu_supports("avxvnni");
+        cached = (!flag || strcmp(flag, "0")) && g2x_level() == G2X_AVXVNNI; /* level implies AVX-VNNI */
     }
     return cached;
 }

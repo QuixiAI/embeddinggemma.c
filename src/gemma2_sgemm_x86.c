@@ -55,7 +55,20 @@ static float element(const void *data, int type, size_t i) {
     return f;
 }
 
-const void *g2s_weight_of(const void *key, const void *data, int type, int m, int k) {
+typedef struct {
+    float *p;
+    const void *data;
+    int type, k;
+} g2s_pack_job;
+static void g2s_pack_panels(void *opaque, int32_t begin, int32_t end) {
+    const g2s_pack_job *j = opaque;
+    for (int pn = begin; pn < end; pn++)
+        for (int z = 0; z < j->k; z++)
+            for (int c = 0; c < 16; c++)
+                j->p[((size_t)pn * j->k + z) * 16 + c] = element(j->data, j->type, (size_t)(pn * 16 + c) * j->k + z);
+}
+
+const void *g2s_weight_of(const void *key, const void *data, int type, int m, int k, ei_thread_pool *pool) {
     for (int i = 0; i < g2s_count; i++)
         if (g2s_weights[i].key == key)
             return g2s_weights[i].m == m && g2s_weights[i].k == k ? &g2s_weights[i] : NULL;
@@ -65,10 +78,8 @@ const void *g2s_weight_of(const void *key, const void *data, int type, int m, in
     w->p = aligned_alloc(64, (size_t)m * k * sizeof(float));
     if (!w->p)
         return NULL;
-    for (int pn = 0; pn < m / 16; pn++)
-        for (int z = 0; z < k; z++)
-            for (int c = 0; c < 16; c++)
-                w->p[((size_t)pn * k + z) * 16 + c] = element(data, type, (size_t)(pn * 16 + c) * k + z);
+    g2s_pack_job job = {w->p, data, type, k};
+    ei_parallel_for(pool, m / 16, 4, g2s_pack_panels, &job); /* on the caller's pool (first use) */
     g2_release_source(data, (size_t)m * k * (type == EI_T_F32 ? 4 : 2));
     w->key = key;
     w->m = m;
@@ -121,8 +132,8 @@ void g2s_block(const void *wp, const float *x, int t0, int t1, int p0, int np, f
 }
 #else
 int g2s_enabled(void) { return 0; }
-const void *g2s_weight_of(const void *key, const void *data, int type, int m, int k) {
-    (void)key, (void)data, (void)type, (void)m, (void)k;
+const void *g2s_weight_of(const void *key, const void *data, int type, int m, int k, ei_thread_pool *pool) {
+    (void)key, (void)data, (void)type, (void)m, (void)k, (void)pool;
     return NULL;
 }
 void g2s_block(const void *w, const float *x, int t0, int t1, int p0, int np, float *y) {

@@ -527,7 +527,7 @@ static bool gemm_q8_x86_vnni256(workspace *ws, ei_thread_pool *pool, const ei_te
     if (!g2v_enabled() || (n <= 8 && !short_waves) || k % 32 || m % 8)
         return false;
     pthread_mutex_lock(&weight_cache_lock);
-    const void *pw = g2v_weight_of(w, w->data, m, k);
+    const void *pw = g2v_weight_of(w, w->data, m, k, pool);
     pthread_mutex_unlock(&weight_cache_lock);
     if (!pw)
         return false;
@@ -662,7 +662,7 @@ static bool gemm_f_sgemm(ei_thread_pool *pool, const ei_tensor *w, const float *
     if (!g2s_enabled() || m % 16)
         return false;
     pthread_mutex_lock(&weight_cache_lock);
-    const void *pw = g2s_weight_of(w, w->data, (int)w->type, m, k);
+    const void *pw = g2s_weight_of(w, w->data, (int)w->type, m, k, pool);
     pthread_mutex_unlock(&weight_cache_lock);
     if (!pw)
         return false;

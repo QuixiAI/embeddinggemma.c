@@ -56,7 +56,32 @@ int g2v_enabled(void) {
     return cached;
 }
 
-const void *g2v_weight_of(const void *key, const ei_block_q8_0 *blocks, int m, int k) {
+/* Repack 8-row groups [begin, end): runs on the caller's pool (first use of a tensor). */
+typedef struct {
+    g2v_weight *w;
+    const ei_block_q8_0 *blocks;
+    int kb;
+} g2v_repack_job;
+static void g2v_repack_groups(void *opaque, int32_t begin, int32_t end) {
+    const g2v_repack_job *j = opaque;
+    const int kb = j->kb;
+    for (int g = begin; g < end; g++)
+        for (int p = 0; p < kb; p++) {
+            int8_t *dst = j->w->q + ((size_t)g * kb + p) * 256;
+            for (int r = 0; r < 8; r++) {
+                const ei_block_q8_0 *b = j->blocks + (size_t)(8 * g + r) * kb + p;
+                int32_t sum = 0;
+                for (int i = 0; i < 8; i++)
+                    memcpy(dst + i * 32 + r * 4, b->qs + 4 * i, 4);
+                for (int z = 0; z < 32; z++)
+                    sum += b->qs[z];
+                j->w->s[((size_t)g * kb + p) * 8 + r] = b->d;
+                j->w->c[((size_t)g * kb + p) * 8 + r] = (int16_t)sum;
+            }
+        }
+}
+
+const void *g2v_weight_of(const void *key, const ei_block_q8_0 *blocks, int m, int k, ei_thread_pool *pool) {
     for (int i = 0; i < g2v_count; i++)
         if (g2v_weights[i].key == key) {
             if (g2v_weights[i].m != m || g2v_weights[i].k != k)
@@ -72,20 +97,8 @@ const void *g2v_weight_of(const void *key, const ei_block_q8_0 *blocks, int m, i
     w->c = aligned_alloc(64, ((size_t)m * kb * sizeof(int16_t) + 63) & ~(size_t)63);
     if (!w->q || !w->s || !w->c)
         return NULL;
-    for (int g = 0; g < m / 8; g++)
-        for (int p = 0; p < kb; p++) {
-            int8_t *dst = w->q + ((size_t)g * kb + p) * 256;
-            for (int r = 0; r < 8; r++) {
-                const ei_block_q8_0 *b = blocks + (size_t)(8 * g + r) * kb + p;
-                int32_t sum = 0;
-                for (int j = 0; j < 8; j++)
-                    memcpy(dst + j * 32 + r * 4, b->qs + 4 * j, 4);
-                for (int z = 0; z < 32; z++)
-                    sum += b->qs[z];
-                w->s[((size_t)g * kb + p) * 8 + r] = b->d;
-                w->c[((size_t)g * kb + p) * 8 + r] = (int16_t)sum;
-            }
-        }
+    g2v_repack_job job = {w, blocks, kb};
+    ei_parallel_for(pool, m / 8, 8, g2v_repack_groups, &job);
     g2_release_source(blocks, (size_t)m * kb * sizeof(ei_block_q8_0));
     w->key = key;
     w->m = m;
@@ -174,8 +187,8 @@ void g2v_tile(const void *wp, int g, const uint8_t *xu, const float *xs, int t0,
 }
 #else
 int g2v_enabled(void) { return 0; }
-const void *g2v_weight_of(const void *key, const ei_block_q8_0 *blocks, int m, int k) {
-    (void)key, (void)blocks, (void)m, (void)k;
+const void *g2v_weight_of(const void *key, const ei_block_q8_0 *blocks, int m, int k, ei_thread_pool *pool) {
+    (void)key, (void)blocks, (void)m, (void)k, (void)pool;
     return NULL;
 }
 void g2v_tile(const void *w, int g, const uint8_t *xu, const float *xs, int t0, int nt, int k, float *y,

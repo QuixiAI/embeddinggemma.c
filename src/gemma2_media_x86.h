@@ -8,7 +8,10 @@
 
 /* Key block of the tiled kernels. Query blocks depend on the head width and
  * kernel variant: callers must size tasks with g2m_attn_qblock(d). */
-enum { G2M_ATTN_KB = 64 };
+#ifndef G2M_KB
+#define G2M_KB 64 /* compile-time key block (tuning experiments: -DG2M_KB=32|128) */
+#endif
+enum { G2M_ATTN_KB = G2M_KB };
 
 /* Online-softmax attention for one head and a block of queries [q0, q0 + nq),
  * nq <= g2m_attn_qblock(d). Head width d: multiple of 16, <= 512 (fp32, any d

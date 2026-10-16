@@ -13,11 +13,24 @@
 #include "gemma2_fast_x86.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- portable fallbacks -------------------------------------------------- */
 
-int g2m_attn_qblock(int d) { return d <= 128 ? 64 : d <= 256 ? 32 : 16; }
+int g2m_attn_qblock(int d) {
+    /* EI_G2M_QB=16..128 (multiple of 16) overrides the query block for widths <= 64, and up
+     * to 64 for widths <= 128 (tuning experiments). */
+    static int qb = -1;
+    if (qb < 0) {
+        const char *e = getenv("EI_G2M_QB");
+        int v = e ? atoi(e) : 0;
+        qb = v >= 16 && v <= 128 && v % 16 == 0 ? v : 0;
+    }
+    if (qb && (d <= 64 || (d <= 128 && qb <= 64)))
+        return qb; /* Q^T/O^T hold d x QB <= 8192 floats */
+    return d <= 128 ? 64 : d <= 256 ? 32 : 16;
+}
 
 void g2m_attn_reference(const g2m_attn_args *a) {
     float scores[G2M_ATTN_KB], o[512];
@@ -87,13 +100,13 @@ AVX2 static inline __m256 exp8(__m256 x) {
 
 /* Scratch per thread: Q^T and O^T hold d x QB floats (<= 8192 each by the
  * choice of QB), S^T/P^T KB x QB. 80 KB, so not on small worker stacks. */
-static _Thread_local _Alignas(32) float tl_qt[8192], tl_ot[8192], tl_st[G2M_ATTN_KB * 64];
+static _Thread_local _Alignas(32) float tl_qt[8192], tl_ot[8192], tl_st[G2M_ATTN_KB * 128];
 
 AVX2 static void attn_avx2(const g2m_attn_args *a) {
     enum { KB = G2M_ATTN_KB };
     const int d = a->d, QB = g2m_attn_qblock(d), nq = a->nq;
     float *qt = tl_qt, *ot = tl_ot, *st = tl_st;
-    _Alignas(32) float m[64], l[64], alpha[64], lof[64], hif[64];
+    _Alignas(32) float m[128], l[128], alpha[128], lof[128], hif[128];
     const int np = (nq + 15) & ~15; /* query lanes, padded to whole 16-wide tiles */
     for (int dd = 0; dd < d; dd++)
         for (int i = 0; i < np; i++)

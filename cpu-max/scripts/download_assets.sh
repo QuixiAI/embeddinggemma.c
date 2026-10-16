@@ -7,13 +7,15 @@
 # models:   GGUF files for the native engines (cpu-max/models/gguf, checked against
 #           cpu-max/models/SHA256SUMS), the official FP32 model and the ONNX
 #           Community export (Hugging Face cache).
-# datasets: SciFact, Flickr30k 1k test, 5 Clotho test shards (Hugging Face cache)
-#           and MSR-VTT test-1k (cpu-max/data/msrvtt; the video archive is 2.2 GB).
-# Needs the `hf` CLI (installed by `uv sync` in cpu-max/), unzip, sha256sum.
+# datasets: SciFact, Flickr30k 1k test (images extracted to cpu-max/data/flickr1k),
+#           4 Clotho test shards (Hugging Face cache) and MSR-VTT test-1k
+#           (cpu-max/data/msrvtt; the video archive is 2.2 GB).
+# Needs the environment of `uv sync` in cpu-max/ (hf CLI, huggingface_hub), unzip, sha256sum.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 HF=${HF:-.venv/bin/hf}
 command -v "$HF" >/dev/null || HF=hf
+PY=${PY:-.venv/bin/python}
 what=("$@")
 [ ${#what[@]} -eq 0 ] && what=(models datasets)
 
@@ -32,6 +34,11 @@ for w in "${what[@]}"; do
       "$HF" download mteb/scifact --repo-type dataset --revision cf10ab6856b15b0e670ef8ae5dae4e266c12d035
       "$HF" download nlphuji/flickr_1k_test_image_text_retrieval --repo-type dataset \
           --revision c4a4cdc67b77fce148b45484a067957bf75ec4c3
+      # Flickr30k 1k test images, extracted for fixtures and retrieval (data/flickr1k/images_flickr_1k_test)
+      zip=$("$PY" -c "from huggingface_hub import hf_hub_download as d; print(d('nlphuji/flickr_1k_test_image_text_retrieval', 'images_flickr_1k_test.zip', repo_type='dataset', revision='c4a4cdc67b77fce148b45484a067957bf75ec4c3'))")
+      mkdir -p data/flickr1k
+      unzip -q -o "$zip" -d data/flickr1k
+      echo "flickr: $(ls data/flickr1k/images_flickr_1k_test | wc -l) images"
       "$HF" download CLAPv2/Clotho --repo-type dataset --revision b491ad6569dba180ca60a0e2d17a1d6a0d5d9f4a \
           data/test/test-mnt_audio_clip_processed_datasets_Clotho_test_4907-mnt_audio_clip_processed_datasets_Clotho_test_5674-batch32.parquet \
           data/test/test-mnt_audio_clip_processed_datasets_Clotho_test_4941-mnt_audio_clip_processed_datasets_Clotho_test_5405-batch18.parquet \

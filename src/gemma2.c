@@ -364,7 +364,7 @@ bool ei_gemma2_vision_ref(const ei_gguf *g, ei_thread_pool *pool, const uint8_t 
     }
     double rp_total = rp_on() ? rp_now() : 0;
     int cols = width / 16, rows = height / 16, n = cols * rows;
-    bool use_gelu = ei_gguf_kv_bool(g, "clip.use_gelu", false);
+    bool use_gelu = ei_gemma2_vision_tanh_gelu(g); /* cpu-max: official/upstream semantics switch */
     float *patches = alloc_f((size_t)n * 768), *x = alloc_f((size_t)n * 768),
           *h = alloc_f((size_t)n * 768);
     float *q = alloc_f((size_t)n * 768), *k = alloc_f((size_t)n * 768),

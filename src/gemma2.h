@@ -35,8 +35,12 @@ bool ei_gemma2_vision(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb
                       int height, float **output, size_t *tokens, char *err, size_t err_len);
 /* cpu-max fork: SIMD/threaded CPU vision tower (default; EI_GEMMA2_CPU_MEDIA_FAST=0
  * restores the reference graph above). Same math as the reference: Q8 activations
- * for Q8 weights, fp32 attention/norms, the GGUF-selected GELU variant. */
+ * for Q8 weights, fp32 attention/norms, the selected GELU variant. */
 bool ei_gemma2_cpu_media_fast(void);
+/* cpu-max fork: official (default) vs upstream semantics (EI_GEMMA2_SEMANTICS=upstream):
+ * vision MLP activation, log-mel floor, video frame timestamps. */
+bool ei_gemma2_official_semantics(void);
+bool ei_gemma2_vision_tanh_gelu(const ei_gguf *g);
 bool ei_gemma2_vision_ref(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb, int width,
                           int height, float **output, size_t *tokens, char *err, size_t err_len);
 bool ei_gemma2_vision_fast(const ei_gguf *g, ei_thread_pool *pool, const uint8_t *rgb, int width,

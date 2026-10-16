@@ -4,7 +4,7 @@
  * (gemma2.c: per-element GEMM loops, scalar attention with a calloc per job,
  * single-threaded norms/RoPE/activations/quantization). This path keeps the
  * reference math -- Q8_0 activations for Q8_0 weights, fp32 attention and
- * norms, the fp16-rounded patch input, the GGUF-selected GELU variant -- and
+ * norms, the fp16-rounded patch input, the selected GELU variant -- and
  * changes only how it is executed:
  *   - Q8_0 GEMMs on the fast text graph's x86 VNNI/AVX2 (or NEON) tiles,
  *   - g2m_attn64: tiled online-softmax attention for the 64-wide heads,
@@ -58,6 +58,26 @@ bool ei_gemma2_cpu_media_fast(void) {
         cached = !flag || strcmp(flag, "0");
     }
     return cached;
+}
+
+/* EI_GEMMA2_SEMANTICS=upstream restores upstream's three deviations from the
+ * official model; the default ("official") follows the Transformers
+ * implementation (measured against its FP32 embeddings: reports/). */
+bool ei_gemma2_official_semantics(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("EI_GEMMA2_SEMANTICS");
+        cached = !(e && !strcmp(e, "upstream"));
+    }
+    return cached;
+}
+bool ei_gemma2_vision_tanh_gelu(const ei_gguf *g) {
+    const char *gelu = getenv("EI_GEMMA2_VISION_GELU"); /* explicit override: tanh | quick */
+    if (gelu)
+        return !strcmp(gelu, "tanh");
+    /* The GGUF lacks clip.use_gelu, so upstream (like llama.cpp) selects QuickGELU;
+     * the official config's vision hidden_activation is gelu_pytorch_tanh. */
+    return ei_gemma2_official_semantics() || ei_gguf_kv_bool(g, "clip.use_gelu", false);
 }
 
 static const ei_tensor *tensor_of(const ei_gguf *g, const char *name) {
@@ -276,10 +296,7 @@ bool ei_gemma2_vision_fast(const ei_gguf *g, ei_thread_pool *pool, const uint8_t
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, create_ctx);
     const int cols = width / 16, prow = height / 16, n = cols * prow;
-    bool tanh_gelu = ei_gguf_kv_bool(g, "clip.use_gelu", false);
-    const char *gelu = getenv("EI_GEMMA2_VISION_GELU"); /* study override: tanh | quick */
-    if (gelu)
-        tanh_gelu = !strcmp(gelu, "tanh");
+    const bool tanh_gelu = ei_gemma2_vision_tanh_gelu(g);
 
     pthread_mutex_lock(&vision_lock);
     vision_ws *w = &vws;

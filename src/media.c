@@ -6,6 +6,7 @@
 #include "gemma2_cuda.h"
 #endif
 #include "media.h"
+#include "gemma2.h"
 #include <pthread.h>
 #include <math.h>
 #include <limits.h>
@@ -658,8 +659,8 @@ static void fft(float re[512], float im[512]) {
 static bool logmel_hf(void) {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("EI_GEMMA2_AUDIO_LOGMEL");
-        on = e && !strcmp(e, "hf");
+        const char *e = getenv("EI_GEMMA2_AUDIO_LOGMEL"); /* explicit override: hf | max */
+        on = e ? !strcmp(e, "hf") : ei_gemma2_official_semantics();
     }
     return on;
 }
@@ -788,9 +789,9 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
                 double sum = 0;
                 for (int f = first[bin]; f <= last[bin]; ++f)
                     sum += mag[f] * filters[bin][f];
-                /* cpu-max fork: EI_GEMMA2_AUDIO_LOGMEL=hf uses the official Transformers
-                 * extractor's log(mel + floor); the default keeps upstream's
-                 * log(max(mel, floor)) (llama.cpp mtmd-audio). */
+                /* cpu-max fork: official semantics (default) use the Transformers
+                 * extractor's log(mel + floor); EI_GEMMA2_SEMANTICS=upstream (or
+                 * EI_GEMMA2_AUDIO_LOGMEL=max) keeps upstream's log(max(mel, floor)). */
                 mel[(size_t)t * 128 + bin] =
                     logmel_hf() ? (float)log(sum + 0.001) : logf(fmaxf(0.001f, (float)sum));
             }

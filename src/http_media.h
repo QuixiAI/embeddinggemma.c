@@ -146,12 +146,13 @@ static bool media_part(const char **p, ei_media_input *m, char *err, size_t len)
         ei_media_frame *prepared = ei_xcalloc(frames.n, sizeof *prepared);
         video_decode_all(m, &frames, frame_tokens, prepared);
         ei_media_frames_encode(m, prepared, frames.n);
-        /* cpu-max fork: EI_GEMMA2_VIDEO_TIMESTAMPS=0 omits the "MM:SS " text before
-         * each frame, the official processor's default layout (add_timestamps=False). */
+        /* cpu-max fork: official semantics (default) omit the "MM:SS " text before
+         * each frame, the processor's default layout (add_timestamps=False);
+         * EI_GEMMA2_SEMANTICS=upstream or EI_GEMMA2_VIDEO_TIMESTAMPS=1 keep it. */
         static int stamps = -1;
         if (stamps < 0) {
             const char *e = getenv("EI_GEMMA2_VIDEO_TIMESTAMPS");
-            stamps = !(e && !strcmp(e, "0"));
+            stamps = e ? strcmp(e, "0") != 0 : !ei_gemma2_official_semantics();
         }
         for (size_t i = 0; ok && i < frames.n; ++i) {
             unsigned seconds = (unsigned)(i / fps);

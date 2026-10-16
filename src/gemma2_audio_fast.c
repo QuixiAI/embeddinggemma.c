@@ -482,7 +482,7 @@ bool ei_gemma2_audio_fast(const ei_gguf *g, ei_thread_pool *pool, const float *m
     /* Subsampling: (frames x 128) -> (t0 x 64 x 128) -> (t1 x 32 x 32), LayerNorm + ReLU. */
     conv_job cj = {w, mel, f32_of(g, "a.conv1d.0.norm.weight"), f32_of(g, "a.conv1d.1.norm.weight"), w->c1,
                    frames, t0, t1};
-    AP(AP_CONV, ei_parallel_for(pool, t1, 8, conv01_rows, &cj));
+    AP(AP_CONV, ei_parallel_for(pool, t1, 4, conv01_rows, &cj));
     AP(AP_GEMM, ei_gemma2_fast_gemm_f(pool, tensor_of(g, "a.input_projection.weight"), w->c1, n, w->x));
 
     for (int l = 0; l < 12; ++l) {

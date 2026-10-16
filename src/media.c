@@ -619,7 +619,7 @@ static uint16_t u16(const uint8_t *p) {
 /* Radix-2 FFT, unnormalized, for the model's 512-point STFT. Twiddles are
  * tabulated once with the same expression the butterflies used to evaluate
  * per call (2,304 cosf/sinf pairs per frame), so results are unchanged. */
-static float fft_cos[512], fft_sin[512];
+static float fft_cos[512], fft_sin[512], hann[320];
 static pthread_once_t fft_once = PTHREAD_ONCE_INIT;
 static void fft_tables(void) {
     for (int width = 2; width <= 512; width *= 2)
@@ -628,6 +628,9 @@ static void fft_tables(void) {
             fft_cos[width / 2 + j] = cosf(theta);
             fft_sin[width / 2 + j] = sinf(theta);
         }
+    /* cpu-max fork: the analysis window, the same expression once instead of per frame. */
+    for (int j = 0; j < 320; ++j)
+        hann[j] = 0.5f - 0.5f * cosf(6.283185307179586f * j / 320);
 }
 static void fft(float re[512], float im[512]) {
     pthread_once(&fft_once, fft_tables);
@@ -663,6 +666,39 @@ static bool logmel_hf(void) {
         on = e ? !strcmp(e, "hf") : ei_gemma2_official_semantics();
     }
     return on;
+}
+
+/* cpu-max fork: log-mel frames [begin, end) of one chunk; frames are
+ * independent, so the CPU path runs them on the engine pool. */
+typedef struct {
+    const float *pcm, (*filters)[257];
+    const int *first, *last;
+    size_t count;
+    float *mel;
+    bool hf;
+} mel_job;
+static void mel_frames(void *opaque, int32_t begin, int32_t end) {
+    const mel_job *j = opaque;
+    for (int t = begin; t < end; ++t) {
+        float re[512] = {0}, im[512] = {0}, mag[257];
+        for (int k = 0; k < 320; ++k) {
+            int pos = t * 160 + k - 160;
+            if (pos >= 0 && (size_t)pos < j->count)
+                re[k] = j->pcm[pos] * hann[k];
+        }
+        fft(re, im);
+        for (int f = 0; f < 257; ++f)
+            mag[f] = sqrtf(re[f] * re[f] + im[f] * im[f]);
+        for (int bin = 0; bin < 128; ++bin) {
+            double sum = 0;
+            for (int f = j->first[bin]; f <= j->last[bin]; ++f)
+                sum += mag[f] * j->filters[bin][f];
+            /* Official semantics (default) use the Transformers extractor's
+             * log(mel + floor); EI_GEMMA2_SEMANTICS=upstream (or
+             * EI_GEMMA2_AUDIO_LOGMEL=max) keeps upstream's log(max(mel, floor)). */
+            j->mel[(size_t)t * 128 + bin] = j->hf ? (float)log(sum + 0.001) : logf(fmaxf(0.001f, (float)sum));
+        }
+    }
 }
 bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err, size_t err_len) {
     size_t size = 0;
@@ -774,35 +810,31 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
         /* A sub-frame tail still carries signal; pad it to one analysis frame. */
         if (frames < 1) frames = 1;
         MEDIA_STAGE("wav", t0);
+        /* cpu-max fork: on the CPU tower path the frames run on the engine
+         * pool, so the engine lock is taken here (it covers the tower anyway). */
+        bool cpu_tower = !m->audio;
+#if defined(EI_ENABLE_METAL)
+        if (m->metal) cpu_tower = false;
+#endif
+#if defined(EI_ENABLE_CUDA)
+        if (m->cuda) cpu_tower = false;
+#endif
+        if (cpu_tower && m->lock)
+            pthread_mutex_lock(m->lock);
+        pthread_once(&fft_once, fft_tables);
         float *mel = ei_xcalloc((size_t)frames * 128, sizeof(float));
-        for (int t = 0; t < frames; ++t) {
-            float re[512] = {0}, im[512] = {0}, mag[257];
-            for (int j = 0; j < 320; ++j) {
-                int pos = t * 160 + j - 160;
-                if (pos >= 0 && (size_t)pos < count)
-                    re[j] = pcm[offset + pos] * (0.5f - 0.5f * cosf(6.283185307179586f * j / 320));
-            }
-            fft(re, im);
-            for (int f = 0; f < 257; ++f)
-                mag[f] = sqrtf(re[f] * re[f] + im[f] * im[f]);
-            for (int bin = 0; bin < 128; ++bin) {
-                double sum = 0;
-                for (int f = first[bin]; f <= last[bin]; ++f)
-                    sum += mag[f] * filters[bin][f];
-                /* cpu-max fork: official semantics (default) use the Transformers
-                 * extractor's log(mel + floor); EI_GEMMA2_SEMANTICS=upstream (or
-                 * EI_GEMMA2_AUDIO_LOGMEL=max) keeps upstream's log(max(mel, floor)). */
-                mel[(size_t)t * 128 + bin] =
-                    logmel_hf() ? (float)log(sum + 0.001) : logf(fmaxf(0.001f, (float)sum));
-            }
-        }
+        mel_job mj = {pcm + offset, (const float(*)[257])filters, first, last, count, mel, logmel_hf()};
+        if (cpu_tower)
+            ei_parallel_for(m->pool, frames, 16, mel_frames, &mj);
+        else
+            mel_frames(&mj, 0, frames);
         MEDIA_STAGE("logmel", t0);
         float *soft = NULL;
         size_t n = 0;
         if (m->audio)
             ok = m->audio(m->audio_ctx, mel, frames, &soft, &n, err, err_len);
         else {
-            if (m->lock)
+            if (m->lock && !cpu_tower)
                 pthread_mutex_lock(m->lock);
 #if defined(EI_ENABLE_METAL)
             if (m->metal) ok = ei_gemma2_metal_audio(m->metal, m->projector, mel, frames, &soft, &n, err, err_len);

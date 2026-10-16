@@ -655,6 +655,14 @@ static void fft(float re[512], float im[512]) {
                 im[a] += v;
             }
 }
+static bool logmel_hf(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("EI_GEMMA2_AUDIO_LOGMEL");
+        on = e && !strcmp(e, "hf");
+    }
+    return on;
+}
 bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err, size_t err_len) {
     size_t size = 0;
     double t0 = media_timing() ? media_now_ms() : 0;
@@ -780,7 +788,11 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
                 double sum = 0;
                 for (int f = first[bin]; f <= last[bin]; ++f)
                     sum += mag[f] * filters[bin][f];
-                mel[(size_t)t * 128 + bin] = logf(fmaxf(0.001f, (float)sum));
+                /* cpu-max fork: EI_GEMMA2_AUDIO_LOGMEL=hf uses the official Transformers
+                 * extractor's log(mel + floor); the default keeps upstream's
+                 * log(max(mel, floor)) (llama.cpp mtmd-audio). */
+                mel[(size_t)t * 128 + bin] =
+                    logmel_hf() ? (float)log(sum + 0.001) : logf(fmaxf(0.001f, (float)sum));
             }
         }
         MEDIA_STAGE("logmel", t0);

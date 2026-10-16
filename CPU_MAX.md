@@ -30,6 +30,10 @@ caching, and all GPU backends.
 | `4141ac4` | official semantics by default (`EI_GEMMA2_SEMANTICS=upstream` restores upstream) | `src/gemma2_vision_fast.c`, `src/gemma2.c`, `src/media.c`, `src/http_media.h` |
 | `320dee5` | hybrid P/E-core aware CPU pool (P-cores first, caller on a P-core, small waves capped to P-cores) | `src/parallel.c`, `src/engine.c`, `src/gemma2_fast.c`, towers |
 | `e7cabc7` | `make test-gemma2` runs the llama.cpp goldens with upstream semantics | `Makefile` |
+| `e150672` | attention block-size hooks for tuning (`EI_G2M_QB`, `-DG2M_KB`); defaults unchanged | `src/gemma2_media_x86.c` |
+| `019382b` | fp16 scales / int16 sums in the VNNI256 repack; streamed audio subsampling (less resident memory, bit-identical) | `src/gemma2_vnni256.c`, `src/gemma2_audio_fast.c` |
+| `563ee14` | vision attention reads head-major K/V planes (bit-identical, faster at large images) | `src/gemma2_vision_fast.c`, `src/test_gemma2_attn.c` |
+| `d495f8d` | `EI_GEMMA2_CPU_PREPACK=1`: repack CPU weights at startup | `src/server.c` |
 
 All numerics keep upstream's choices: Q8_0 weights with Q8_0 activations
 for the integer GEMMs, fp32 attention, norms, softmax and accumulation.
@@ -49,7 +53,9 @@ Defaults are on where the hardware supports them; `0` restores upstream.
 | `EI_GEMMA2_CPU_RELEASE_WEIGHTS` | 1 | drop GGUF pages of repacked weights |
 | `EI_CPU_HYBRID` | 1 on hybrid CPUs | pin the gemma2 CPU pool P-cores first (`0`: upstream's unpinned pool) |
 | `EI_GEMMA2_CPU_HYBRID_TOKENS` | 512 | text waves below this run on the P-core threads only |
+| `EI_GEMMA2_CPU_PREPACK` | 0 | repack text/vision/audio weights before listening (first request of each modality runs at warm speed; all towers resident from startup) |
 | `EI_GEMMA2_CPU_PROFILE` | 0 | per-stage timers (text, vision, audio) |
+| `EI_G2M_QB` | per head width | attention query block override (tuning only) |
 | `EI_GEMMA2_REF_PROFILE` | 0 | op-class timers of the reference graphs |
 | `EI_GEMMA2_SEMANTICS` | `official` | `upstream` restores upstream's three deviations below (embeddings identical in kind to upstream's, e.g. for existing indexes) |
 | `EI_GEMMA2_VISION_GELU` | official: `tanh` | vision MLP activation (`gelu_pytorch_tanh` per the official config; upstream: QuickGELU, the GGUF lacks `clip.use_gelu`) |
@@ -68,6 +74,7 @@ embeddings on the benchmark workloads, upstream semantics reach cosine
 make test-gemma2 GEMMA2_MODEL=... GEMMA2_MMPROJ=...      # upstream suite (passes; runs with upstream semantics)
 make build/test_gemma2_vnni256 && ./build/test_gemma2_vnni256        # GEMM routes vs fp64 scalar
 make build/test_gemma2_attn && ./build/test_gemma2_attn              # attention vs scalar fp32 vs fp64
+./build/test_gemma2_attn bench 10080 64 12                           # throughput; EI_ATTN_BENCH_HEADMAJOR=1, EI_ATTN_BENCH_THP=1
 make build/test_gemma2_media && ./build/test_gemma2_media T.gguf P.gguf vision-synthetic   # fast vs reference towers
 ./build/test_gemma2_media T.gguf P.gguf audio-synthetic
 ```

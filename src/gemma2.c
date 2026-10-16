@@ -492,6 +492,13 @@ static float silu(float x) { return x / (1.0f + expf(-x)); }
 /* Audio features are time-major, 128 HTK log-magnitude mel bins. */
 bool ei_gemma2_audio(const ei_gguf *g, ei_thread_pool *pool, const float *mel, int frames,
                      float **output, size_t *tokens, char *err, size_t err_len) {
+    if (ei_gemma2_cpu_media_fast())
+        return ei_gemma2_audio_fast(g, pool, mel, frames, output, tokens, err, err_len);
+    return ei_gemma2_audio_ref(g, pool, mel, frames, output, tokens, err, err_len);
+}
+/* The unchanged upstream reference graph (EI_GEMMA2_CPU_MEDIA_FAST=0). */
+bool ei_gemma2_audio_ref(const ei_gguf *g, ei_thread_pool *pool, const float *mel, int frames,
+                         float **output, size_t *tokens, char *err, size_t err_len) {
     if (frames < 1 || frames > 3000) {
         snprintf(err, err_len, "audio chunk must contain 1..3000 mel frames");
         return false;

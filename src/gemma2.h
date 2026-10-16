@@ -43,4 +43,10 @@ bool ei_gemma2_vision_fast(const ei_gguf *g, ei_thread_pool *pool, const uint8_t
                            int height, float **output, size_t *tokens, char *err, size_t err_len);
 bool ei_gemma2_audio(const ei_gguf *g, ei_thread_pool *pool, const float *mel, int frames,
                      float **output, size_t *tokens, char *err, size_t err_len);
+/* cpu-max fork: SIMD/threaded CPU audio tower (default; EI_GEMMA2_CPU_MEDIA_FAST=0
+ * restores the reference graph). Same math as the reference. */
+bool ei_gemma2_audio_ref(const ei_gguf *g, ei_thread_pool *pool, const float *mel, int frames,
+                         float **output, size_t *tokens, char *err, size_t err_len);
+bool ei_gemma2_audio_fast(const ei_gguf *g, ei_thread_pool *pool, const float *mel, int frames,
+                          float **output, size_t *tokens, char *err, size_t err_len);
 #endif

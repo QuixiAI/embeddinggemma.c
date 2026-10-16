@@ -99,7 +99,7 @@ HDRS_NATIVE := $(wildcard src/*.h src/vendor/*.h)
 SRCS_CORE := src/gguf.c
 SRCS_MODEL := $(SRCS_CORE) src/model.c
 SRCS_TOKENIZER := $(SRCS_MODEL) src/tokenizer.c
-SRCS_ENGINE := $(SRCS_TOKENIZER) src/quants.c src/kernels.c src/parallel.c src/engine.c src/gemma2.c src/gemma2_fast.c src/gemma2_fast_x86.c src/gemma2_vision_fast.c src/gemma2_media_x86.c src/gemma2_vnni256.c src/media.c src/response_cache.c
+SRCS_ENGINE := $(SRCS_TOKENIZER) src/quants.c src/kernels.c src/parallel.c src/engine.c src/gemma2.c src/gemma2_fast.c src/gemma2_fast_x86.c src/gemma2_vision_fast.c src/gemma2_audio_fast.c src/gemma2_media_x86.c src/gemma2_vnni256.c src/media.c src/response_cache.c
 SRCS_SERVICE := src/inference_service.c
 SRCS_SERVER := src/server.c src/float_format.c
 

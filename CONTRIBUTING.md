@@ -655,7 +655,13 @@ Important production controls:
 - `--tokenizer-workers N`: set persistent tokenizer workers.
 - `--batch-wait-us N`: bound microbatch collection delay.
 - `--keepalive-connections N`, `--keepalive-max-requests N`, and
-  `--keepalive-timeout-ms N`: control persistent HTTP connections.
+  `--keepalive-timeout-ms N`: control persistent HTTP connections. The
+  keep-alive timeout (1 s) bounds only the wait for the next request on an
+  idle connection.
+- `--request-timeout-ms N` (default 30000): bounds each read once a request
+  has started; a stalled request gets 408. `Expect: 100-continue` is answered
+  with `100 Continue`. Every error response is also logged to stderr, and a
+  failure executing valid inputs is a 500, not a 400.
 - `--response-cache-mb N`: size the exact float-JSON response LRU.
 - `--persistent-cache-path PATH`: persist the exact-embedding cache to disk.
   The service loads matching entries at startup and flushes ready entries on

@@ -53,6 +53,7 @@ static int ei_socket_errno(void) {
     int error = WSAGetLastError();
     if (error == WSAEINTR) return EINTR;
     if (error == WSAETIMEDOUT || error == WSAEWOULDBLOCK) return EAGAIN;
+    if (error == WSAECONNRESET) return ECONNRESET;
     return error;
 #else
     return errno;
@@ -401,6 +402,7 @@ typedef struct {
     size_t keepalive_connections;
     size_t keepalive_max_requests;
     uint32_t keepalive_timeout_ms;
+    uint32_t request_timeout_ms;
     size_t response_cache_bytes;
     const char *persistent_cache_path;
 } server_opts;
@@ -886,8 +888,15 @@ static void http_response(ei_socket fd, int status, const char *reason,
                         body, keep_alive);
 }
 
+/* One stderr line per error response, so a client-side failure report can be
+ * matched to the server's reason (issue #2: rejected requests left no trace). */
+static void log_http_error(int status, const char *msg) {
+    fprintf(stderr, "http %d: %s\n", status, msg);
+}
+
 static void http_error(ei_socket fd, int status, const char *reason, const char *msg,
                        bool keep_alive) {
+    log_http_error(status, msg);
     sbuf b = {0};
     sbuf_append_z(&b, "{\"error\":");
     sbuf_append_json_string(&b, msg, strlen(msg));
@@ -901,6 +910,7 @@ static void http_error(ei_socket fd, int status, const char *reason, const char 
 static void openai_http_error(ei_socket fd, int status, const char *reason,
                               const char *msg, const char *param,
                               bool keep_alive) {
+    log_http_error(status, msg);
     sbuf b = {0};
     sbuf_append_z(&b, "{\"error\":{\"message\":");
     sbuf_append_json_string(&b, msg, strlen(msg));
@@ -994,31 +1004,71 @@ static char *find_header_end(char *buf, size_t n) {
     return NULL;
 }
 
+/* Two receive timeouts per connection: idle_ms bounds the wait for the next
+ * request on a keep-alive connection (--keepalive-timeout-ms), request_ms
+ * bounds each read once a request has started (--request-timeout-ms). The
+ * idle timeout used to govern the body read too, so a client that paused
+ * over a second between headers and body got a 400 (issue #2). */
 typedef struct {
     ei_socket fd;
     sbuf buffered;
+    uint32_t idle_ms, request_ms, current_ms;
 } http_connection;
 
 typedef enum {
     HTTP_READ_OK,
     HTTP_READ_CLOSED,
     HTTP_READ_ERROR,
+    HTTP_READ_TIMEOUT,
 } http_read_result;
+
+static void connection_timeout(http_connection *connection, uint32_t ms) {
+    if (connection->current_ms == ms) return;
+#ifdef _WIN32
+    DWORD timeout = ms;
+#else
+    struct timeval timeout = {
+        .tv_sec = ms / 1000u,
+        .tv_usec = (suseconds_t)(ms % 1000u) * 1000,
+    };
+#endif
+    ei_setsockopt(connection->fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+    connection->current_ms = ms;
+}
+
+static void send_all(ei_socket fd, const char *data, size_t len) {
+    while (len) {
+        int chunk = len > INT_MAX ? INT_MAX : (int)len;
+        ssize_t sent = send(fd, data, chunk, 0);
+        if (sent <= 0) {
+            if (sent < 0 && ei_socket_errno() == EINTR) continue;
+            return;
+        }
+        data += sent;
+        len -= (size_t)sent;
+    }
+}
 
 static http_read_result read_request(http_connection *connection,
                                      char **headers_out, char **body_out,
                                      size_t *body_len_out,
                                      char *err, size_t err_len) {
     char tmp[8192];
+    connection_timeout(connection, connection->buffered.n ? connection->request_ms
+                                                          : connection->idle_ms);
     char *hdr_end = find_header_end(
         connection->buffered.data, connection->buffered.n);
     while (!hdr_end) {
         ssize_t n = recv(connection->fd, tmp, sizeof tmp, 0);
         if (n < 0) {
             if (ei_socket_errno() == EINTR) continue;
-            if ((ei_socket_errno() == EAGAIN || ei_socket_errno() == EWOULDBLOCK) &&
-                connection->buffered.n == 0) {
+            /* Between requests, a timeout or a reset is the client leaving. */
+            if (connection->buffered.n == 0 && ei_socket_errno() == ECONNRESET)
                 return HTTP_READ_CLOSED;
+            if (ei_socket_errno() == EAGAIN || ei_socket_errno() == EWOULDBLOCK) {
+                if (connection->buffered.n == 0) return HTTP_READ_CLOSED; /* idle */
+                snprintf(err, err_len, "timed out reading request headers");
+                return HTTP_READ_TIMEOUT;
             }
             snprintf(err, err_len, "failed to read request");
             return HTTP_READ_ERROR;
@@ -1030,6 +1080,7 @@ static http_read_result read_request(http_connection *connection,
             return HTTP_READ_ERROR;
         }
         sbuf_append(&connection->buffered, tmp, (size_t)n);
+        connection_timeout(connection, connection->request_ms); /* a request has started */
         hdr_end = find_header_end(
             connection->buffered.data, connection->buffered.n);
         if (!hdr_end && connection->buffered.n > MAX_HEADER_BYTES) {
@@ -1070,13 +1121,22 @@ static http_read_result read_request(http_connection *connection,
         return HTTP_READ_ERROR;
     }
 
+    /* A client that sent Expect: 100-continue (curl does for bodies over
+     * 1 KB) waits for this before sending the body. */
+    if (connection->buffered.n - body_start < body_len &&
+        header_has_token(headers, "expect", "100-continue")) {
+        static const char continue_line[] = "HTTP/1.1 100 Continue\r\n\r\n";
+        send_all(connection->fd, continue_line, sizeof continue_line - 1u);
+    }
     while (connection->buffered.n - body_start < body_len) {
         ssize_t n = recv(connection->fd, tmp, sizeof tmp, 0);
         if (n < 0) {
             if (ei_socket_errno() == EINTR) continue;
-            snprintf(err, err_len, "failed to read request body");
+            bool timed_out = ei_socket_errno() == EAGAIN || ei_socket_errno() == EWOULDBLOCK;
+            snprintf(err, err_len, timed_out ? "timed out reading request body"
+                                             : "failed to read request body");
             free(headers);
-            return HTTP_READ_ERROR;
+            return timed_out ? HTTP_READ_TIMEOUT : HTTP_READ_ERROR;
         }
         if (n == 0) {
             snprintf(err, err_len, "client closed connection before body completed");
@@ -1186,7 +1246,7 @@ static void handle_embed(ei_socket fd, ei_inference_service *service,
     bool any_structured = false;
     for (size_t i = 0; i < inputs.n; ++i)
         any_structured |= inputs.structured[i];
-    bool embedded = true;
+    bool embedded = true, backend_failed = false;
     if (any_structured) {
         for (size_t i = 0; i < inputs.n && embedded; ++i) {
             size_t count = 0;
@@ -1195,13 +1255,14 @@ static void handle_embed(ei_socket fd, ei_inference_service *service,
                                             &count, err, sizeof err);
             } else
                 embedded = ei_inference_service_embed_batch_with_usage(
-                    service, texts + i, lengths + i, 1, embeddings + i * EI_N_EMBD, &count, err,
-                    sizeof err);
+                    service, texts + i, lengths + i, 1, embeddings + i * EI_N_EMBD, &count,
+                    &backend_failed, err, sizeof err);
             prompt_tokens += count;
         }
     } else
         embedded = ei_inference_service_embed_batch_with_usage(
-            service, texts, lengths, inputs.n, embeddings, &prompt_tokens, err, sizeof err);
+            service, texts, lengths, inputs.n, embeddings, &prompt_tokens, &backend_failed, err,
+            sizeof err);
     if (!embedded) {
         free(embeddings);
         free(lengths);
@@ -1209,8 +1270,10 @@ static void handle_embed(ei_socket fd, ei_inference_service *service,
         free(owned_cache_key);
         free_inputs(&inputs);
         free(model.s);
-        embedding_http_error(fd, api, 400, "Bad Request", err, "input",
-                             keep_alive);
+        if (backend_failed) /* valid inputs the engine failed to run: not the client's fault */
+            embedding_http_error(fd, api, 500, "Internal Server Error", err, NULL, keep_alive);
+        else
+            embedding_http_error(fd, api, 400, "Bad Request", err, "input", keep_alive);
         return;
     }
 
@@ -1324,6 +1387,8 @@ static bool handle_client(http_connection *connection,
     if (read_result != HTTP_READ_OK) {
         if (read_result == HTTP_READ_ERROR) {
             http_error(connection->fd, 400, "Bad Request", err, false);
+        } else if (read_result == HTTP_READ_TIMEOUT) {
+            http_error(connection->fd, 408, "Request Timeout", err, false);
         }
         return false;
     }
@@ -1687,6 +1752,7 @@ static void usage(const char *argv0) {
             "          [--max-client-batch-size N] [--tokenizer-workers N]\n"
             "          [--batch-wait-us N] [--keepalive-connections N]\n"
             "          [--keepalive-max-requests N] [--keepalive-timeout-ms N]\n"
+            "          [--request-timeout-ms N]\n"
             "          [--response-cache-mb N] [--persistent-cache-path PATH]\n"
             "          [--pipeline-slots N]  (embeddinggemma-2 GPU waves in flight, 1..8)\n"
             "          [--media-slots N]  (embeddinggemma-2 GPU media contexts in flight, 1..8; default 2)\n"
@@ -1755,6 +1821,7 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
     opts->keepalive_connections = 0;
     opts->keepalive_max_requests = 100;
     opts->keepalive_timeout_ms = 1000;
+    opts->request_timeout_ms = 30000;
     opts->response_cache_bytes = 64u * 1024u * 1024u;
     opts->persistent_cache_path = NULL;
     for (int i = 1; i < argc; i++) {
@@ -1856,6 +1923,10 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
             size_t value;
             if (!parse_size_arg(argv[++i], 1, 60000, &value)) return false;
             opts->keepalive_timeout_ms = (uint32_t)value;
+        } else if (strcmp(argv[i], "--request-timeout-ms") == 0 && i + 1 < argc) {
+            size_t value;
+            if (!parse_size_arg(argv[++i], 1, 3600000, &value)) return false;
+            opts->request_timeout_ms = (uint32_t)value;
         } else if (strcmp(argv[i], "--response-cache-mb") == 0 && i + 1 < argc) {
             size_t value;
             if (!parse_size_arg(argv[++i], 0, 4096, &value)) return false;
@@ -1963,18 +2034,11 @@ static void *server_worker_main(void *opaque) {
     server_worker *worker = opaque;
     for (;;) {
         ei_socket fd = socket_queue_pop(worker->queue);
-        http_connection connection = { .fd = fd };
-#ifdef _WIN32
-        DWORD receive_timeout = worker->opts->keepalive_timeout_ms;
-#else
-        struct timeval receive_timeout = {
-            .tv_sec = worker->opts->keepalive_timeout_ms / 1000u,
-            .tv_usec = (suseconds_t)(
-                worker->opts->keepalive_timeout_ms % 1000u) * 1000,
+        http_connection connection = {
+            .fd = fd,
+            .idle_ms = worker->opts->keepalive_timeout_ms,
+            .request_ms = worker->opts->request_timeout_ms,
         };
-#endif
-        ei_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
-                   sizeof receive_timeout);
         bool keepalive_slot = worker->opts->keepalive_max_requests > 1 &&
             keepalive_limiter_try_acquire(worker->keepalive);
         for (size_t request = 0;; request++) {

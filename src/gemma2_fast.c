@@ -11,6 +11,7 @@
 #include "gemma2_fast_x86.h"
 #include "gemma2_media_x86.h"
 #include "gemma2_vnni256.h"
+#include "gemma2_sgemm_x86.h"
 #include "kernels.h"
 #include <math.h>
 #include <pthread.h>
@@ -641,7 +642,48 @@ static void f_rows(void *opaque, int32_t begin, int32_t end) {
         }
     }
 }
+/* x86 packed fp32 GEMM (gemma2_sgemm_x86.c): tasks are 4 panels (64 outputs)
+ * x 48 tokens. EI_GEMMA2_CPU_SGEMM=0 restores f_rows. The repack cache is
+ * keyed by the weight data (stable per mapping; callers pass tensor copies
+ * with adjusted shapes, so the struct address is not a key). */
+#if defined(__x86_64__)
+typedef struct {
+    const void *w;
+    const float *x;
+    float *y;
+    int n, panel_tasks, panels;
+} sgemm_job;
+static void sgemm_tasks(void *opaque, int32_t begin, int32_t end) {
+    sgemm_job *j = opaque;
+    for (int task = begin; task < end; task++) {
+        int pb = task % j->panel_tasks, tb = task / j->panel_tasks;
+        int p0 = pb * 4, np = j->panels - p0 < 4 ? j->panels - p0 : 4;
+        int t0 = tb * 48, t1 = t0 + 48 < j->n ? t0 + 48 : j->n;
+        g2s_block(j->w, j->x, t0, t1, p0, np, j->y);
+    }
+}
+static bool gemm_f_sgemm(ei_thread_pool *pool, const ei_tensor *w, const float *x, int n, float *y) {
+    int k = (int)w->ne[0], m = (int)w->ne[1];
+    if (!g2s_enabled() || m % 16)
+        return false;
+    pthread_mutex_lock(&weight_cache_lock);
+    const void *pw = g2s_weight_of(w->data, w->data, (int)w->type, m, k, pool);
+    pthread_mutex_unlock(&weight_cache_lock);
+    if (!pw)
+        return false;
+    sgemm_job j = {pw, x, y, n, (m / 16 + 3) / 4, m / 16};
+    PROF(1, ei_parallel_for(pool, j.panel_tasks * ((n + 47) / 48), 1, sgemm_tasks, &j));
+    return true;
+}
+#else
+static bool gemm_f_sgemm(ei_thread_pool *pool, const ei_tensor *w, const float *x, int n, float *y) {
+    (void)pool, (void)w, (void)x, (void)n, (void)y;
+    return false;
+}
+#endif
 static void gemm_f(ei_thread_pool *pool, const ei_tensor *w, const float *x, int n, float *y) {
+    if (gemm_f_sgemm(pool, w, x, n, y))
+        return;
     f_job j = {w, x, y, (int)w->ne[0], (int)w->ne[1], n};
     if (j.k > 1024 || j.k % 4)
         ei_die("gemm_f supports k <= 1024, multiple of 4");

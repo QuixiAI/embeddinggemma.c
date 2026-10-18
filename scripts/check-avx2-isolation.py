@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify that a portable x86-64 executable keeps AVX code inside the
-runtime-dispatched ei_avx2_* kernels.
+runtime-dispatched kernels: ei_avx2_* (kernels_avx2.c) and the EmbeddingGemma 2
+g2x_* / q8_tile_* kernels (gemma2_fast_x86.c, behind __builtin_cpu_supports).
 
 Every other function must run on an SSE2-only CPU, so it must not contain a
 VEX-encoded instruction (mnemonics starting with "v") or touch a ymm/zmm
@@ -12,6 +13,7 @@ import subprocess
 import sys
 
 FUNCTION = re.compile(r"^[0-9a-f]+ <(?P<name>[^>]+)>:$")
+DISPATCHED_PREFIXES = ("ei_avx2_", "g2x_", "q8_tile_")
 INSTRUCTION = re.compile(r"^\s*[0-9a-f]+:\s+(?P<mnemonic>[a-z][a-z0-9.]*)\s*(?P<operands>.*)$")
 
 
@@ -43,6 +45,8 @@ def main() -> int:
             continue
         if function.startswith("ei_avx2_"):
             dispatched.add(function)
+        elif function.startswith(DISPATCHED_PREFIXES):
+            pass
         else:
             leaks.setdefault(function, f"{mnemonic} {operands}".strip())
 

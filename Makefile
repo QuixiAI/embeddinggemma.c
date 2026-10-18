@@ -108,7 +108,7 @@ SRCS_CORE := src/gguf.c
 SRCS_MODEL := $(SRCS_CORE) src/model.c
 SRCS_TOKENIZER := $(SRCS_MODEL) src/tokenizer.c
 SRCS_KERNELS := src/quants.c src/kernels.c src/kernels_avx2.c
-SRCS_ENGINE := $(SRCS_TOKENIZER) $(SRCS_KERNELS) src/parallel.c src/engine.c src/gemma2.c src/gemma2_fast.c src/gemma2_fast_x86.c src/media.c src/response_cache.c
+SRCS_ENGINE := $(SRCS_TOKENIZER) $(SRCS_KERNELS) src/parallel.c src/engine.c src/gemma2.c src/gemma2_fast.c src/gemma2_fast_x86.c src/gemma2_media_x86.c src/media.c src/response_cache.c
 SRCS_SERVICE := src/inference_service.c
 SRCS_SERVER := src/server.c src/float_format.c
 
@@ -761,3 +761,11 @@ $(BUILD)/test_windows_paths: src/test_windows_paths.c src/windows_compat.h src/c
 test-windows-download: $(BUILD)/embeddinggemma $(BUILD)/test_downloader_fixture $(BUILD)/test_windows_paths
 	./$(BUILD)/test_windows_paths
 	python3 testdata/test_windows_download.py --binary ./$(BUILD)/embeddinggemma.exe --downloader ./$(BUILD)/test_downloader_fixture.exe
+
+# Tiled attention kernel (gemma2_media_x86.c) against its scalar reference and fp64.
+$(BUILD)/test_gemma2_attn: src/test_gemma2_attn.c $(SRCS_ENGINE) $(HDRS_NATIVE) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/test_gemma2_attn.c $(SRCS_ENGINE) $(LDLIBS)
+
+.PHONY: test-gemma2-attn
+test-gemma2-attn: $(BUILD)/test_gemma2_attn
+	./$(BUILD)/test_gemma2_attn

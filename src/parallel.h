@@ -25,6 +25,17 @@ void ei_thread_pool_unbind_caller(const ei_cpu_binding *saved);
 /* Logical CPUs in placement order: one hardware thread per core first, grouped
  * by shared L3, then SMT siblings (Linux sysfs; identity elsewhere). */
 int32_t ei_cpu_placement(int32_t *cpus, int32_t max);
+/* Hybrid CPUs. Allowed CPUs (the process affinity mask) in the
+ * order P-core primary threads, E-cores, P-core SMT siblings; *performance =
+ * number of P-core primaries. Returns 0 when the CPU does not report hybrid
+ * core types (/sys/devices/cpu_core, cpu_atom). */
+int32_t ei_cpu_hybrid_order(int32_t *cpus, int32_t max, int32_t *performance);
+/* At most `threads` threads (caller included) join subsequent calls; values
+ * outside 1..threads() restore the full pool. Set between calls only. */
+void ei_thread_pool_set_cap(ei_thread_pool *pool, int32_t threads);
+/* Leading pool threads pinned to P-cores (0 = unknown / not hybrid). */
+int32_t ei_thread_pool_performance_threads(const ei_thread_pool *pool);
+void ei_thread_pool_set_performance_threads(ei_thread_pool *pool, int32_t threads);
 void ei_thread_pool_destroy(ei_thread_pool *pool);
 int32_t ei_thread_pool_threads(const ei_thread_pool *pool);
 /* Online logical CPUs (at least 1). */

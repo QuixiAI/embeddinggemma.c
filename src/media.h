@@ -14,6 +14,11 @@ typedef struct {
     /* Optional: held only around engine calls (towers and the final text
      * pass), so decoding and feature extraction run concurrently. */
     pthread_mutex_t *lock;
+    /* Optional: taken before `lock` around the same engine calls
+     * on the CPU backend, so one media request at a time is inside the towers
+     * and a tower can hand `lock` to waiting text waves between layers
+     * (ei_gemma2_cpu_yield) without letting another media request in. */
+    pthread_mutex_t *outer_lock;
     /* Optional: runs the final text pass over the assembled input rows
      * (e.g. packed with other requests' finishes) instead of the engine call. */
     bool (*finish)(void *ctx, const float *inputs, size_t n, float *out, char *err,

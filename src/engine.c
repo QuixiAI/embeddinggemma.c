@@ -24,6 +24,32 @@ static void set_err(char *err, size_t err_len, const char *msg) {
     }
 }
 
+/* On hybrid CPUs (P-cores + E-cores) the gemma2 CPU pool is
+ * pinned in the order P-core primary threads, E-cores, P-core SMT siblings,
+ * and records how many leading threads sit on P-cores, so the graphs can keep
+ * small waves on the fast cores (ei_thread_pool_set_cap) and spread large ones
+ * over every core. EI_CPU_HYBRID=0, a non-hybrid CPU, or more threads than
+ * allowed CPUs keep the unpinned pool. */
+static ei_thread_pool *gemma2_cpu_pool(void) {
+    const char *flag = getenv("EI_CPU_HYBRID");
+    if (!(flag && !strcmp(flag, "0"))) {
+        int32_t n = ei_cpu_count(), performance = 0;
+        int32_t *order = ei_xmalloc((size_t)n * sizeof *order);
+        int32_t ordered = ei_cpu_hybrid_order(order, n, &performance);
+        /* The pool's own count: EI_THREADS (set by --threads), else every online CPU up to 32. */
+        const char *env = getenv("EI_THREADS");
+        int32_t threads = env && *env ? atoi(env) : (n < 32 ? n : 32);
+        if (ordered > 0 && performance > 0 && threads > 0 && threads <= ordered) {
+            ei_thread_pool *pool = ei_thread_pool_create_pinned(threads, 50, order);
+            ei_thread_pool_set_performance_threads(pool, performance < threads ? performance : threads);
+            free(order);
+            return pool;
+        }
+        free(order);
+    }
+    return ei_thread_pool_create_spin(0, 50);
+}
+
 void ei_engine_load_backend(ei_engine *e, const char *model_path, const char *backend) {
     memset(e, 0, sizeof *e);
     ei_model_load(&e->model, model_path);
@@ -58,7 +84,7 @@ void ei_engine_load_backend(ei_engine *e, const char *model_path, const char *ba
         if (!e->gemma2_metal && strcmp(requested, "auto") && strcmp(requested, "cpu"))
             ei_die("EmbeddingGemma 2 backend '%s' is not available in this build", requested);
         // Short CPU waves are wake-up bound; the gemma2 pool spins 50 us.
-        if (!e->gemma2_metal) e->thread_pool = ei_thread_pool_create_spin(0, 50);
+        if (!e->gemma2_metal) e->thread_pool = gemma2_cpu_pool();
         return;
     }
     e->short_projection_threads = 6;

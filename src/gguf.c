@@ -120,6 +120,37 @@ static uint64_t tensor_bytes(const ei_tensor *t, const char *namebuf) {
     return n * bb;
 }
 
+/* Read-only file mappings currently open, so callers can tell a tensor in a
+ * GGUF mapping (pages re-readable from the file) from anonymous memory (where
+ * dropping pages would lose data). */
+#include <pthread.h>
+enum { EI_GGUF_MAPS = 16 };
+static struct {
+    const uint8_t *base;
+    size_t len;
+} gguf_maps[EI_GGUF_MAPS];
+static pthread_mutex_t gguf_maps_lock = PTHREAD_MUTEX_INITIALIZER;
+static void gguf_maps_set(const uint8_t *base, size_t len, const uint8_t *old) {
+    pthread_mutex_lock(&gguf_maps_lock);
+    for (int i = 0; i < EI_GGUF_MAPS; i++)
+        if (gguf_maps[i].base == old) {
+            gguf_maps[i].base = base;
+            gguf_maps[i].len = base ? len : 0;
+            break;
+        }
+    pthread_mutex_unlock(&gguf_maps_lock);
+}
+bool ei_gguf_in_mapping(const void *p, size_t n) {
+    const uint8_t *a = p;
+    bool found = false;
+    pthread_mutex_lock(&gguf_maps_lock);
+    for (int i = 0; i < EI_GGUF_MAPS && !found; i++)
+        found = gguf_maps[i].base && a >= gguf_maps[i].base &&
+                a + n <= gguf_maps[i].base + gguf_maps[i].len;
+    pthread_mutex_unlock(&gguf_maps_lock);
+    return found;
+}
+
 void ei_gguf_open(ei_gguf *g, const char *path) {
     memset(g, 0, sizeof *g);
 
@@ -146,8 +177,8 @@ void ei_gguf_open(ei_gguf *g, const char *path) {
     g->map = mmap(NULL, g->map_len, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (g->map == MAP_FAILED) ei_die("%s: mmap failed", path);
-
 #endif
+    gguf_maps_set(g->map, g->map_len, NULL);
 
     cur c = { g->map, g->map + g->map_len, path };
 
@@ -224,6 +255,7 @@ void ei_gguf_close(ei_gguf *g) {
     }
     free(g->kv);
     free(g->tensors);
+    if (g->map) gguf_maps_set(NULL, 0, g->map);
 #ifdef _WIN32
     if (g->map) UnmapViewOfFile(g->map);
 #else

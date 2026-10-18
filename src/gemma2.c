@@ -2,6 +2,39 @@
 #include "kernels.h"
 #include <math.h>
 
+/* Model semantics (see gemma2.h). The default is llama.cpp's behaviour, which
+ * the goldens in testdata/ were produced with; EI_GEMMA2_SEMANTICS=official
+ * selects the official processor's. Read once. */
+bool ei_gemma2_official_semantics(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("EI_GEMMA2_SEMANTICS");
+        on = e && !strcmp(e, "official");
+    }
+    return on;
+}
+/* Vision MLP activation: EI_GEMMA2_VISION_GELU=tanh|quick overrides; else the
+ * official semantics use tanh GELU and the default follows the GGUF's
+ * clip.use_gelu, which this model's conversion leaves unset (QuickGELU). */
+bool ei_gemma2_vision_tanh_gelu(const ei_gguf *g) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("EI_GEMMA2_VISION_GELU");
+        mode = !e ? 2 : !strcmp(e, "tanh") ? 1 : 0;
+    }
+    if (mode != 2)
+        return mode;
+    return ei_gemma2_official_semantics() || ei_gguf_kv_bool(g, "clip.use_gelu", false);
+}
+/* Installed once at startup by a server that shares the engine pool between
+ * CPU media towers and text waves; the towers call it between layers. */
+static void (*cpu_yield_hook)(void);
+void ei_gemma2_set_cpu_yield(void (*hook)(void)) { cpu_yield_hook = hook; }
+void ei_gemma2_cpu_yield(void) {
+    if (cpu_yield_hook)
+        cpu_yield_hook();
+}
+
 /* Tensor storage is [input, output]; activations are contiguous token rows. */
 static const ei_tensor *tensor(const ei_gguf *g, const char *name) {
     return ei_gguf_tensor(g, name, true);

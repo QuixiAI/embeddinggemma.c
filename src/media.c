@@ -6,6 +6,7 @@
 #include "gemma2_cuda.h"
 #endif
 #include "media.h"
+#include "gemma2.h"
 #include <pthread.h>
 #include <math.h>
 #include <limits.h>
@@ -326,6 +327,19 @@ static void cache_soft_store(const ei_media_input *m, const unsigned char key[24
     ei_response_cache_insert(m->cache, (const char *)key, 24, blob, bytes);
     free(blob);
 }
+/* Engine sections of a media request (outer_lock, then lock). */
+static void engine_lock(ei_media_input *m) {
+    if (m->outer_lock)
+        pthread_mutex_lock(m->outer_lock);
+    if (m->lock)
+        pthread_mutex_lock(m->lock);
+}
+static void engine_unlock(ei_media_input *m) {
+    if (m->lock)
+        pthread_mutex_unlock(m->lock);
+    if (m->outer_lock)
+        pthread_mutex_unlock(m->outer_lock);
+}
 bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budget, char *err,
                     size_t err_len) {
     size_t size = 0;
@@ -406,8 +420,7 @@ bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budge
     float *soft = NULL;
     size_t n = 0;
     bool ok;
-    if (m->lock)
-        pthread_mutex_lock(m->lock);
+    engine_lock(m);
 #if defined(EI_ENABLE_METAL)
     if (m->metal) ok = ei_gemma2_metal_vision(m->metal, m->projector, canvas, tw, th, &soft, &n, err, err_len);
     else
@@ -417,8 +430,7 @@ bool ei_media_image(ei_media_input *m, const char *base64, size_t len, int budge
     else
 #endif
     ok = ei_gemma2_vision(m->projector, m->pool, canvas, tw, th, &soft, &n, err, err_len);
-    if (m->lock)
-        pthread_mutex_unlock(m->lock);
+    engine_unlock(m);
     MEDIA_STAGE("vision", t0);
     free(canvas);
     if (ok && keyed)
@@ -528,12 +540,10 @@ void ei_media_frames_encode(ei_media_input *m, ei_media_frame *frames, size_t n)
         float *soft = NULL;
         size_t total = 0;
         char err[160];
-        if (m->lock)
-            pthread_mutex_lock(m->lock);
+        engine_lock(m);
         bool ok = ei_gemma2_metal_vision_frames(m->metal, m->projector, rgb, (int)batch, f->width,
                                                 f->height, &soft, &total, err, sizeof err);
-        if (m->lock)
-            pthread_mutex_unlock(m->lock);
+        engine_unlock(m);
         if (ok) {
             size_t each = total / batch;
             for (size_t j = 0; j < batch; j++) {
@@ -588,8 +598,7 @@ bool ei_media_image_commit(ei_media_input *m, ei_media_frame *frame, const char 
         return true;
     }
     size_t n = 0;
-    if (m->lock)
-        pthread_mutex_lock(m->lock);
+    engine_lock(m);
 #if defined(EI_ENABLE_METAL)
     if (m->metal) ok = ei_gemma2_metal_vision(m->metal, m->projector, canvas, frame->width, frame->height, &soft, &n, err, err_len);
     else
@@ -599,8 +608,7 @@ bool ei_media_image_commit(ei_media_input *m, ei_media_frame *frame, const char 
     else
 #endif
     ok = ei_gemma2_vision(m->projector, m->pool, canvas, frame->width, frame->height, &soft, &n, err, err_len);
-    if (m->lock)
-        pthread_mutex_unlock(m->lock);
+    engine_unlock(m);
     free(canvas);
     if (ok && frame->keyed)
         cache_soft_store(m, frame->key, soft, n);
@@ -618,7 +626,7 @@ static uint16_t u16(const uint8_t *p) {
 /* Radix-2 FFT, unnormalized, for the model's 512-point STFT. Twiddles are
  * tabulated once with the same expression the butterflies used to evaluate
  * per call (2,304 cosf/sinf pairs per frame), so results are unchanged. */
-static float fft_cos[512], fft_sin[512];
+static float fft_cos[512], fft_sin[512], hann[320];
 static pthread_once_t fft_once = PTHREAD_ONCE_INIT;
 static void fft_tables(void) {
     for (int width = 2; width <= 512; width *= 2)
@@ -627,6 +635,9 @@ static void fft_tables(void) {
             fft_cos[width / 2 + j] = cosf(theta);
             fft_sin[width / 2 + j] = sinf(theta);
         }
+    /* The analysis window: the same expression once instead of per frame. */
+    for (int j = 0; j < 320; ++j)
+        hann[j] = 0.5f - 0.5f * cosf(6.283185307179586f * j / 320);
 }
 static void fft(float re[512], float im[512]) {
     pthread_once(&fft_once, fft_tables);
@@ -654,6 +665,47 @@ static void fft(float re[512], float im[512]) {
                 re[a] += r;
                 im[a] += v;
             }
+}
+static bool logmel_hf(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("EI_GEMMA2_AUDIO_LOGMEL"); /* explicit override: hf | max */
+        on = e ? !strcmp(e, "hf") : ei_gemma2_official_semantics();
+    }
+    return on;
+}
+
+/* Log-mel frames [begin, end) of one chunk; frames are
+ * independent, so the CPU path runs them on the engine pool. */
+typedef struct {
+    const float *pcm, (*filters)[257];
+    const int *first, *last;
+    size_t count;
+    float *mel;
+    bool hf;
+} mel_job;
+static void mel_frames(void *opaque, int32_t begin, int32_t end) {
+    const mel_job *j = opaque;
+    for (int t = begin; t < end; ++t) {
+        float re[512] = {0}, im[512] = {0}, mag[257];
+        for (int k = 0; k < 320; ++k) {
+            int pos = t * 160 + k - 160;
+            if (pos >= 0 && (size_t)pos < j->count)
+                re[k] = j->pcm[pos] * hann[k];
+        }
+        fft(re, im);
+        for (int f = 0; f < 257; ++f)
+            mag[f] = sqrtf(re[f] * re[f] + im[f] * im[f]);
+        for (int bin = 0; bin < 128; ++bin) {
+            double sum = 0;
+            for (int f = j->first[bin]; f <= j->last[bin]; ++f)
+                sum += mag[f] * j->filters[bin][f];
+            /* The default matches llama.cpp: log(max(mel, floor)).
+             * EI_GEMMA2_SEMANTICS=official (or EI_GEMMA2_AUDIO_LOGMEL=hf) uses the
+             * Transformers extractor's log(mel + floor). */
+            j->mel[(size_t)t * 128 + bin] = j->hf ? (float)log(sum + 0.001) : logf(fmaxf(0.001f, (float)sum));
+        }
+    }
 }
 bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err, size_t err_len) {
     size_t size = 0;
@@ -765,32 +817,32 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
         /* A sub-frame tail still carries signal; pad it to one analysis frame. */
         if (frames < 1) frames = 1;
         MEDIA_STAGE("wav", t0);
+        /* On the CPU tower path the frames run on the engine
+         * pool, so the engine lock is taken here (it covers the tower anyway). */
+        bool cpu_tower = !m->audio;
+#if defined(EI_ENABLE_METAL)
+        if (m->metal) cpu_tower = false;
+#endif
+#if defined(EI_ENABLE_CUDA)
+        if (m->cuda) cpu_tower = false;
+#endif
+        if (cpu_tower)
+            engine_lock(m);
+        pthread_once(&fft_once, fft_tables);
         float *mel = ei_xcalloc((size_t)frames * 128, sizeof(float));
-        for (int t = 0; t < frames; ++t) {
-            float re[512] = {0}, im[512] = {0}, mag[257];
-            for (int j = 0; j < 320; ++j) {
-                int pos = t * 160 + j - 160;
-                if (pos >= 0 && (size_t)pos < count)
-                    re[j] = pcm[offset + pos] * (0.5f - 0.5f * cosf(6.283185307179586f * j / 320));
-            }
-            fft(re, im);
-            for (int f = 0; f < 257; ++f)
-                mag[f] = sqrtf(re[f] * re[f] + im[f] * im[f]);
-            for (int bin = 0; bin < 128; ++bin) {
-                double sum = 0;
-                for (int f = first[bin]; f <= last[bin]; ++f)
-                    sum += mag[f] * filters[bin][f];
-                mel[(size_t)t * 128 + bin] = logf(fmaxf(0.001f, (float)sum));
-            }
-        }
+        mel_job mj = {pcm + offset, (const float(*)[257])filters, first, last, count, mel, logmel_hf()};
+        if (cpu_tower)
+            ei_parallel_for(m->pool, frames, 16, mel_frames, &mj);
+        else
+            mel_frames(&mj, 0, frames);
         MEDIA_STAGE("logmel", t0);
         float *soft = NULL;
         size_t n = 0;
         if (m->audio)
             ok = m->audio(m->audio_ctx, mel, frames, &soft, &n, err, err_len);
         else {
-            if (m->lock)
-                pthread_mutex_lock(m->lock);
+            if (!cpu_tower)
+                engine_lock(m);
 #if defined(EI_ENABLE_METAL)
             if (m->metal) ok = ei_gemma2_metal_audio(m->metal, m->projector, mel, frames, &soft, &n, err, err_len);
             else
@@ -800,8 +852,7 @@ bool ei_media_audio(ei_media_input *m, const char *base64, size_t len, char *err
             else
 #endif
             ok = ei_gemma2_audio(m->projector, m->pool, mel, frames, &soft, &n, err, err_len);
-            if (m->lock)
-                pthread_mutex_unlock(m->lock);
+            engine_unlock(m);
         }
         MEDIA_STAGE("audio", t0);
         free(mel);
@@ -834,11 +885,9 @@ bool ei_media_finish(ei_media_input *m, float out[768], char *err, size_t err_le
     if (m->finish)
         ok = m->finish(m->finish_ctx, m->inputs, m->n, out, err, err_len);
     else {
-        if (m->lock)
-            pthread_mutex_lock(m->lock);
+        engine_lock(m);
         ok = finish_text(m, out, err, err_len);
-        if (m->lock)
-            pthread_mutex_unlock(m->lock);
+        engine_unlock(m);
     }
     if (media_timing())
         fprintf(stderr, "media finish     %7.2f ms (%zu rows)\n", media_now_ms() - t0, m->n);

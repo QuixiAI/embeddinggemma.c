@@ -177,8 +177,12 @@ The target is the hardware ceiling under many concurrent requests (SlimServe
 - **Front-end wins that cost nothing numerically:** table base64 (18x) and
   libcompression inflate for PNG IDAT (1.65x), both byte-identical. Compare
   HTTP responses with `cmp`, and send unique bodies: the response cache
-  serves repeats, and curl's `Expect: 100-continue` breaks this server's
-  body read.
+  serves repeats.
+- **The keep-alive idle timeout used to bound the request body read** (issue
+  #2, fixed 2026-10-18): a client pausing over 1 s between headers and body,
+  or curl waiting on `Expect: 100-continue`, got a silent 400 that a retry
+  fixed. Reads now switch to `--request-timeout-ms` once a request starts,
+  `Expect` is answered, and every error response is logged.
 
 ## EmbeddingGemma 2 text lessons (2026-10-11)
 

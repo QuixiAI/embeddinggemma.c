@@ -1135,13 +1135,14 @@ bool ei_inference_service_embed_batch(ei_inference_service *service,
                                       size_t batch_size, float *out,
                                       char *err, size_t err_len) {
     return ei_inference_service_embed_batch_with_usage(
-        service, texts, text_lengths, batch_size, out, NULL, err, err_len);
+        service, texts, text_lengths, batch_size, out, NULL, NULL, err, err_len);
 }
 
 bool ei_inference_service_embed_batch_with_usage(
     ei_inference_service *service, const char *const *texts,
     const size_t *text_lengths, size_t batch_size, float *out,
-    size_t *prompt_tokens, char *err, size_t err_len) {
+    size_t *prompt_tokens, bool *backend_failed, char *err, size_t err_len) {
+    if (backend_failed) *backend_failed = false;
     if (!service || !service->tokenizer || !texts || !text_lengths ||
         batch_size == 0) {
         set_error(err, err_len, "embedding batch must contain at least one input");
@@ -1223,7 +1224,10 @@ bool ei_inference_service_embed_batch_with_usage(
         if (!await_entry_locked(service, entries[i],
                                 out + i * EI_N_EMBD,
                                 item_error, sizeof item_error)) {
+            /* Entries fail only when the backend could not execute them;
+             * input validation happened before submission. */
             if (ok) snprintf(first_error, sizeof first_error, "%s", item_error);
+            if (backend_failed) *backend_failed = true;
             ok = false;
         }
     }

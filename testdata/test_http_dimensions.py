@@ -111,6 +111,59 @@ def check_keep_alive(base_url):
             raise AssertionError("server did not close after Connection: close")
 
 
+def read_status_line(connection):
+    connection.settimeout(10)
+    data = b""
+    while b"\r\n" not in data:
+        chunk = connection.recv(256)
+        if not chunk:
+            break
+        data += chunk
+    return data.split(b"\r\n", 1)[0].decode("ascii", "replace"), data
+
+
+def check_request_timeouts(base_url, request_timeout_s):
+    """Issue #2: the keep-alive idle timeout (1 s) also bounded the body read,
+    so a client pausing between headers and body got a silent 400."""
+    port = int(base_url.rsplit(":", 1)[1])
+    body = json.dumps({"input": ["request timeout regression " + "x" * 2000]}).encode()
+    head = (
+        "POST /api/embed HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\nConnection: close\r\n"
+    ).encode()
+    # A pause longer than the idle timeout but inside the request timeout is served.
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+        connection.sendall(head + b"\r\n")
+        time.sleep(1.5)
+        connection.sendall(body)
+        status, _ = read_status_line(connection)
+        if not status.startswith("HTTP/1.1 200 "):
+            raise AssertionError(f"paused body was not served: {status!r}")
+    # Expect: 100-continue gets an interim response, then the request is served.
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+        connection.sendall(head + b"Expect: 100-continue\r\n\r\n")
+        status, data = read_status_line(connection)
+        if status != "HTTP/1.1 100 Continue":
+            raise AssertionError(f"Expect: 100-continue was not answered: {status!r}")
+        connection.sendall(body)
+        rest = data.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in data else b""
+        while b"\r\n" not in rest:
+            chunk = connection.recv(256)
+            if not chunk:
+                break
+            rest += chunk
+        final = rest.split(b"\r\n", 1)[0].decode("ascii", "replace")
+        if not final.startswith("HTTP/1.1 200 "):
+            raise AssertionError(f"request after 100 Continue failed: {final!r}")
+    # A body that stalls past the request timeout is a 408, not a 400.
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+        connection.sendall(head + b"\r\n" + body[:10])
+        time.sleep(request_timeout_s + 1.0)
+        status, _ = read_status_line(connection)
+        if not status.startswith("HTTP/1.1 408 "):
+            raise AssertionError(f"stalled body did not time out with 408: {status!r}")
+
+
 def check_discovery(base_url):
     content_type, body = get(base_url + "/")
     if content_type != "application/json":
@@ -377,6 +430,8 @@ def main():
         str(port),
         "--workers",
         "4",
+        "--request-timeout-ms",
+        "2500",
     ]
     process = subprocess.Popen(
         command,
@@ -388,6 +443,7 @@ def main():
         wait_until_ready(process, base_url)
         check_discovery(base_url)
         check_keep_alive(base_url)
+        check_request_timeouts(base_url, 2.5)
         check_dimensions(base_url)
         check_openai_compatibility(base_url)
     finally:

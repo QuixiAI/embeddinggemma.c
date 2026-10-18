@@ -11,6 +11,7 @@
 #include "gemma2_fast_x86.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
+#include <cpuid.h>
 #include <immintrin.h>
 #include <math.h>
 #include <stdlib.h>
@@ -21,6 +22,16 @@
 #define AVXVNNI __attribute__((target("avx2,fma,f16c,avxvnni")))
 
 static int wide512; /* repacked 512-bit VNNI GEMM (g2x_gemm512_tile) */
+/* AVX-VNNI (VEX-encoded VNNI): CPUID.(EAX=7,ECX=1):EAX[4]. Read directly because
+ * __builtin_cpu_supports("avxvnni") is rejected by clang before 19. */
+static int cpu_avxvnni(void) {
+    unsigned a, b, c, d;
+    if (__get_cpuid_max(0, NULL) < 7)
+        return 0;
+    __cpuid_count(7, 1, a, b, c, d);
+    (void)b, (void)c, (void)d;
+    return (a >> 4) & 1;
+}
 int g2x_level(void) {
     static int level = -1;
     if (level >= 0)
@@ -30,7 +41,7 @@ int g2x_level(void) {
                __builtin_cpu_supports("f16c");
     int vnni512 = avx2 && __builtin_cpu_supports("avx512vl") &&
                   __builtin_cpu_supports("avx512vnni");
-    int avxvnni = avx2 && __builtin_cpu_supports("avxvnni");
+    int avxvnni = avx2 && cpu_avxvnni(); /* avx2 implies OS-enabled YMM state */
     level = vnni512 ? G2X_VNNI512 : avxvnni ? G2X_AVXVNNI : avx2 ? G2X_AVX2 : G2X_NONE;
     wide512 = vnni512 && __builtin_cpu_supports("avx512dq");
     const char *force = getenv("EI_GEMMA2_CPU_X86");
@@ -40,6 +51,8 @@ int g2x_level(void) {
         level = G2X_AVX2, wide512 = 0;
     else if (force && !strcmp(force, "vnni256"))
         wide512 = 0; /* VNNI tier, 256-bit Q8 tile */
+    else if (force && !strcmp(force, "avxvnni") && avxvnni)
+        level = G2X_AVXVNNI, wide512 = 0; /* the AVX-VNNI tier (repacked 256-bit GEMM) on an AVX-512 CPU */
     return level;
 }
 int g2x_gemm512_enabled(void) {

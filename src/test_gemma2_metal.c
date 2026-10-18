@@ -25,10 +25,11 @@ int main(int argc, char **argv) {
     if (argc != 3)
         ei_die("usage: %s text.gguf projector.gguf", argv[0]);
     // The fast route is EI_GEMMA2_ROUTE_FLAGS (comma-separated EI_GEMMA2_METAL_*
-    // names; the rest stay "0"), default FUSED,TENSOR2,FLASH2, the shipped
-    // default. The reference route has every flag off.
+    // names; the rest stay "0"), default the shipped stack for this GPU: the
+    // Metal 4 routes where they exist, else FUSED,SG,AFUSED. The reference
+    // route has every flag off.
     const char *all[] = {"TENSOR", "FLASH",   "GEMV",   "FUSED",  "TENSOR2",
-                         "FLASH2", "FLASH64", "VFUSED", "AFUSED", "LAYER"};
+                         "FLASH2", "FLASH64", "VFUSED", "AFUSED", "LAYER",  "SG"};
     char name[64];
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) {
         snprintf(name, sizeof name, "EI_GEMMA2_METAL_%s", all[i]);
@@ -37,13 +38,15 @@ int main(int argc, char **argv) {
     ei_engine e;
     ei_engine_load_backend(&e, argv[1], "metal");
     const char *route = getenv("EI_GEMMA2_ROUTE_FLAGS");
-    char *flags = strdup(route && *route ? route : "FUSED,TENSOR2,FLASH2,FLASH64,VFUSED,AFUSED"),
-         *save = NULL;
+    if (!route || !*route)
+        route = ei_gemma2_metal_has_metal4() ? "FUSED,TENSOR2,FLASH2,FLASH64,VFUSED,AFUSED"
+                                             : "FUSED,SG,AFUSED";
+    char *flags = strdup(route), *save = NULL;
     for (char *f = strtok_r(flags, ",", &save); f; f = strtok_r(NULL, ",", &save)) {
         snprintf(name, sizeof name, "EI_GEMMA2_METAL_%s", f);
         setenv(name, "1", 1);
     }
-    printf("fast route: %s\n", route && *route ? route : "FUSED,TENSOR2,FLASH2,FLASH64,VFUSED,AFUSED");
+    printf("fast route: %s\n", route);
     free(flags);
     char err[512];
     void *fast = ei_gemma2_metal_create(&e.model.gguf, err, sizeof err);

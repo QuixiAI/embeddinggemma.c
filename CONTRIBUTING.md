@@ -307,6 +307,17 @@ exactly (goldens identical to 9 digits):
   (width 64) uses the padded tensor kernel below (`FLASH64`), else the
   simdgroup flash kernel: any `matmul2d` flash at width 64 crashes the M5
   driver. `EI_GEMMA2_METAL_FLASH2_MIN_TOKENS` moves the threshold.
+- `EI_GEMMA2_METAL_SG=1`: from 32 tokens on GPUs without Metal 4 (default on
+  there, off where TENSOR2/FLASH2 run; `0` restores the scalar kernels), every
+  projection is a simdgroup-matrix GEMM (64 rows x 32 tokens per threadgroup,
+  Q8/BF16/F16/F32 weights decoded to fp16 tiles, FP32 accumulation; a
+  per-token scale from `g2s_rowscale` keeps a row past 16,384 in fp16's range
+  and is 1, bit for bit, otherwise) and widths 256/512 take a simdgroup flash
+  kernel (8 queries x 32 keys, online softmax, the same window and
+  packed-sequence masks, fp16 K/V written by the q/k/v norm pass). Short
+  waves keep the fused GEMVs. Needs the Apple7 GPU family (M1 and later);
+  older Mac GPUs keep the scalar kernels. Metal 3.1.
+  `EI_GEMMA2_METAL_SG_MIN_TOKENS` moves the threshold.
 - `EI_GEMMA2_METAL_SKIP=attn,mm,qkv,geglu,ple,post,qknorm`: diagnostic only;
   drops those dispatches to size their GPU share. Output is invalid (`attn`,
   `mm` and `post` also apply to the media towers).
@@ -452,7 +463,8 @@ Validate the default and each stack you change:
 make test-gemma2-metal
 EI_GEMMA2_METAL_FUSED=0 EI_GEMMA2_METAL_TENSOR2=0 EI_GEMMA2_METAL_FLASH2=0 EI_GEMMA2_METAL_TENSOR=1 EI_GEMMA2_METAL_FLASH=1 make test-gemma2-metal
 EI_GEMMA2_METAL_FUSED=0 EI_GEMMA2_METAL_TENSOR2=0 EI_GEMMA2_METAL_FLASH2=0 make test-gemma2-metal
-make test-gemma2-metal-routes   # default stack vs every route off
+make test-gemma2-metal-routes   # this GPU's default stack vs every route off
+EI_GEMMA2_ROUTE_FLAGS=FUSED,SG,AFUSED make test-gemma2-metal-routes   # the Metal 3 stack on a Metal 4 GPU
 EI_GEMMA2_ROUTE_FLAGS=TENSOR,FLASH make test-gemma2-metal-routes
 ```
 

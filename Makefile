@@ -84,7 +84,8 @@ METAL_SOURCES := \
 	src/metal/kernels/attention.metal \
 	src/metal/kernels/elementwise.metal \
 	src/metal/kernels/pool.metal \
-	src/metal/kernels/gemma2.metal
+	src/metal/kernels/gemma2.metal \
+	src/metal/kernels/gemma2_simdgroup.metal
 METAL_HEADERS := $(wildcard $(METAL_INCLUDE_DIR)/*.metal)
 METALLIB := $(BUILD)/embeddinggemma.metallib
 METAL4_SOURCES := \
@@ -421,7 +422,7 @@ $(METALLIB): $(METAL_SOURCES) $(METAL_HEADERS) | $(BUILD)
 	}
 	xcrun -sdk macosx metal $(METAL_FLAGS) -I$(METAL_INCLUDE_DIR) $(METAL_SOURCES) -o $@
 
-$(METAL4_METALLIB): $(METAL4_SOURCES) src/metal/kernels/gemma2.metal | $(BUILD)
+$(METAL4_METALLIB): $(METAL4_SOURCES) src/metal/kernels/gemma2.metal $(METAL_HEADERS) | $(BUILD)
 	@xcrun --find metal >/dev/null 2>&1 || { \
 		echo "error: Metal compiler not found; install/select full Xcode with xcode-select" >&2; \
 		exit 1; \

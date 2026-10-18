@@ -13,7 +13,7 @@
 
 static const char *route_flags[] = {"TENSOR", "FLASH",  "GEMV",   "FUSED",  "TENSOR2",
                                     "FLASH2", "NOEPI", "FLASH64", "VFUSED", "AFUSED",
-                                    "LAYER",  "FLASH2_TILE", "LAYER_GROUPS"};
+                                    "LAYER",  "FLASH2_TILE", "LAYER_GROUPS", "SG"};
 
 static void set_route(const char *spec) {
     char name[64];

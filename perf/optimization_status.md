@@ -3975,3 +3975,94 @@ re-streams all ~57 MB of layer weights for every token. llama.cpp's x86
 prefill uses tiled/repacked Q4_0 GEMM. A register-blocked Q4_0 x Q8_0 GEMM
 (several rows x several tokens per tile) is the next CPU lever; AVX-VNNI would
 come after that.
+
+## 2026-10-13: EmbeddingGemma 2 on GPUs without Metal 4 (simdgroup GEMM and flash)
+
+Host: Apple M3 Max (40-core GPU, 128 GB), macOS 15.7.9, so Metal 3.1 only;
+shared with a resident chat model and its own llama.cpp embedding server.
+Without Metal 4 the 10-09 stack is off: FUSED waves of any size ran the
+per-token GEMVs, `attn_output`/`ffn_down`/`proj` ran `g2_mm` (one simdgroup
+per output value) and attention ran the scalar `g2_attention`. HTTP ingest of
+~1,200-character passages (16 or 32 per request, fresh text per run so no
+cache answers) was 24-25 passages/s against llama.cpp b11459's 60-65 on the
+same Q8_0 file.
+
+`EI_GEMMA2_METAL_SG` (default on without Metal 4, from 32 tokens):
+
+- `g2s_gemm`: y = x W^T on `simdgroup_half8x8` tiles, 64 weight rows x 32
+  tokens x 32 k per 128-thread threadgroup, weights (Q8/BF16/F16/F32) decoded
+  to fp16 in threadgroup memory, fp32 accumulation, optional clamp epilogue.
+  All projections take it, so packed waves leave the fused GEMVs.
+- `g2s_flash_256` / `_512`: one simdgroup per 8 queries of a head, 32-key
+  blocks, S and P.V on the matrix units, online softmax with the same window
+  and packed-sequence bounds as `g2_attention`, the 8 x D output in registers
+  (rescaled through a diagonal matrix), fp16 K/V padded by 32 zero rows.
+
+Where the time went (`bench_gemma2_metal`, 300x16, `EI_GEMMA2_METAL_SKIP`):
+
+| route | full | skip mm | skip attn | skip both |
+|---|---:|---:|---:|---:|
+| FUSED (before) | 1488 ms | 1197 | 876 | 520 |
+| FUSED + SG GEMM only | 900 ms | 739 | 201 | 46 |
+
+In-process pairs, `bench_gemma2_metal` base `FUSED=1`, route `FUSED=1,SG=1`
+(median, ms):
+
+| case | base | SG | speedup | min cosine | SG tok/s |
+|---|---:|---:|---:|---:|---:|
+| 300x16 | 1476.4 | 250.7 | 5.89x | 0.999881 | 19,148 |
+| 300x27 | 2521.3 | 416.7 | 6.05x | 0.999881 | 19,438 |
+| 32x8 | 44.7 | 18.5 | 2.41x | 0.999908 | 13,810 |
+| 64x4 | 47.9 | 19.0 | 2.51x | 0.999982 | 13,440 |
+| 1000x4 | 1994.8 | 263.9 | 7.56x | 0.999999 | 15,158 |
+| 2040x4 | 5492.4 | 631.1 | 8.70x | 0.999999 | 12,930 |
+
+HTTP against llama.cpp b11459's `llama-server` on the same Q8_0 and
+projector (`--pooling mean --embd-normalize 2 -c/-b/-ub 8192`), 35 Markdown
+documents cut into 2,994 unique 1,200-character passages (1.22M tokens, 409
+a passage), 32 a request, 4 requests in flight:
+
+| server | streamed | a document at a time | single query p50 | RSS after |
+|---|---:|---:|---:|---:|
+| llama.cpp b11459 | 17,709 tok/s | 16,282 tok/s | 10.1 ms | 4.46 GB |
+| embeddinggemma.c, SG | 17,691 tok/s | 18,193 tok/s | 8.4 ms | 0.77 GB |
+
+Throughput is at parity with llama.cpp on this GPU; the win is memory (5.8x
+less) and query latency. An earlier run that reported 2.3x repeated each
+passage about 2.5 times, so this server's exact cache answered the repeats;
+it is withdrawn. Embeddings agree with llama.cpp at minimum cosine 0.999999.
+
+Rejected: a 64-token x 64-row GEMM tile (4 x 4 accumulators per simdgroup,
+half the weight decodes): back to back it lost at every size (400x20 450 vs
+438 ms, 64x4 23.2 vs 19.1 ms, 2040x4 673 vs 644 ms). At 400x20 the forward
+is about 64% GEMM, 23% attention and 14% the rest (`EI_GEMMA2_METAL_SKIP`).
+
+Media (`bench_gemma2_media`, SG=0 / SG=1, ms per call): v432 253.4 / 135.2,
+v768 1655.1 / 1264.8, video4 1049.2 / 566.0, a10 100.5 / 31.0, mixed
+106.9 / 27.1. Vision attention (width 64) still runs `g2_attention`; v768 is
+the next lever on these GPUs.
+
+Correctness: `make test-gemma2-metal` passes with SG on and off (text minimum
+0.999720428, vision tower 0.999126704 / 0.999124902, audio identical);
+`EI_GEMMA2_ROUTE_FLAGS=FUSED,SG,AFUSED make test-gemma2-metal-routes` passes
+(packed text batches 1..1025 tokens at cosine >= 0.99996, vision, audio and
+packed clips). On Metal 4 GPUs SG defaults off, so the shipped stack there is
+unchanged.
+
+Review fixes (2026-10-18, M5 Max, Metal 4 host running the SG stack through
+`EI_GEMMA2_ROUTE_FLAGS=FUSED,SG,AFUSED`): `ei_gemma2_metal_clone` did not copy
+`sg`/`sgMin`, so every media slot, the media finisher, the audio batcher and
+extra pipeline executors ran the scalar kernels (the HTTP media numbers above
+were measured through the bench, not the server). The SG flash now consumes
+the fp16 K/V the q/k/v norm pass already writes instead of converting again
+(48 dispatches and a K/V read per forward), and skips the diagonal output
+rescale on blocks where no row maximum moved (`simd_all(scale == 1)`,
+bit-identical). `g2s_rowscale` gives each GEMM row a scale that is 1 unless
+its magnitude passes 16,384 (the model card's fp16 warning; forcing the limit
+to 0.5 so every row scales still passes the route gates at >= 0.99996). The
+SG pipelines are created only on the Apple7 family, the Metal 4 library
+depends on the shared `gemma2_common.metal`, the Metal 4 kernels include it
+instead of carrying their own `G2P`, and `test_gemma2_metal_routes` picks
+this GPU's shipped default (`FUSED,SG,AFUSED` without Metal 4). Interleaved
+`bench_gemma2_metal` runs of the two binaries (300x16, 64x4, 1000x4) were
+within the host's run-to-run noise with identical minimum cosines.

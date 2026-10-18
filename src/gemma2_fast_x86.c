@@ -6,9 +6,13 @@
  * (signed); negating INT8_MIN would wrap, but activations come from the
  * symmetric +-127 quantizer, so -128 never occurs in x. AVX-512 is promoted
  * per kernel by measurement, never blanket (perf/optimization_status.md).
- * EI_GEMMA2_CPU_X86=scalar|avx2|vnni256 forces a tier (default: the best;
- * on AVX-512 VNNI CPUs the repacked 512-bit GEMM). */
+ * EI_GEMMA2_CPU_X86=scalar|avx2|vnni256|avxvnni forces a tier (default: the
+ * best; on AVX-512 VNNI CPUs the repacked 512-bit GEMM). */
+#if defined(__linux__)
+#define _DEFAULT_SOURCE /* madvise under -std=c11 (gemma2_release.h) */
+#endif
 #include "gemma2_fast_x86.h"
+#include "gemma2_release.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <cpuid.h>
@@ -166,6 +170,8 @@ const void *g2x_weight_of(const void *key, const ei_block_q8_0 *blocks, int m, i
             sum += blocks[b].qs[z];
         w->c[b] = -128 * sum;
     }
+    /* The repack is the only copy the kernel reads from now on. */
+    g2_release_source(blocks, (size_t)m * kb * sizeof(ei_block_q8_0));
     w->key = key;
     g2x_weight_count++;
     return w;

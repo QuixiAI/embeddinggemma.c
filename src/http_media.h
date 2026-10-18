@@ -146,12 +146,20 @@ static bool media_part(const char **p, ei_media_input *m, char *err, size_t len)
         ei_media_frame *prepared = ei_xcalloc(frames.n, sizeof *prepared);
         video_decode_all(m, &frames, frame_tokens, prepared);
         ei_media_frames_encode(m, prepared, frames.n);
+        /* The "MM:SS " text before each frame matches llama.cpp (the default);
+         * EI_GEMMA2_SEMANTICS=official drops it, the processor's add_timestamps=False
+         * layout, and EI_GEMMA2_VIDEO_TIMESTAMPS=0|1 overrides either way. */
+        static int stamps = -1;
+        if (stamps < 0) {
+            const char *e = getenv("EI_GEMMA2_VIDEO_TIMESTAMPS");
+            stamps = e ? strcmp(e, "0") != 0 : !ei_gemma2_official_semantics();
+        }
         for (size_t i = 0; ok && i < frames.n; ++i) {
             unsigned seconds = (unsigned)(i / fps);
             char stamp[40];
             int n = snprintf(stamp, sizeof stamp, "%s%02u:%02u ", i ? " " : "", seconds / 60,
                              seconds % 60);
-            ok = ei_media_text(m, stamp, (size_t)n, err, len) &&
+            ok = (!stamps || ei_media_text(m, stamp, (size_t)n, err, len)) &&
                  ei_media_image_commit(m, &prepared[i], frames.items[i].s, frames.items[i].len,
                                        err, len);
         }

@@ -2,6 +2,9 @@
 #define EI_GEMMA2_METAL_H
 #include "gguf.h"
 void *ei_gemma2_metal_create(const ei_gguf *g, char *err, size_t len);
+/* Whether the default device has the Metal 4 tensor routes (else the SG route
+ * is the shipped packed-wave stack). */
+bool ei_gemma2_metal_has_metal4(void);
 void ei_gemma2_metal_free(void *ctx);
 /* A pipeline slot: shares the device, pipelines and weights of ctx, with its
  * own command queue and workspace so waves on different slots overlap. */

@@ -4000,3 +4000,21 @@ Correctness: `make test-gemma2-metal` passes with SG on and off (text minimum
 (packed text batches 1..1025 tokens at cosine >= 0.99996, vision, audio and
 packed clips). On Metal 4 GPUs SG defaults off, so the shipped stack there is
 unchanged.
+
+Review fixes (2026-10-18, M5 Max, Metal 4 host running the SG stack through
+`EI_GEMMA2_ROUTE_FLAGS=FUSED,SG,AFUSED`): `ei_gemma2_metal_clone` did not copy
+`sg`/`sgMin`, so every media slot, the media finisher, the audio batcher and
+extra pipeline executors ran the scalar kernels (the HTTP media numbers above
+were measured through the bench, not the server). The SG flash now consumes
+the fp16 K/V the q/k/v norm pass already writes instead of converting again
+(48 dispatches and a K/V read per forward), and skips the diagonal output
+rescale on blocks where no row maximum moved (`simd_all(scale == 1)`,
+bit-identical). `g2s_rowscale` gives each GEMM row a scale that is 1 unless
+its magnitude passes 16,384 (the model card's fp16 warning; forcing the limit
+to 0.5 so every row scales still passes the route gates at >= 0.99996). The
+SG pipelines are created only on the Apple7 family, the Metal 4 library
+depends on the shared `gemma2_common.metal`, the Metal 4 kernels include it
+instead of carrying their own `G2P`, and `test_gemma2_metal_routes` picks
+this GPU's shipped default (`FUSED,SG,AFUSED` without Metal 4). Interleaved
+`bench_gemma2_metal` runs of the two binaries (300x16, 64x4, 1000x4) were
+within the host's run-to-run noise with identical minimum cosines.

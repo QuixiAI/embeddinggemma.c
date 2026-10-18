@@ -122,6 +122,21 @@ static bool finish(EIGemma2Metal *c, char *err, size_t len) {
     c->command = nil;
     return ok;
 }
+// The simdgroup-matrix route (EI_GEMMA2_METAL_SG): packed waves on GPUs
+// without Metal 4. One predicate for the layer code (short_route) and the
+// projection/attention dispatchers, so they cannot disagree on a wave.
+static bool sg_route(EIGemma2Metal *c, int n) {
+    return c->sg && n >= c->sgMin;
+}
+// Attention consumes fp16 K/V (written by the q/k/v norm pass when it can)
+// on the tensor flash and simdgroup flash routes; both read whole key blocks
+// past the last token, so the producer pads half_rows(n) zero rows.
+static bool half_kv_attention(EIGemma2Metal *c, int n, int d) {
+    return (d == 256 || d == 512) && ((c->flash2 && n >= c->flash2Min) || sg_route(c, n));
+}
+static int half_rows(int n) {
+    return (n + 63) / 64 * 64 + 128;
+}
 // y = x W^T; with lo < hi the result is clamped to [lo, hi] in the wide GEMM's
 // epilogue (returns true) or left for the caller to clamp (false).
 static bool mm_clamp(EIGemma2Metal *c, const ei_gguf *g, const char *name, id<MTLBuffer> x, int n,
@@ -135,8 +150,18 @@ static bool mm_clamp(EIGemma2Metal *c, const ei_gguf *g, const char *name, id<MT
         p.k = p.m = 768;
     bool wide = c->tensor2 && n >= c->tensor2Min;
     id<MTLBuffer> packed = wide ? c->packed[@(name)] : nil;
-    bool simdgroup = !packed && !(c->tensorMM && n >= 32) && !wide && c->sg && n >= c->sgMin &&
-                     p.m % 64 == 0 && p.k % 32 == 0;
+    bool simdgroup = !wide && !(c->tensorMM && n >= 32) && sg_route(c, n);
+    if (simdgroup && (p.m % 64 || p.k % 32)) {
+        // Every text, vision and audio projection fits the 64 x 32 tile; a
+        // weight that does not would silently fall to g2_mm, so say so once.
+        static bool warned;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "gemma2 Metal: %s [%u x %u] is not a simdgroup GEMM shape\n", name,
+                    p.m, p.k);
+        }
+        simdgroup = false;
+    }
     bool clamped = (packed || simdgroup) && lo < hi;
     if (clamped) {
         p.lo = lo;
@@ -153,7 +178,22 @@ static bool mm_clamp(EIGemma2Metal *c, const ei_gguf *g, const char *name, id<MT
         [c->enc dispatchThreadgroups:MTLSizeMake((n + tm - 1) / tm, p.m / 64, 1)
                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else if (simdgroup) {
+        // The model card warns that activations exceed fp16's range, and the
+        // GEMM stages them as fp16: a per-token scale (1 unless a row's
+        // magnitude passes the kernel's limit, so ordinary waves are
+        // bit-identical) keeps the operands finite; the epilogue undoes it.
+        id<MTLBuffer> rowScale = buffer(c, @"sg_scale", (size_t)(n + 31) / 32 * 32);
+        pipeline(c, @"g2s_rowscale");
+        bind(c, x, 0);
+        bind(c, rowScale, 1);
+        params(c, p, 2);
+        groups(c, n, 1);
         pipeline(c, @"g2s_gemm");
+        weight(c, g, name, 0);
+        bind(c, x, 1);
+        bind(c, y, 2);
+        params(c, p, 3);
+        bind(c, rowScale, 4);
         [c->enc dispatchThreadgroups:MTLSizeMake(p.m / 64, (n + 31) / 32, 1)
                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else if ((c->tensorMM && n >= 32) || wide) {
@@ -329,19 +369,24 @@ static void attention_c(EIGemma2Metal *c, id<MTLBuffer> q, id<MTLBuffer> k, id<M
                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         return;
     }
-    if (c->sg && !rpe && (d == 256 || d == 512) && n >= c->sgMin) {
-        // fp16 K/V with at least 32 zero rows past the last token for whole key blocks.
-        int padded = (n + 31) / 32 * 32 + 32;
+    if (!rpe && half_kv_attention(c, n, d)) {
+        // Simdgroup flash: fp16 K/V with at least 32 zero rows past the last
+        // token for whole key blocks, the layout g2_qkv_post writes.
+        int padded = half_rows(n);
         id<MTLBuffer> kh = buffer(c, @"kh", (size_t)padded * kv * d / 2),
                       vh = buffer(c, @"vh_half", (size_t)padded * kv * d / 2);
-        pipeline(c, @"g2_half");
-        bind(c, k, 0);
-        bind(c, kh, 1);
-        params(c, (G2P){.n = n, .m = padded, .d = kv * d}, 2);
-        threads(c, (size_t)padded * kv * d);
-        bind(c, v, 0);
-        bind(c, vh, 1);
-        threads(c, (size_t)padded * kv * d);
+        bool ready = c->kvHalfReady;
+        c->kvHalfReady = false;
+        if (!ready) {
+            pipeline(c, @"g2_half");
+            bind(c, k, 0);
+            bind(c, kh, 1);
+            params(c, (G2P){.n = n, .m = padded, .d = kv * d}, 2);
+            threads(c, (size_t)padded * kv * d);
+            bind(c, v, 0);
+            bind(c, vh, 1);
+            threads(c, (size_t)padded * kv * d);
+        }
         pipeline(c, d == 512 ? @"g2s_flash_512" : @"g2s_flash_256");
         bind(c, q, 0);
         bind(c, kh, 1);
@@ -495,6 +540,13 @@ static bool repack_upgate(EIGemma2Metal *c, const ei_gguf *g, const char *prefix
     c->packed[@(name)] = b;
     return true;
 }
+bool ei_gemma2_metal_has_metal4(void) {
+    @autoreleasepool {
+        if (@available(macOS 26.0, *))
+            return [MTLCreateSystemDefaultDevice() supportsFamily:MTLGPUFamilyMetal4];
+        return false;
+    }
+}
 void *ei_gemma2_metal_create(const ei_gguf *g, char *err, size_t len) {
     @autoreleasepool {
         EIGemma2Metal *c = [EIGemma2Metal new];
@@ -531,7 +583,7 @@ void *ei_gemma2_metal_create(const ei_gguf *g, char *err, size_t len) {
                  @"g2_conv", @"g2_audio_scale", @"g2_depthwise", @"g2_bias", @"g2_gemv_q8",
                  @"g2_gemv_bf16", @"g2_gemv_f16", @"g2_gemv_f32", @"g2_gemv_ple", @"g2_gemv_qkv",
                  @"g2_gemv_geglu", @"g2_qkv_post", @"g2_post_add", @"g2_post_add_768",
-                 @"g2_post_add_1024", @"g2_vqkv_post", @"g2s_gemm", @"g2s_flash_256", @"g2s_flash_512"
+                 @"g2_post_add_1024", @"g2_vqkv_post"
              ]) {
             id<MTLFunction> f = [lib newFunctionWithName:name];
             id<MTLComputePipelineState> p =
@@ -543,6 +595,22 @@ void *ei_gemma2_metal_create(const ei_gguf *g, char *err, size_t len) {
             }
             c->pipelines[name] = p;
         }
+        // simdgroup_half8x8 needs the Apple7 family (M1 and later); an older
+        // Mac GPU keeps the scalar kernels rather than failing to start.
+        bool simdgroupMatrix = [c->device supportsFamily:MTLGPUFamilyApple7];
+        if (simdgroupMatrix)
+            for (NSString *name in
+                 @[ @"g2s_rowscale", @"g2s_gemm", @"g2s_flash_256", @"g2s_flash_512" ]) {
+                id<MTLFunction> f = [lib newFunctionWithName:name];
+                id<MTLComputePipelineState> p =
+                    f ? [c->device newComputePipelineStateWithFunction:f error:&error] : nil;
+                if (!p) {
+                    snprintf(err, len, "Gemma 2 Metal pipeline %s: %s", name.UTF8String,
+                             error ? error.localizedDescription.UTF8String : "missing kernel");
+                    return NULL;
+                }
+                c->pipelines[name] = p;
+            }
         const char *tensorFlag = getenv("EI_GEMMA2_METAL_TENSOR");
         const char *flashFlag = getenv("EI_GEMMA2_METAL_FLASH");
         c->tensorMM = tensorFlag && !strcmp(tensorFlag, "1");
@@ -603,9 +671,14 @@ void *ei_gemma2_metal_create(const ei_gguf *g, char *err, size_t len) {
         const char *flash2Flag = getenv("EI_GEMMA2_METAL_FLASH2");
         c->flash2 = flash2Flag ? !strcmp(flash2Flag, "1") : metal4;
         // Without Metal 4 the packed waves would fall back to per-token GEMVs and
-        // g2_mm; the simdgroup GEMM takes them instead (default on there).
+        // g2_mm; the simdgroup GEMM takes them instead (default on there, "0"
+        // turns it off and restores the scalar kernels bit for bit).
         const char *sgFlag = getenv("EI_GEMMA2_METAL_SG");
-        c->sg = sgFlag ? !strcmp(sgFlag, "1") : !metal4;
+        c->sg = sgFlag ? !strcmp(sgFlag, "1") : (!metal4 && simdgroupMatrix);
+        if (c->sg && !simdgroupMatrix) {
+            snprintf(err, len, "Gemma 2 Metal SG route requires an Apple7 (M1 or later) GPU");
+            return NULL;
+        }
         const char *sgMinFlag = getenv("EI_GEMMA2_METAL_SG_MIN_TOKENS");
         c->sgMin = sgMinFlag ? atoi(sgMinFlag) : 32;
         const char *f2min = getenv("EI_GEMMA2_METAL_FLASH2_MIN_TOKENS");
@@ -766,6 +839,8 @@ void *ei_gemma2_metal_clone(void *ctx, char *err, size_t len) {
         c->flash64 = p->flash64;
         c->vfused = p->vfused;
         c->afused = p->afused;
+        c->sg = p->sg;
+        c->sgMin = p->sgMin;
         c->tensor2Min = p->tensor2Min;
         c->tensor2Wide = p->tensor2Wide;
         c->flash2Min = p->flash2Min;
@@ -828,8 +903,7 @@ static bool projector(EIGemma2Metal *c, const ei_gguf *g, char *err, size_t len)
 // Fused text-layer helpers (EI_GEMMA2_METAL_FUSED=1). Short waves use fused
 // GEMVs; waves on the tensor route keep separate projections.
 static bool short_route(EIGemma2Metal *c, int n) {
-    return !(c->tensorMM && n >= 32) && !(c->tensor2 && n >= c->tensor2Min) &&
-           !(c->sg && n >= c->sgMin);
+    return !(c->tensorMM && n >= 32) && !(c->tensor2 && n >= c->tensor2Min) && !sg_route(c, n);
 }
 static void short_groups(EIGemma2Metal *c, size_t rows_per_group, size_t rows, int n) {
     [c->enc dispatchThreadgroups:MTLSizeMake(rows / rows_per_group, (n + 7) / 8, 1)
@@ -914,9 +988,10 @@ static void text_layer_fused(EIGemma2Metal *c, const ei_gguf *g, int l, int n, s
     uint32_t norm_type = weight(c, g, T("attn_q_norm"), 4)->type;
     weight(c, g, T("attn_k_norm"), 5);
     bind(c, bounds, 6);
-    // Tensor flash reads fp16 K/V with 64 zero pad rows; write them here.
-    bool half_kv = c->flash2 && n >= c->flash2Min;
-    int rows = half_kv ? (n + 63) / 64 * 64 + 128 : n;
+    // The tensor and simdgroup flash kernels read fp16 K/V with zero pad
+    // rows past the last token; write them here.
+    bool half_kv = half_kv_attention(c, n, d);
+    int rows = half_kv ? half_rows(n) : n;
     if (half_kv) {
         bind(c, buffer(c, @"kh", (size_t)rows * kv * d / 2), 7);
         bind(c, buffer(c, @"vh_half", (size_t)rows * kv * d / 2), 8);

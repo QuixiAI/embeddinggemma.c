@@ -3,14 +3,33 @@
 // Packed-wave GEMM for GPUs without the Metal 4 tensor route: y = x W^T on the
 // simdgroup 8x8 matrix units Metal 3 exposes (Apple7+). Each threadgroup reuses
 // one 64-row x 32-k weight tile across 32 tokens, which the per-token GEMVs and
-// g2_mm cannot; operands are fp16 in threadgroup memory (activations stay below
-// fp16's range, see README) and every sum accumulates in fp32.
+// g2_mm cannot; operands are fp16 in threadgroup memory and every sum
+// accumulates in fp32. The model card says the activations exceed fp16's range
+// (measured operands stay below 740, see README), so g2s_rowscale gives every
+// token a scale: 1 while its row stays within SG_XMAX, which leaves the
+// ordinary wave bit-identical, else |x|max / SG_XMAX so the staged fp16 row is
+// finite; the epilogue multiplies it back.
 constant constexpr uint SG_TOKENS = 32, SG_ROWS = 64, SG_K = 32;
+constant constexpr float SG_XMAX = 16384.f;
+
+// One simdgroup per token: scale[t] for row t of x (p.k floats, k % 32 == 0).
+kernel void g2s_rowscale(device const float *x [[buffer(0)]], device float *scale [[buffer(1)]],
+                         constant G2P &p [[buffer(2)]], uint t [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    device const float *row = x + (size_t)t * p.k;
+    float peak = 0;
+    for (uint i = lane; i < p.k; i += 32)
+        peak = max(peak, abs(row[i]));
+    peak = simd_max(peak);
+    if (lane == 0)
+        scale[t] = peak > SG_XMAX ? peak / SG_XMAX : 1.f;
+}
 
 // 128 threads: thread t fills 16 k of weight row t / 2 and 8 k of token t / 4,
 // and simdgroup s owns all 32 tokens x rows 16s..16s+15 of the tile.
 kernel void g2s_gemm(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]],
                      device float *y [[buffer(2)]], constant G2P &p [[buffer(3)]],
+                     device const float *scale [[buffer(4)]],
                      uint2 g [[threadgroup_position_in_grid]],
                      uint t [[thread_index_in_threadgroup]],
                      uint s [[simdgroup_index_in_threadgroup]]) {
@@ -20,6 +39,9 @@ kernel void g2s_gemm(device const uchar *w [[buffer(0)]], device const float *x 
     const uint row0 = g.x * SG_ROWS, token0 = g.y * SG_TOKENS;
     const uint wr = t / 2, wk = (t % 2) * 16, xr = t / 4, xk = (t % 4) * 8;
     const bool live = token0 + xr < p.n;
+    // 1 / scale is exact for the common scale of 1; a scaled row is already
+    // beyond fp16's precision at its magnitude, so the division costs nothing.
+    const float inv = live ? 1.f / scale[token0 + xr] : 0.f;
     simdgroup_float8x8 acc[8];
     for (uint i = 0; i < 8; i++)
         acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.f);
@@ -38,7 +60,7 @@ kernel void g2s_gemm(device const uchar *w [[buffer(0)]], device const float *x 
         device const float *src = x + (size_t)(token0 + xr) * p.k + k0 + xk;
         threadgroup half *dx = sx + xr * SG_K + xk;
         for (uint j = 0; j < 8; j++)
-            dx[j] = live ? half(src[j]) : half(0);
+            dx[j] = live ? half(src[j] * inv) : half(0);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kk = 0; kk < SG_K; kk += 8) {
             simdgroup_half8x8 a[4], b[2];
@@ -61,7 +83,7 @@ kernel void g2s_gemm(device const uchar *w [[buffer(0)]], device const float *x 
         const uint token = token0 + e / SG_ROWS;
         if (token >= p.n)
             continue;
-        const float v = sy[e];
+        const float v = sy[e] * scale[token];
         y[(size_t)token * p.m + row0 + e % SG_ROWS] = clamped ? clamp(v, p.lo, p.hi) : v;
     }
 }
@@ -139,17 +161,23 @@ inline void g2s_flash(device const float *q, device const half *kh, device const
         sum += simd_shuffle_xor(sum, 2);
         total = total * scale + sum;
         mx = next;
-        if (lane % 4 == 0)
+        // Once the running maxima settle every scale is exactly 1 (exp(0)),
+        // and the D / 8 diagonal multiplies are a quarter of the P.V work;
+        // the test is simdgroup-uniform, so skipping them changes no bit.
+        const bool rescaled = !simd_all(scale == 1.f);
+        if (rescaled && lane % 4 == 0)
             for (uint j = 0; j < 8; j++)
                 sd[row * 8 + j] = j == row ? scale : 0;
         simdgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_float8x8 rescale;
-        simdgroup_load(rescale, sd, 8);
+        if (rescaled)
+            simdgroup_load(rescale, sd, 8);
         simdgroup_half8x8 pj[4];
         for (uint j = 0; j < 4; j++)
             simdgroup_load(pj[j], sp + j * 8, FA_KEYS);
         for (uint i = 0; i < D / 8; i++) {
-            simdgroup_multiply(o[i], rescale, o[i]);
+            if (rescaled)
+                simdgroup_multiply(o[i], rescale, o[i]);
             for (uint j = 0; j < 4; j++) {
                 simdgroup_half8x8 b;
                 simdgroup_load(b, vh + (size_t)(key0 + j * 8) * stride + kvh * D + i * 8, stride);

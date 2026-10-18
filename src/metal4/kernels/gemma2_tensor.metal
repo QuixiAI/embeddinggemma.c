@@ -1,25 +1,15 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
 #include <metal_tensor>
+// G2P, G2Q8 and the weight decode are shared with the Metal 3 kernels; the
+// host _Static_asserts the parameter layout, so there is one definition.
+#include "../../metal/include/gemma2_common.metal"
 using namespace metal;
-struct G2P {
-    uint n, k, m, type, heads, kv, d, window, cols, mode, layer;
-    float scale, lo, hi;
-};
-struct G2Q8 {
-    half d;
-    char qs[32];
-};
 inline float g2gelu_t(float x) {
     return 0.5f * x * (1 + tanh(0.7978845608f * x * (1 + 0.044715f * x * x)));
 }
 inline half g2_weight(device const uchar *w, uint type, uint i) {
-    if (type == 0)
-        return half(((device const float *)w)[i]);
-    if (type == 30)
-        return half(as_type<float>(uint(((device const ushort *)w)[i]) << 16));
-    device const G2Q8 *b = (device const G2Q8 *)w;
-    return half(float(b[i / 32].d) * float(b[i / 32].qs[i % 32]));
+    return half(g2w(w, type, i));
 }
 // Q8/BF16/F32 -> half weight tiles, FP32 activations and accumulators. Fixed
 // K multiples of 32 and output multiples of 64 for all three Gemma 2 graphs.

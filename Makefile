@@ -411,7 +411,7 @@ $(METALLIB): $(METAL_SOURCES) $(METAL_HEADERS) | $(BUILD)
 	}
 	xcrun -sdk macosx metal $(METAL_FLAGS) -I$(METAL_INCLUDE_DIR) $(METAL_SOURCES) -o $@
 
-$(METAL4_METALLIB): $(METAL4_SOURCES) src/metal/kernels/gemma2.metal | $(BUILD)
+$(METAL4_METALLIB): $(METAL4_SOURCES) src/metal/kernels/gemma2.metal $(METAL_HEADERS) | $(BUILD)
 	@xcrun --find metal >/dev/null 2>&1 || { \
 		echo "error: Metal compiler not found; install/select full Xcode with xcode-select" >&2; \
 		exit 1; \

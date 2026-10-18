@@ -1,9 +1,6 @@
 #include <metal_stdlib>
+#include "../../metal/include/gemma2_common.metal"
 using namespace metal;
-struct G2P {
-    uint n, k, m, type, heads, kv, d, window, cols, mode, layer;
-    float scale, lo, hi;
-};
 // Adapted from the original profile's tiled attention. Packed sequence bounds
 // mask both full and symmetric sliding attention; softmax/accumulators are FP32.
 template <uint head_dim, typename Accumulator>

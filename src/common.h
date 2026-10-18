@@ -39,7 +39,11 @@ static inline float ei_fp16_to_fp32(ei_fp16 h) {
     return f;
 }
 
+#ifdef _WIN32
+__attribute__((format(gnu_printf, 1, 2), noreturn))
+#else
 __attribute__((format(printf, 1, 2), noreturn))
+#endif
 static inline void ei_die(const char *fmt, ...);
 
 #include <stdarg.h>

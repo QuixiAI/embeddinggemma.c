@@ -87,8 +87,10 @@ make
 ```
 
 The output is `build/embeddinggemma`. The CPU route includes scalar C, ARM64
-NEON, AVX2, and SSSE3 kernels and selects the best available implementation at
-runtime.
+NEON, SSE2/SSSE3, and AVX2 kernels. NEON and SSE2/SSSE3 follow the compiler
+target; on x86-64 the AVX2 kernels (`src/kernels_avx2.c`, with per-function
+`target("avx2,fma,f16c")` attributes) are selected at runtime when the CPU and
+OS support AVX2, FMA, and F16C, so one baseline binary runs on any x86-64 CPU.
 
 Build the self-contained Metal server:
 
@@ -231,6 +233,9 @@ Diagnostic controls:
 
 - `EI_THREADS` (1..1024; the server's `--threads` sets it): override the CPU
   thread count. The default is every core up to 32.
+- `EI_CPU_ISA=auto|baseline|avx2`: x86-64 kernel family. `baseline` forces the
+  SSE2 route on an AVX2 host; `avx2` fails at startup when unsupported.
+  `test_cpu_dispatch` compares the two routes in one process.
 - `EI_CPU_SHORT_THREADS`: override the short-projection worker width.
 - `EI_CPU_DUAL_PROJECTION`: control paired projection accumulation.
 - `EI_CPU_FUSED_RMS_QUANT=0`: materialize normalized activations before Q8.

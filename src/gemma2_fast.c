@@ -83,7 +83,9 @@ struct ei_gemma2_fast {
     workspace ws;
 };
 static ei_gemma2_fast default_ctx = {PTHREAD_MUTEX_INITIALIZER, {0}};
+#if (defined(__aarch64__) && defined(__APPLE__)) || defined(__x86_64__)
 static pthread_mutex_t weight_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 static void reserve(workspace *ws, size_t n) {
     if (ws->tokens >= n)

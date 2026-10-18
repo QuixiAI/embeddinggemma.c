@@ -17,23 +17,52 @@
 #include "gemma2_cuda.h"
 #endif
 
-#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <stdatomic.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "windows_compat.h"
+#ifdef _WIN32
+#include <ws2tcpip.h>
+#include <direct.h>
+#include <process.h>
+typedef SOCKET ei_socket;
+#define EI_INVALID_SOCKET INVALID_SOCKET
+#define ei_socket_close closesocket
+#else
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/uio.h>
-#include <pthread.h>
-#include <stdatomic.h>
-#include <signal.h>
 #include <spawn.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
-#include <unistd.h>
+typedef int ei_socket;
+#define EI_INVALID_SOCKET (-1)
+#define ei_socket_close close
+#endif
+
+static int ei_socket_errno(void) {
+#ifdef _WIN32
+    int error = WSAGetLastError();
+    if (error == WSAEINTR) return EINTR;
+    if (error == WSAETIMEDOUT || error == WSAEWOULDBLOCK) return EAGAIN;
+    return error;
+#else
+    return errno;
+#endif
+}
+
+static int ei_setsockopt(ei_socket fd, int level, int name,
+                         const void *value, int length) {
+    return setsockopt(fd, level, name, (const char *)value, length);
+}
 
 static pthread_mutex_t inference_mutex = PTHREAD_MUTEX_INITIALIZER;
 // GPU media contexts (vision/audio towers and the mixed-input text forward):
@@ -248,7 +277,9 @@ static bool media_audio_submit(void *ctx, const float *mel, int frames, float **
 #define MAX_BODY_BYTES (16u * 1024u * 1024u)
 #define MAX_HEADER_BYTES (64u * 1024u)
 
+#ifndef _WIN32
 extern char **environ;
+#endif
 
 #if defined(EI_ENABLE_ROCM)
 #define DEFAULT_INFERENCE_BACKEND "rocm"
@@ -739,8 +770,24 @@ static bool parse_required_model(const char *body, sv_string *model,
     return true;
 }
 
-static void send_header_and_body(int fd, const char *hdr, size_t hdr_len,
+static void send_header_and_body(ei_socket fd, const char *hdr, size_t hdr_len,
                                  const char *body, size_t body_len) {
+#ifdef _WIN32
+    const char *parts[] = {hdr, body};
+    size_t lengths[] = {hdr_len, body_len};
+    for (int i = 0; i < 2; i++) {
+        while (lengths[i]) {
+            int chunk = lengths[i] > INT_MAX ? INT_MAX : (int)lengths[i];
+            int sent = send(fd, parts[i], chunk, 0);
+            if (sent <= 0) {
+                if (sent < 0 && ei_socket_errno() == EINTR) continue;
+                return;
+            }
+            parts[i] += sent;
+            lengths[i] -= (size_t)sent;
+        }
+    }
+#else
     struct iovec iov[2] = {
         {(void *)(uintptr_t)hdr, hdr_len},
         {(void *)(uintptr_t)body, body_len},
@@ -748,8 +795,8 @@ static void send_header_and_body(int fd, const char *hdr, size_t hdr_len,
     int index = 0;
     while (index < 2) {
         ssize_t sent = writev(fd, iov + index, 2 - index);
-        if (sent < 0) {
-            if (errno == EINTR) continue;
+        if (sent <= 0) {
+            if (ei_socket_errno() == EINTR) continue;
             return;
         }
         size_t remaining = (size_t)sent;
@@ -762,9 +809,10 @@ static void send_header_and_body(int fd, const char *hdr, size_t hdr_len,
             iov[index].iov_len -= remaining;
         }
     }
+#endif
 }
 
-static void http_response_raw(int fd, int status, const char *reason,
+static void http_response_raw(ei_socket fd, int status, const char *reason,
                               const char *content_type, const char *body,
                               size_t body_len, bool keep_alive) {
     char hdr[512];
@@ -781,20 +829,20 @@ static void http_response_raw(int fd, int status, const char *reason,
     send_header_and_body(fd, hdr, (size_t)n, body, body_len);
 }
 
-static void http_response_typed(int fd, int status, const char *reason,
+static void http_response_typed(ei_socket fd, int status, const char *reason,
                                 const char *content_type, const char *body,
                                 bool keep_alive) {
     http_response_raw(fd, status, reason, content_type, body, strlen(body),
                       keep_alive);
 }
 
-static void http_response(int fd, int status, const char *reason,
+static void http_response(ei_socket fd, int status, const char *reason,
                           const char *body, bool keep_alive) {
     http_response_typed(fd, status, reason, "application/json; charset=utf-8",
                         body, keep_alive);
 }
 
-static void http_error(int fd, int status, const char *reason, const char *msg,
+static void http_error(ei_socket fd, int status, const char *reason, const char *msg,
                        bool keep_alive) {
     sbuf b = {0};
     sbuf_append_z(&b, "{\"error\":");
@@ -806,7 +854,7 @@ static void http_error(int fd, int status, const char *reason, const char *msg,
     free(b.data);
 }
 
-static void openai_http_error(int fd, int status, const char *reason,
+static void openai_http_error(ei_socket fd, int status, const char *reason,
                               const char *msg, const char *param,
                               bool keep_alive) {
     sbuf b = {0};
@@ -822,7 +870,7 @@ static void openai_http_error(int fd, int status, const char *reason,
     free(b.data);
 }
 
-static void embedding_http_error(int fd, embedding_api api, int status,
+static void embedding_http_error(ei_socket fd, embedding_api api, int status,
                                  const char *reason, const char *msg,
                                  const char *param, bool keep_alive) {
     if (api == EMBEDDING_API_OPENAI) {
@@ -903,7 +951,7 @@ static char *find_header_end(char *buf, size_t n) {
 }
 
 typedef struct {
-    int fd;
+    ei_socket fd;
     sbuf buffered;
 } http_connection;
 
@@ -923,8 +971,8 @@ static http_read_result read_request(http_connection *connection,
     while (!hdr_end) {
         ssize_t n = recv(connection->fd, tmp, sizeof tmp, 0);
         if (n < 0) {
-            if (errno == EINTR) continue;
-            if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+            if (ei_socket_errno() == EINTR) continue;
+            if ((ei_socket_errno() == EAGAIN || ei_socket_errno() == EWOULDBLOCK) &&
                 connection->buffered.n == 0) {
                 return HTTP_READ_CLOSED;
             }
@@ -981,7 +1029,7 @@ static http_read_result read_request(http_connection *connection,
     while (connection->buffered.n - body_start < body_len) {
         ssize_t n = recv(connection->fd, tmp, sizeof tmp, 0);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (ei_socket_errno() == EINTR) continue;
             snprintf(err, err_len, "failed to read request body");
             free(headers);
             return HTTP_READ_ERROR;
@@ -1010,7 +1058,7 @@ static http_read_result read_request(http_connection *connection,
     return HTTP_READ_OK;
 }
 
-static void handle_tags(int fd, const server_opts *opts, bool keep_alive) {
+static void handle_tags(ei_socket fd, const server_opts *opts, bool keep_alive) {
     (void)opts;
     sbuf b = {0};
     sbuf_append_z(&b, "{\"models\":[{\"name\":");
@@ -1025,7 +1073,7 @@ static void handle_tags(int fd, const server_opts *opts, bool keep_alive) {
 static ei_response_cache *media_cache;
 #include "http_media.h"
 
-static void handle_embed(int fd, ei_inference_service *service,
+static void handle_embed(ei_socket fd, ei_inference_service *service,
                          const server_opts *opts, const char *body,
                          size_t body_len, bool keep_alive,
                          ei_response_cache *response_cache,
@@ -1303,6 +1351,10 @@ static char *path_join(const char *a, const char *b) {
 
 static char *dirname_copy(const char *path) {
     const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(path, '\\');
+    if (backslash && (!slash || backslash > slash)) slash = backslash;
+#endif
     if (!slash) return dup_z(".");
     if (slash == path) return dup_z("/");
     return dup_range(path, (size_t)(slash - path));
@@ -1318,8 +1370,17 @@ static char *resolve_model_path(const server_opts *opts) {
     if (cache_home && *cache_home) {
         root = dup_z(cache_home);
     } else {
+#ifdef _WIN32
+        const char *local = getenv("LOCALAPPDATA");
+        if (local && *local) root = dup_z(local);
+        else {
+            const char *home = getenv("USERPROFILE");
+            root = path_join(home && *home ? home : ".", ".cache");
+        }
+#else
         const char *home = getenv("HOME");
         root = path_join(home && *home ? home : ".", ".cache");
+#endif
     }
     char *directory = path_join(root, "embeddinggemma.c");
     char *model = path_join(directory, opts->profile->file);
@@ -1345,19 +1406,37 @@ static void ensure_dir(const char *path) {
         return;
     }
     if (errno != ENOENT) ei_die("cannot stat %s: %s", path, strerror(errno));
-    if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+#ifdef _WIN32
+    if (_mkdir(path)
+#else
+    if (mkdir(path, 0755)
+#endif
+        != 0 && errno != EEXIST) {
         ei_die("cannot create directory %s: %s", path, strerror(errno));
     }
 }
 
 static void mkdir_p(const char *path) {
     char *tmp = dup_z(path);
+#ifdef _WIN32
+    for (char *p = tmp; *p; p++) if (*p == '\\') *p = '/';
+#endif
     size_t n = strlen(tmp);
     if (n == 0) {
         free(tmp);
         return;
     }
-    for (size_t i = 1; i < n; i++) {
+    size_t start = 1;
+#ifdef _WIN32
+    start = ei_windows_directory_start(tmp);
+    if (start == SIZE_MAX) ei_die("invalid UNC directory: %s", path);
+    if (tmp[0] == '/' && tmp[1] == '/' && start >= n) {
+        /* Existing share roots are managed by SMB, never created here. */
+        free(tmp);
+        return;
+    }
+#endif
+    for (size_t i = start; i < n; i++) {
         if (tmp[i] == '/') {
             tmp[i] = '\0';
             ensure_dir(tmp);
@@ -1376,6 +1455,39 @@ typedef enum {
 
 static downloader_result run_downloader(const char *program,
                                         char *const arguments[]) {
+#ifdef _WIN32
+    /* The Windows CRT joins argv without quoting. Quote each argument using
+     * its command-line rules, preserving spaces and trailing backslashes. */
+    size_t count = 0;
+    while (arguments[count]) count++;
+    char **quoted = ei_xcalloc(count + 1, sizeof(*quoted));
+    for (size_t i = 0; i < count; i++) {
+        const char *arg = arguments[i];
+        char *out = quoted[i] = ei_xmalloc(strlen(arg) * 2 + 3);
+        *out++ = '"';
+        size_t slashes = 0;
+        for (;;) {
+            char ch = *arg++;
+            if (ch == '\\') { slashes++; continue; }
+            size_t emit = (ch == '"' || ch == '\0') ? slashes * 2 : slashes;
+            while (emit--) *out++ = '\\';
+            slashes = 0;
+            if (ch == '\0') break;
+            if (ch == '"') *out++ = '\\';
+            *out++ = ch;
+        }
+        *out++ = '"';
+        *out = '\0';
+    }
+    intptr_t status = _spawnvp(_P_WAIT, program, (const char *const *)quoted);
+    int spawn_errno = errno;
+    for (size_t i = 0; i < count; i++) free(quoted[i]);
+    free(quoted);
+    errno = spawn_errno;
+    if (status == -1 && errno == ENOENT) return DOWNLOADER_UNAVAILABLE;
+    if (status == 0) return DOWNLOADER_SUCCEEDED;
+    fprintf(stderr, "%s failed (status %lld)\n", program, (long long)status);
+#else
     pid_t child;
     int rc = posix_spawnp(&child, program, NULL, NULL, arguments, environ);
     if (rc == ENOENT) return DOWNLOADER_UNAVAILABLE;
@@ -1402,6 +1514,7 @@ static downloader_result run_downloader(const char *program,
         fprintf(stderr, "%s terminated by signal %d\n",
                 program, WTERMSIG(status));
     }
+#endif
     return DOWNLOADER_FAILED;
 }
 
@@ -1497,7 +1610,7 @@ static uint64_t model_fingerprint(const char *path) {
     if (!file) return 0;
     unsigned char buffer[65536];
     if (fseek(file, 0, SEEK_END) == 0) {
-        long size = ftell(file);
+        int64_t size = (int64_t)ftell(file);
         for (int i = 0; i < 8; i++) {
             hash ^= (uint64_t)((size >> (i * 8)) & 0xff);
             hash *= 1099511628211ull;
@@ -1544,7 +1657,11 @@ static void usage(const char *argv0) {
             "          [--cuda-devices all|I,J,...]  (embeddinggemma-2 on several GPUs)\n"
             "default listen: 0.0.0.0:%d\n"
             "default model: $XDG_CACHE_HOME/embeddinggemma.c/%s\n"
+#ifdef _WIN32
+            "               or $LOCALAPPDATA/embeddinggemma.c/%s\n",
+#else
             "               or $HOME/.cache/embeddinggemma.c/%s\n",
+#endif
             argv0, EMBEDDINGGEMMA_DEFAULT_PORT, ei_profiles[0].file, ei_profiles[0].file);
 }
 
@@ -1721,7 +1838,7 @@ static bool parse_args(int argc, char **argv, server_opts *opts) {
 }
 
 typedef struct {
-    int *fds;
+    ei_socket *fds;
     size_t capacity;
     size_t head;
     size_t count;
@@ -1753,7 +1870,7 @@ static void socket_queue_init(socket_queue *queue, size_t capacity) {
     }
 }
 
-static bool socket_queue_try_push(socket_queue *queue, int fd) {
+static bool socket_queue_try_push(socket_queue *queue, ei_socket fd) {
     pthread_mutex_lock(&queue->mutex);
     if (queue->count == queue->capacity) {
         pthread_mutex_unlock(&queue->mutex);
@@ -1767,10 +1884,10 @@ static bool socket_queue_try_push(socket_queue *queue, int fd) {
     return true;
 }
 
-static int socket_queue_pop(socket_queue *queue) {
+static ei_socket socket_queue_pop(socket_queue *queue) {
     pthread_mutex_lock(&queue->mutex);
     while (queue->count == 0) pthread_cond_wait(&queue->ready, &queue->mutex);
-    int fd = queue->fds[queue->head];
+    ei_socket fd = queue->fds[queue->head];
     queue->head = (queue->head + 1) % queue->capacity;
     queue->count--;
     pthread_mutex_unlock(&queue->mutex);
@@ -1801,14 +1918,18 @@ static void keepalive_limiter_release(keepalive_limiter *limiter) {
 static void *server_worker_main(void *opaque) {
     server_worker *worker = opaque;
     for (;;) {
-        int fd = socket_queue_pop(worker->queue);
+        ei_socket fd = socket_queue_pop(worker->queue);
         http_connection connection = { .fd = fd };
+#ifdef _WIN32
+        DWORD receive_timeout = worker->opts->keepalive_timeout_ms;
+#else
         struct timeval receive_timeout = {
             .tv_sec = worker->opts->keepalive_timeout_ms / 1000u,
             .tv_usec = (suseconds_t)(
                 worker->opts->keepalive_timeout_ms % 1000u) * 1000,
         };
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+#endif
+        ei_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
                    sizeof receive_timeout);
         bool keepalive_slot = worker->opts->keepalive_max_requests > 1 &&
             keepalive_limiter_try_acquire(worker->keepalive);
@@ -1822,7 +1943,7 @@ static void *server_worker_main(void *opaque) {
         }
         if (keepalive_slot) keepalive_limiter_release(worker->keepalive);
         free(connection.buffered.data);
-        close(fd);
+        ei_socket_close(fd);
     }
     return NULL;
 }
@@ -1850,7 +1971,12 @@ static bool execute_engine_batch_slot(void *opaque, size_t slot, const int32_t *
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) ei_die("Winsock initialization failed");
+#else
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     server_opts opts;
     if (!parse_args(argc, argv, &opts)) {
@@ -2074,10 +2200,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) ei_die("socket failed: %s", strerror(errno));
+    ei_socket s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == EI_INVALID_SOCKET) ei_die("socket failed: %s", strerror(errno));
     int yes = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    ei_setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
@@ -2105,6 +2231,10 @@ int main(int argc, char **argv) {
     /* Graceful shutdown so the persistent cache is flushed. sigaction without
      * SA_RESTART makes accept() return EINTR when a stop signal arrives. */
     if (opts.persistent_cache_path) {
+#ifdef _WIN32
+        signal(SIGTERM, handle_stop_signal);
+        signal(SIGINT, handle_stop_signal);
+#else
         struct sigaction action;
         memset(&action, 0, sizeof action);
         action.sa_handler = handle_stop_signal;
@@ -2112,22 +2242,35 @@ int main(int argc, char **argv) {
         action.sa_flags = 0;
         sigaction(SIGTERM, &action, NULL);
         sigaction(SIGINT, &action, NULL);
+#endif
     }
     while (!g_stop_requested) {
-        int c = accept(s, NULL, NULL);
-        if (c >= 0) {
+#ifdef _WIN32
+        /* CRT signal handlers do not interrupt Winsock accept. Polling keeps
+         * graceful cache publication reachable after a stop signal. */
+        fd_set ready;
+        FD_ZERO(&ready);
+        FD_SET(s, &ready);
+        struct timeval timeout = {0, 250000};
+        int selected = select(0, &ready, NULL, NULL, &timeout);
+        if (g_stop_requested) break;
+        if (selected == 0) continue;
+        if (selected == SOCKET_ERROR) ei_die("select failed: %d", WSAGetLastError());
+#endif
+        ei_socket c = accept(s, NULL, NULL);
+        if (c != EI_INVALID_SOCKET) {
             int nodelay = 1;
-            setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof nodelay);
+            ei_setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof nodelay);
         }
-        if (c < 0) {
-            if (errno == EINTR) continue;
+        if (c == EI_INVALID_SOCKET) {
+            if (ei_socket_errno() == EINTR) continue;
             fprintf(stderr, "accept failed: %s\n", strerror(errno));
             continue;
         }
         if (!socket_queue_try_push(&connection_queue, c)) {
             http_error(c, 503, "Service Unavailable",
                        "server request queue is full", false);
-            close(c);
+            ei_socket_close(c);
         }
     }
     if (opts.persistent_cache_path) {

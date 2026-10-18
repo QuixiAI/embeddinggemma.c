@@ -4066,3 +4066,68 @@ instead of carrying their own `G2P`, and `test_gemma2_metal_routes` picks
 this GPU's shipped default (`FUSED,SG,AFUSED` without Metal 4). Interleaved
 `bench_gemma2_metal` runs of the two binaries (300x16, 64x4, 1000x4) were
 within the host's run-to-run noise with identical minimum cosines.
+
+## 2026-10-18: CPU engine work ported from the CPU-Max fork (PR #6)
+
+Yazeedx0's fork (`embeddinggemma-cpu-max`, 32 commits on d8f9e33) carried the
+EmbeddingGemma 2 CPU work below plus a rebrand and 127k lines of reports;
+the engine was re-applied on main as a series of commits (branch
+`port/pr6-cpu-engine`), each validated on an M5 Max (clang) and a Ryzen 9950X
+(GCC 15; AVX-512 tier, so the AVX-VNNI kernel runs there only under
+`EI_GEMMA2_CPU_X86=avxvnni`, a force value added for that). Defaults are
+unchanged where the fork changed them: model semantics stay llama.cpp's
+(`EI_GEMMA2_SEMANTICS=official` is opt-in), nothing from `cpu-max/` came
+across; the fork's benchmark write-up (2.46x geomean over PyTorch FP32 /
+ONNX INT8 on an i7-14700HX) is at
+https://github.com/Yazeedx0/embeddinggemma-cpu-max.
+
+What landed, with the 9950X numbers (32 threads, `test_gemma2_vnni256` /
+`test_gemma2_media`, medians):
+
+| path | flag | result |
+|---|---|---|
+| repacked 256-bit AVX-VNNI Q8_0 GEMM | `EI_GEMMA2_CPU_VNNI256` | 2.0-2.7 TMAC/s against 0.52 for the generic AVX-VNNI tile (4.7x), exact to 5e-8 |
+| packed fp32 GEMM for BF16/F32 projections | `EI_GEMMA2_CPU_SGEMM` | 0.66-1.2 TMAC/s against 0.23 for the row kernel, 1.4e-7 |
+| tiled online-softmax attention (text) | `EI_GEMMA2_CPU_FLASH` | error vs fp64 equal to the scalar kernel's (1e-5..1e-4 err/rms) |
+| fast vision tower | `EI_GEMMA2_CPU_MEDIA_FAST` | 3.8-8.7x the reference at the AVX-512 tier, 6-17x at the AVX-VNNI tier, flattened cosine 0.9991-0.9995 |
+| fast audio tower | same | 5-11x (7.8-21x AVX-VNNI tier), 0.99988-0.99995 |
+| source-page release after repack | `EI_GEMMA2_CPU_RELEASE_WEIGHTS` | server RSS after text+image+audio 925 MB against 1536 without (main 931) |
+| hybrid P/E pool, caller pinning | `EI_CPU_HYBRID` | Linux sysfs `cpu_core`/`cpu_atom` only; not measurable on these boxes |
+| CPU media towers yield the engine lock | `EI_GEMMA2_CPU_YIELD` | short text requests during a 1,100-token image: 10-14 ms with the yield, 649 ms without, 5.2 s on main (reference towers); the image itself 889 ms against 788 |
+
+Head-of-line probe (9950X, 8 HTTP workers, unique 1536x1632 images at
+`vision_tokens` 1120 so the media cache cannot answer): a short text request
+alone takes 9.4 ms; while the image runs it takes 10-14 ms with the yield,
+649 ms without it, and 5.2 s on main, where the scalar reference tower holds
+the engine for 5.3 s. Server RSS after one text, image and audio request:
+main 931 MB (299 anonymous, 632 file); the port 925 MB at the AVX-512 tier
+(904 anonymous, 21 file) and 856 MB at the AVX-VNNI tier. The fast media
+towers route their Q8 GEMMs through the repacked kernels, which doubles the
+media weights in anonymous memory (+600 MB); releasing the GGUF source pages
+after every repack, the pre-existing 512-bit one included, gives it back
+(1536 MB with `EI_GEMMA2_CPU_RELEASE_WEIGHTS=0`).
+
+Whole-forward effect against main's binary (14 HTTP requests, text 1-1500
+words, images 48-480 px, 2-12 s audio, video, mixed): byte-identical with
+every new path off; with defaults the worst cosine is 0.99958 (12 s audio)
+and 0.99982 on text, the Q8 activation requantization amplifying
+summation-order changes. `make test-gemma2` goldens (llama.cpp outputs):
+text minimum 0.999474 (0.999641 before) at the AVX-512 tier, 0.999672 at
+the AVX-VNNI tier; vision tower 0.999106 / 0.999257 (0.999159 before);
+audio tower 0.99992. On the M5 Max the fast vision tower sits at 0.999007
+against the 0.999 gate (0.999154 with the scalar graph): the NEON route of
+the same math, kept on by default but the thinnest margin in the suite.
+
+Fixed while porting: the fork's vision patch GEMM keyed its weight cache by
+the address of a stack copy of the tensor (one 2.4 MB entry per HTTP thread,
+then a per-thread fallback kernel); the repack caches now key by the weight
+data pointer. `weight_cache_lock` stays under its architecture guard (the
+fork's sgemm hook broke Linux aarch64). `aligned_alloc` is wrapped
+(`ei_aligned_alloc`) for the UCRT. Every new AVX function carries the `g2x_`
+prefix so `scripts/check-avx2-isolation.py` holds. The audio tower clamps
+q/k/v with their own bounds instead of exiting when they differ. The
+reference-graph profiler accumulators are thread-local.
+
+Not ported: `cpu-max/` (benchmark harness, reports, uv environment), README
+rewrite, installer, `--version` / startup identity, `CPU_MAX.md`.
+

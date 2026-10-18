@@ -9,6 +9,9 @@
  * tile, threaded SIMD row kernels, cached RoPE tables, persistent workspace. */
 #include "gemma2.h"
 #include "gemma2_fast_x86.h"
+#include "gemma2_media_x86.h"
+#include "gemma2_vnni256.h"
+#include "gemma2_sgemm_x86.h"
 #include "kernels.h"
 #include <math.h>
 #include <pthread.h>
@@ -241,11 +244,15 @@ static bool gemm_q8_i8mm(workspace *ws, ei_thread_pool *pool, const ei_tensor *w
                          float *y);
 static bool gemm_q8_x86_512(workspace *ws, ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq,
                             int n, float *y);
+static bool gemm_q8_x86_vnni256(workspace *ws, ei_thread_pool *pool, const ei_tensor *w,
+                                const ei_block_q8_0 *xq, int n, float *y);
 static void gemm_q8(workspace *ws, ei_thread_pool *pool, const ei_tensor *w, const ei_block_q8_0 *xq, int n,
                     float *y) {
     if (gemm_q8_i8mm(ws, pool, w, xq, n, y))
         return;
     if (gemm_q8_x86_512(ws, pool, w, xq, n, y))
+        return;
+    if (gemm_q8_x86_vnni256(ws, pool, w, xq, n, y))
         return;
     // Short waves: 8-row blocks so every thread gets work; long: 32-row tiles.
     int rr = n <= 8 ? 8 : 32;
@@ -474,6 +481,82 @@ static bool gemm_q8_x86_512(workspace *ws, ei_thread_pool *pool, const ei_tensor
 }
 #endif
 
+/* ---- x86 AVX-VNNI 256-bit GEMM on 8-row repacked weights ----------------
+ * gemma2_vnni256.c. Tasks are 32 rows (4 groups) x 32 tokens; inside a task the
+ * group's weight panel (8 x k bytes) stays in L1 across the token loop. */
+#if defined(__x86_64__)
+typedef struct {
+    const void *w;
+    const ei_block_q8_0 *xq;
+    uint8_t *xu;
+    float *xs;
+    float *y;
+    int k, m, n, row_tasks;
+} v256_job;
+static void v256_acts(void *opaque, int32_t begin, int32_t end) {
+    v256_job *j = opaque;
+    g2x_acts(j->xq, begin, end, j->k, j->xu, j->xs);
+}
+/* Short waves (<= 8 tokens): one task per 8-row group. */
+static void v256_groups(void *opaque, int32_t begin, int32_t end) {
+    v256_job *j = opaque;
+    for (int g = begin; g < end; g++)
+        for (int t = 0; t < j->n; t += G2V_TILE_TOKENS)
+            g2v_tile(j->w, g, j->xu, j->xs, t, j->n - t < G2V_TILE_TOKENS ? j->n - t : G2V_TILE_TOKENS, j->k,
+                     j->y, j->m);
+}
+static void v256_rows(void *opaque, int32_t begin, int32_t end) {
+    v256_job *j = opaque;
+    for (int task = begin; task < end; task++) {
+        int rb = task % j->row_tasks, tb = task / j->row_tasks;
+        int g_end = rb * 4 + 4 < j->m / 8 ? rb * 4 + 4 : j->m / 8;
+        int t_end = tb * 32 + 32 < j->n ? tb * 32 + 32 : j->n;
+        for (int g = rb * 4; g < g_end; g++)
+            for (int t = tb * 32; t < t_end; t += G2V_TILE_TOKENS)
+                g2v_tile(j->w, g, j->xu, j->xs, t, t_end - t < G2V_TILE_TOKENS ? t_end - t : G2V_TILE_TOKENS,
+                         j->k, j->y, j->m);
+    }
+}
+static bool gemm_q8_x86_vnni256(workspace *ws, ei_thread_pool *pool, const ei_tensor *w,
+                                const ei_block_q8_0 *xq, int n, float *y) {
+    int k = (int)w->ne[0], m = (int)w->ne[1];
+    // EI_GEMMA2_CPU_VNNI256_SHORT=0 keeps waves of <= 8 tokens on the generic tile.
+    static int short_waves = -1;
+    if (short_waves < 0) {
+        const char *e = getenv("EI_GEMMA2_CPU_VNNI256_SHORT");
+        short_waves = !(e && !strcmp(e, "0"));
+    }
+    if (!g2v_enabled() || (n <= 8 && !short_waves) || k % 32 || m % 8)
+        return false;
+    pthread_mutex_lock(&weight_cache_lock);
+    const void *pw = g2v_weight_of(w->data, w->data, m, k, pool);
+    pthread_mutex_unlock(&weight_cache_lock);
+    if (!pw)
+        return false;
+    if ((size_t)n * k > ws->x512_cap) {
+        free(ws->x512_u), free(ws->x512_s);
+        ws->x512_u = ei_xmalloc((size_t)n * k);
+        ws->x512_s = ei_xmalloc((size_t)n * (k / 32) * sizeof(float));
+        ws->x512_cap = (size_t)n * k;
+    }
+    v256_job j = {pw, xq, ws->x512_u, ws->x512_s, y, k, m, n, (m / 8 + 3) / 4};
+    if (n <= 8) {
+        g2x_acts(xq, 0, n, k, ws->x512_u, ws->x512_s);
+        PROF(0, ei_parallel_for(pool, m / 8, short_grain(pool, m / 8, n), v256_groups, &j));
+        return true;
+    }
+    PROF(0, ei_parallel_for(pool, n, 16, v256_acts, &j));
+    PROF(0, ei_parallel_for(pool, j.row_tasks * ((n + 31) / 32), 1, v256_rows, &j));
+    return true;
+}
+#else
+static bool gemm_q8_x86_vnni256(workspace *ws, ei_thread_pool *pool, const ei_tensor *w,
+                                const ei_block_q8_0 *xq, int n, float *y) {
+    (void)ws, (void)pool, (void)w, (void)xq, (void)n, (void)y;
+    return false;
+}
+#endif
+
 /* Float-activation GEMM for BF16/F16/F32 weights (the PLE projection). */
 typedef struct {
     const ei_tensor *w;
@@ -559,7 +642,48 @@ static void f_rows(void *opaque, int32_t begin, int32_t end) {
         }
     }
 }
+/* x86 packed fp32 GEMM (gemma2_sgemm_x86.c): tasks are 4 panels (64 outputs)
+ * x 48 tokens. EI_GEMMA2_CPU_SGEMM=0 restores f_rows. The repack cache is
+ * keyed by the weight data (stable per mapping; callers pass tensor copies
+ * with adjusted shapes, so the struct address is not a key). */
+#if defined(__x86_64__)
+typedef struct {
+    const void *w;
+    const float *x;
+    float *y;
+    int n, panel_tasks, panels;
+} sgemm_job;
+static void sgemm_tasks(void *opaque, int32_t begin, int32_t end) {
+    sgemm_job *j = opaque;
+    for (int task = begin; task < end; task++) {
+        int pb = task % j->panel_tasks, tb = task / j->panel_tasks;
+        int p0 = pb * 4, np = j->panels - p0 < 4 ? j->panels - p0 : 4;
+        int t0 = tb * 48, t1 = t0 + 48 < j->n ? t0 + 48 : j->n;
+        g2s_block(j->w, j->x, t0, t1, p0, np, j->y);
+    }
+}
+static bool gemm_f_sgemm(ei_thread_pool *pool, const ei_tensor *w, const float *x, int n, float *y) {
+    int k = (int)w->ne[0], m = (int)w->ne[1];
+    if (!g2s_enabled() || m % 16)
+        return false;
+    pthread_mutex_lock(&weight_cache_lock);
+    const void *pw = g2s_weight_of(w->data, w->data, (int)w->type, m, k, pool);
+    pthread_mutex_unlock(&weight_cache_lock);
+    if (!pw)
+        return false;
+    sgemm_job j = {pw, x, y, n, (m / 16 + 3) / 4, m / 16};
+    PROF(1, ei_parallel_for(pool, j.panel_tasks * ((n + 47) / 48), 1, sgemm_tasks, &j));
+    return true;
+}
+#else
+static bool gemm_f_sgemm(ei_thread_pool *pool, const ei_tensor *w, const float *x, int n, float *y) {
+    (void)pool, (void)w, (void)x, (void)n, (void)y;
+    return false;
+}
+#endif
 static void gemm_f(ei_thread_pool *pool, const ei_tensor *w, const float *x, int n, float *y) {
+    if (gemm_f_sgemm(pool, w, x, n, y))
+        return;
     f_job j = {w, x, y, (int)w->ne[0], (int)w->ne[1], n};
     if (j.k > 1024 || j.k % 4)
         ei_die("gemm_f supports k <= 1024, multiple of 4");
@@ -895,6 +1019,80 @@ static void attention_rows(void *opaque, int32_t begin, int32_t end) {
     }
 }
 
+/* ---- shared with the CPU media towers ---------------------------------- */
+
+void ei_gemma2_fast_gemm_q8(ei_gemma2_fast *ctx, ei_thread_pool *pool, const ei_tensor *w,
+                            const ei_block_q8_0 *xq, int n, float *y) {
+    gemm_q8(&ctx->ws, pool, w, xq, n, y);
+}
+void ei_gemma2_fast_gemm_f(ei_thread_pool *pool, const ei_tensor *w, const float *x, int n, float *y) {
+    gemm_f(pool, w, x, n, y);
+}
+void ei_gemma2_fast_quant_row(const float *x, ei_block_q8_0 *q, int width) { quant_row(x, q, width); }
+float ei_gemma2_fast_sum_squares(const float *x, int d) { return sum_squares(x, d); }
+void ei_gemma2_fast_gelu_mul(float *g, const float *u, int n) { gelu_mul_row(g, u, n); }
+
+/* ---- x86 tiled online-softmax attention ------------------------------------
+ * gemma2_media_x86.c's g2m_attn over (head, query block) tasks: per-query key
+ * bounds carry the packed-sequence limits and the +-512 sliding window, so
+ * one kernel serves every layer. x86 AVX2 only (the NEON path above stays on
+ * ARM); EI_GEMMA2_CPU_FLASH=0 restores the attention above. */
+#if defined(__x86_64__)
+static bool flash_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *flag = getenv("EI_GEMMA2_CPU_FLASH");
+        cached = (!flag || strcmp(flag, "0")) && g2x_level() >= G2X_AVX2;
+    }
+    return cached;
+}
+typedef struct {
+    int n, kv, d, window, blocks;
+    workspace *ws;
+} flash_job;
+static void flash_tasks(void *opaque, int32_t begin, int32_t end) {
+    flash_job *j = opaque;
+    workspace *ws = j->ws;
+    const int qb = g2m_attn_qblock(j->d);
+    int32_t lo[G2M_ATTN_QB_MAX], hi[G2M_ATTN_QB_MAX];
+    for (int task = begin; task < end; task++) {
+        int hd = task / j->blocks, q0 = task % j->blocks * qb, kh = hd / (4 / j->kv);
+        int nq = j->n - q0 < qb ? j->n - q0 : qb, klo = 1 << 30, khi = 0;
+        for (int i = 0; i < nq; i++) {
+            int t = q0 + i;
+            lo[i] = (int32_t)ws->lo[t], hi[i] = (int32_t)ws->hi[t];
+            if (j->window) {
+                if (t - j->window > lo[i])
+                    lo[i] = t - j->window;
+                if (t + j->window + 1 < hi[i])
+                    hi[i] = t + j->window + 1;
+            }
+            klo = lo[i] < klo ? lo[i] : klo;
+            khi = hi[i] > khi ? hi[i] : khi;
+        }
+        g2m_attn_args a = {.q = ws->q, .k = ws->k, .v = ws->v, .out = ws->a, .qstride = (size_t)4 * j->d,
+                           .kvstride = (size_t)j->kv * j->d, .ostride = (size_t)4 * j->d,
+                           .qcol = (size_t)hd * j->d, .kvcol = (size_t)kh * j->d, .ocol = (size_t)hd * j->d,
+                           .d = j->d, .q0 = q0, .nq = nq, .lo = lo, .hi = hi, .klo = klo, .khi = khi,
+                           .scale = 1.0f};
+        g2m_attn(&a);
+    }
+}
+static bool attention_flash(workspace *ws, ei_thread_pool *pool, int n, int kv, int d, int window) {
+    if (!flash_enabled())
+        return false;
+    int qb = g2m_attn_qblock(d);
+    flash_job fj = {n, kv, d, window, (n + qb - 1) / qb, ws};
+    PROF(3, ei_parallel_for(pool, 4 * fj.blocks, 1, flash_tasks, &fj));
+    return true;
+}
+#else
+static bool attention_flash(workspace *ws, ei_thread_pool *pool, int n, int kv, int d, int window) {
+    (void)ws, (void)pool, (void)n, (void)kv, (void)d, (void)window;
+    return false;
+}
+#endif
+
 /* ---- graph -------------------------------------------------------------- */
 
 ei_gemma2_fast *ei_gemma2_fast_create(void) {
@@ -932,6 +1130,21 @@ bool ei_gemma2_embed_batch_fast_ctx(ei_gemma2_fast *ctx, const ei_gguf *g, ei_th
     workspace *ws = &ctx->ws;
     reserve(ws, count);
     int n = (int)count;
+    /* Hybrid CPUs: waves below EI_GEMMA2_CPU_HYBRID_TOKENS run on
+     * the pool's P-core threads only (every parallel step otherwise waits on
+     * the slower E-cores); larger waves use every core. The caller is pinned
+     * to the pool's first (P-core) CPU for the wave. */
+    ei_cpu_binding binding;
+    ei_thread_pool_bind_caller(pool, &binding);
+    const int perf = ei_thread_pool_performance_threads(pool);
+    static int hybrid_tokens = -1;
+    if (hybrid_tokens < 0) {
+        const char *e = getenv("EI_GEMMA2_CPU_HYBRID_TOKENS");
+        hybrid_tokens = e ? atoi(e) : 512;
+    }
+    const bool capped = perf > 0 && n < hybrid_tokens;
+    if (capped)
+        ei_thread_pool_set_cap(pool, perf);
     for (size_t s = 0; s < batch; s++)
         for (size_t t = offsets[s]; t < offsets[s + 1]; t++) {
             ws->lo[t] = (uint32_t)offsets[s];
@@ -970,7 +1183,8 @@ bool ei_gemma2_embed_batch_fast_ctx(ei_gemma2_fast *ctx, const ei_gguf *g, ei_th
         rows(ws, pool, n,
              (row_job){.op = ROW_QKV_POST, .d = d, .kv = kv, .rope_base = l % 6 == 5 ? 1 : 0});
         attn_job aj = {n, kv, d, l % 6 == 5 ? 0 : 512, ws};
-        PROF(3, ei_parallel_for(pool, 4 * ((n + QB - 1) / QB), 1, attention_rows, &aj));
+        if (!attention_flash(ws, pool, n, kv, d, aj.window))
+            PROF(3, ei_parallel_for(pool, 4 * ((n + QB - 1) / QB), 1, attention_rows, &aj));
         rows(ws, pool, n, (row_job){.op = ROW_QUANT, .in = ws->a, .width = 4 * d});
         gemm_q8(ws, pool, T("attn_output"), ws->xq, n, ws->h);
         dequant_norm(T("post_attention_norm"), 512, ws->norm_w[2]);
@@ -1014,6 +1228,9 @@ bool ei_gemma2_embed_batch_fast_ctx(ei_gemma2_fast *ctx, const ei_gguf *g, ei_th
         fprintf(stderr, "\n");
     }
     memset(prof, 0, sizeof prof);
+    if (capped)
+        ei_thread_pool_set_cap(pool, 0);
+    ei_thread_pool_unbind_caller(&binding);
     pthread_mutex_unlock(&ctx->lock);
     return true;
 }

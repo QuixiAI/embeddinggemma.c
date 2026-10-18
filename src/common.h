@@ -75,4 +75,26 @@ static inline void *ei_xrealloc(void *p, size_t n) {
     return r;
 }
 
+/* Aligned allocation for SIMD weight and activation panels (alignment a power
+ * of two, at least sizeof(void *)); free with ei_aligned_free. C11
+ * aligned_alloc wants a size that is a multiple of the alignment, so the size
+ * is rounded up; the UCRT has no aligned_alloc, so Windows uses _aligned_malloc. */
+#ifdef _WIN32
+#include <malloc.h>
+static inline void *ei_aligned_alloc(size_t align, size_t n) {
+    void *p = _aligned_malloc(n ? n : 1, align);
+    if (!p) ei_die("out of memory");
+    return p;
+}
+static inline void ei_aligned_free(void *p) { _aligned_free(p); }
+#else
+static inline void *ei_aligned_alloc(size_t align, size_t n) {
+    size_t rounded = (n + align - 1) / align * align;
+    void *p = aligned_alloc(align, rounded ? rounded : align);
+    if (!p) ei_die("out of memory");
+    return p;
+}
+static inline void ei_aligned_free(void *p) { free(p); }
+#endif
+
 #endif /* EI_COMMON_H */

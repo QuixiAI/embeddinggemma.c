@@ -177,8 +177,17 @@ CPU changes must pass:
 ```sh
 make clean-cpu
 make test
+make test-gemma2-attn      # tiled attention kernel vs its scalar reference and fp64
+make test-gemma2-vnni256   # Q8_0 and float GEMM routes vs fp64 (model-free)
 make test-gemma2  # requires both new GGUF files in model/
+make test-gemma2-media     # fast CPU media towers vs the reference graphs (model files)
 ```
+
+On x86-64 run the two kernel tests at every tier (`EI_GEMMA2_CPU_X86=` unset,
+`avx2`, `scalar`, and `avxvnni` on an AVX-512 CPU, which is the only way the
+256-bit repacked GEMM runs there), and keep
+`python3 scripts/check-avx2-isolation.py build/embeddinggemma` clean: AVX code
+belongs only in the `ei_avx2_*`, `g2x_*` and `q8_tile_*` kernels.
 
 Backend changes must pass the complete suite on matching hardware:
 
@@ -445,8 +454,50 @@ selects the unchanged reference graph):
 - x86-64 (`src/gemma2_fast_x86.c`, runtime-dispatched, generic builds): AVX2 +
   FMA, VNNI 256-bit, and on AVX-512 VNNI CPUs a repacked 512-bit GEMM (u8
   activations with a precomputed -128*sum(w) correction).
-  `EI_GEMMA2_CPU_X86=scalar|avx2|vnni256` forces a tier.
-- `EI_GEMMA2_CPU_PROFILE=1`: per-call GEMM/row/attention wall time.
+  `EI_GEMMA2_CPU_X86=scalar|avx2|vnni256|avxvnni` forces a tier (`avxvnni`
+  runs the AVX-VNNI tier on an AVX-512 CPU, for testing the kernel below).
+- `EI_GEMMA2_CPU_VNNI256` (default on at the AVX-VNNI tier, i.e. CPUs with
+  AVX-VNNI but no AVX-512 such as Alder/Raptor Lake): `src/gemma2_vnni256.c`,
+  Q8_0 weights repacked once into 8-row groups so one vpdpbusd advances eight
+  output rows; exact integer dots, fp32 summation order only. `_SHORT=0`
+  keeps waves of at most 8 tokens on the generic tile.
+- `EI_GEMMA2_CPU_SGEMM` (default on with AVX2): `src/gemma2_sgemm_x86.c`,
+  the BF16/F16/F32 projections (per-layer input, vision patch embedding, audio
+  input projection) as fp32 panels and 6-token x 16-output register tiles
+  instead of per-call row conversion.
+- `EI_GEMMA2_CPU_FLASH` (default on with AVX2): `src/gemma2_media_x86.c`,
+  tiled online-softmax attention in the text graph over (head, query block)
+  tasks with per-query key bounds; ARM keeps the NEON row attention.
+  `EI_G2M_QB` (16..128, widths <= 128) and `-DG2M_KB=32|128` are tuning hooks.
+- `EI_GEMMA2_CPU_MEDIA_FAST` (default on): `src/gemma2_vision_fast.c` and
+  `src/gemma2_audio_fast.c`, the CPU media towers on the fast graph's GEMMs,
+  tiled attention, fused threaded row passes and persistent workspaces (the
+  vision workspace grows to the 1120-soft-token cap, about 150 MB, and is
+  kept). `0` selects the scalar reference graphs in `src/gemma2.c`.
+- `EI_GEMMA2_CPU_RELEASE_WEIGHTS` (default on, Linux and macOS): once a Q8 or
+  float weight is repacked, its GGUF pages are dropped with
+  `madvise(MADV_DONTNEED)` (a private read-only mapping, re-read from the
+  file if touched); the process keeps one copy of each repacked weight.
+- `EI_CPU_HYBRID` (default on, Linux): on CPUs that report `cpu_core` and
+  `cpu_atom` the gemma2 pool is pinned P-core primaries first, then E-cores,
+  then SMT siblings; waves under `EI_GEMMA2_CPU_HYBRID_TOKENS` (512) run on
+  the P-core threads only. No effect on other CPUs.
+- `EI_GEMMA2_CPU_YIELD` (default on, CPU backend): a media tower hands the
+  engine lock to waiting text waves between its layers, so a 1120-token image
+  no longer blocks every text request for the whole tower.
+  `EI_GEMMA2_CPU_PREPACK=1` runs one text, image and audio input before the
+  server listens so the one-time repacks are not paid by first requests.
+- `EI_GEMMA2_SEMANTICS=official`: the official processor's behaviour instead
+  of llama.cpp's (the default, which the goldens in `testdata/` use): tanh
+  GELU in the vision MLP, `log(mel + 0.001)` as the log-mel floor, no
+  `MM:SS ` text before video frames. `EI_GEMMA2_VISION_GELU=tanh|quick`,
+  `EI_GEMMA2_AUDIO_LOGMEL=hf|max` and `EI_GEMMA2_VIDEO_TIMESTAMPS=0|1`
+  override one item each. The CPU towers honour the GELU choice; Metal and
+  CUDA vision still read the GGUF's `clip.use_gelu`, so the official mode is
+  CPU-complete only.
+- `EI_GEMMA2_CPU_PROFILE=1`: per-call GEMM/row/attention wall time (text
+  graph and the fast media towers); `EI_GEMMA2_REF_PROFILE=1` the same per
+  operation class for the reference media graphs.
 - `EI_POOL_SPIN_US=N`: pool workers spin N us on a published
   generation/participant ticket before parking, so back-to-back parallel
   calls skip the condition-variable wake. The EmbeddingGemma 2 CPU pool

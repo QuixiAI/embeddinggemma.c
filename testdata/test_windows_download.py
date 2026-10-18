@@ -30,7 +30,7 @@ def main():
             for key in ("XDG_CACHE_HOME", "EI_MODEL_PATH", "EI_TEST_CURL_FAIL", "HOME"):
                 env.pop(key, None)
             env.update(PATH=str(tools), LOCALAPPDATA=str(directory), USERPROFILE=str(directory))
-            command = [binary]
+            command = [binary, "--profile", "embeddinggemma-300m"]
             expected = directory / "embeddinggemma.c" / "embeddinggemma-300M-qat-Q4_0.gguf"
             if mode == "fallback":
                 env["EI_TEST_CURL_FAIL"] = "1"

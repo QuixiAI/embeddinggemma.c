@@ -51,6 +51,12 @@ static inline int ei_mkstemp(char *pattern) {
     return -1;
 }
 #define mkstemp ei_mkstemp
+/* The server maps --threads and --cuda-devices onto environment variables. */
+static inline int ei_setenv(const char *name, const char *value, int overwrite) {
+    if (!overwrite && getenv(name)) return 0;
+    return _putenv_s(name, value) == 0 ? 0 : -1;
+}
+#define setenv ei_setenv
 /* Windows rename does not replace a destination; cache publication must. */
 static inline int ei_replace_file(const char *from, const char *to) {
     if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING)) return 0;

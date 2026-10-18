@@ -7,6 +7,24 @@
 #if defined(EI_ENABLE_CUDA)
 #include "gemma2_cuda.h"
 #endif
+#ifdef _WIN32
+#include "windows_compat.h"
+#include <shellapi.h>
+// The CRT argv is in the ANSI code page; the goldens are UTF-8 text.
+static char **utf8_argv(void) {
+    int n = 0;
+    wchar_t **wide = CommandLineToArgvW(GetCommandLineW(), &n);
+    if (!wide) ei_die("CommandLineToArgvW failed");
+    char **out = ei_xcalloc((size_t)n + 1, sizeof *out);
+    for (int i = 0; i < n; i++) {
+        int bytes = WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, NULL, 0, NULL, NULL);
+        out[i] = ei_xmalloc((size_t)bytes);
+        WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, out[i], bytes, NULL, NULL);
+    }
+    LocalFree(wide);
+    return out;
+}
+#endif
 
 static void vector(const float *x, size_t n) {
     putchar('[');
@@ -15,6 +33,9 @@ static void vector(const float *x, size_t n) {
     putchar(']');
 }
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    argv = utf8_argv();
+#endif
     if (argc < 4)
         ei_die("usage: %s text.gguf projector.gguf text|vision|audio [text]", argv[0]);
     ei_engine e;

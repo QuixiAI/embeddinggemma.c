@@ -10,7 +10,6 @@
 #include <time.h>
 #include <unistd.h>
 #include "windows_compat.h"
-#include "windows_compat.h"
 
 typedef enum {
     EI_ENTRY_PENDING,

@@ -244,6 +244,28 @@ The target is the hardware ceiling under many concurrent requests (SlimServe
   not suffix): a variant name ending in a letter dispatched half the
   simdgroups and produced NaNs before that was fixed.
 
+## EmbeddingGemma 2 CPU port lessons (2026-10-18)
+
+- **Validate a remote tree from a clean `build/`.** `rsync -a` keeps the
+  Mac's source mtimes, which were older than binaries the box had built
+  minutes earlier, so `make` reused main's baseline and a whole "validation"
+  measured the wrong binary. `rm -rf build` first; check the binary mtime.
+- **Key repack caches by the weight data pointer, not the tensor struct.**
+  Callers pass stack copies of a tensor with adjusted shapes (the vision patch
+  embedding), so a struct-address key grows one entry per HTTP thread and
+  then silently falls back to another kernel per thread.
+- **The AVX-512 boxes never run the AVX-VNNI tier.** `g2x_level()` picks
+  VNNI512 on the 9950X and the EPYC, so a 256-bit kernel for Alder/Raptor Lake
+  is dead code there unless forced (`EI_GEMMA2_CPU_X86=avxvnni`); a
+  "validated" run that does not print `vnni256=1` tested nothing.
+- **Routing media through the repacked GEMM doubles media weights in RSS**
+  unless the repack releases its source pages; measure VmRSS after one
+  request of each modality, not only after text.
+- **Model semantics live in one getter** (`ei_gemma2_official_semantics`,
+  gemma2.c) read by the CPU towers, media.c and http_media.h; the GPU vision
+  towers still read the GGUF flag, so a semantics change is CPU-complete only
+  until Metal/CUDA follow.
+
 ## EmbeddingGemma 2 scaling lessons (2026-10-10)
 
 - **One CPU wave peaks at ~64 threads and collapses past it** (256-thread pool

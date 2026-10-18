@@ -67,6 +67,25 @@ jobs:
       - name: Verify AVX2 code stays in runtime-dispatched kernels
         if: matrix.platform == 'linux-x86_64'
         run: python3 scripts/check-avx2-isolation.py build/embeddinggemma
+      - name: Run the EmbeddingGemma 2 CPU kernel tests at every x86 tier
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          grep -o -w -E 'avx2|avx_vnni|avx512_vnni' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          make build/test_gemma2_attn build/test_gemma2_vnni256
+          for tier in '' avx2 scalar; do
+            echo "== EI_GEMMA2_CPU_X86=$tier"
+            EI_GEMMA2_CPU_X86=$tier ./build/test_gemma2_attn
+            EI_GEMMA2_CPU_X86=$tier ./build/test_gemma2_vnni256 300x768x768 16x2048x512 f300x512x768 F64x768x768
+          done
+      - name: Run the EmbeddingGemma 2 CPU kernel tests (ARM)
+        if: matrix.platform == 'linux-arm64' || matrix.platform == 'darwin-arm64'
+        run: |
+          make build/test_gemma2_attn build/test_gemma2_vnni256
+          ./build/test_gemma2_attn
+          ./build/test_gemma2_vnni256 300x768x768 16x2048x512 f300x512x768 F64x768x768
+      - name: Build with clang
+        if: matrix.platform == 'linux-x86_64'
+        run: make CC=clang BUILD=build-clang build-clang/embeddinggemma build-clang/test_gemma2_attn && ./build-clang/test_gemma2_attn
       - name: Verify Windows AVX2 code stays in runtime-dispatched kernels
         if: runner.os == 'Windows'
         shell: msys2 {0}
